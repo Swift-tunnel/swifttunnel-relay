@@ -1,0 +1,26 @@
+[Unit]
+Description=SwiftTunnel V3 UDP Relay Server
+Documentation=https://github.com/Swift-tunnel/swifttunnel-app
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/swifttunnel-relay
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
