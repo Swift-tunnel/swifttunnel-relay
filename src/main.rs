@@ -28,21 +28,26 @@
 //! - Flow soft-delete with grace period
 
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
+use std::collections::HashSet;
 use std::env;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::interval;
 
 const SESSION_ID_LEN: usize = 8;
 const DEFAULT_PORT: u16 = 51821;
+const DEFAULT_STATS_PORT: u16 = 51822;
+const MAX_HTTP_REQUEST_SIZE: usize = 8192;
+const STATS_HTTP_READ_TIMEOUT_SECS: u64 = 5;
 
 /// Get listen port from RELAY_PORT env var or use default
 fn get_listen_port() -> u16 {
@@ -50,6 +55,25 @@ fn get_listen_port() -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT)
+}
+
+/// Get localhost stats port from RELAY_STATS_PORT env var or use default
+fn get_stats_port() -> u16 {
+    env::var("RELAY_STATS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_STATS_PORT)
+}
+
+/// Get stats API token from RELAY_STATS_TOKEN env var
+fn get_stats_token() -> Option<String> {
+    env::var("RELAY_STATS_TOKEN").ok().and_then(|token| {
+        if token.trim().is_empty() {
+            None
+        } else {
+            Some(token)
+        }
+    })
 }
 /// Session timeout increased from 60s to 180s to survive network hiccups
 const SESSION_TIMEOUT: Duration = Duration::from_secs(180);
@@ -69,27 +93,38 @@ const UDP_HEADER_SIZE: usize = 8;
 type FlowTx = mpsc::Sender<Vec<u8>>;
 
 /// Channel for sending responses back to clients
-type ResponseTx = mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>;
+type ResponseTx = mpsc::UnboundedSender<(SocketAddr, [u8; SESSION_ID_LEN], Vec<u8>)>;
 
 /// Check if a receive error is transient and can be ignored
 fn is_transient_recv_error(e: &std::io::Error) -> bool {
-    matches!(e.kind(),
-        ErrorKind::WouldBlock |
-        ErrorKind::TimedOut |
-        ErrorKind::Interrupted |
-        ErrorKind::ConnectionReset  // Can happen spuriously on recv
+    matches!(
+        e.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionReset // Can happen spuriously on recv
     )
 }
 
 /// Check if a send error is transient and can be ignored
 /// NOTE: ConnectionReset on send = ICMP port unreachable = game server down
 fn is_transient_send_error(e: &std::io::Error) -> bool {
-    matches!(e.kind(),
-        ErrorKind::WouldBlock |
-        ErrorKind::TimedOut |
-        ErrorKind::Interrupted
-        // ConnectionReset on send is NOT transient - game server unreachable
+    matches!(
+        e.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted // ConnectionReset on send is NOT transient - game server unreachable
     )
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
+/// Default identity until we observe a tunnel source IP or strict auth identity.
+fn derive_user_id(session_id: [u8; SESSION_ID_LEN]) -> String {
+    format!("session-{:016x}", u64::from_be_bytes(session_id))
 }
 
 /// Original packet info needed to reconstruct responses
@@ -105,6 +140,32 @@ struct OriginalPacketInfo {
     dst_port: u16,
 }
 
+/// Session metadata tracked by the relay
+struct SessionEntry {
+    user_id: String,
+    client_addr: SocketAddr,
+    created_at_unix: u64,
+    last_activity: Instant,
+    last_activity_unix: u64,
+}
+
+/// Session traffic counters used by local stats API
+struct SessionTraffic {
+    connected_at_unix: u64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
+impl SessionTraffic {
+    fn new(connected_at_unix: u64) -> Self {
+        Self {
+            connected_at_unix,
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Flow entry in the flow map
 struct FlowEntry {
     tx: FlowTx,
@@ -114,6 +175,13 @@ struct FlowEntry {
     original_info: OriginalPacketInfo,
     /// If set, flow is marked for removal after grace period
     marked_for_removal: Option<Instant>,
+}
+
+struct StatsApiContext {
+    sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>>,
+    session_traffic: Arc<DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>>,
+    stats: Arc<Stats>,
+    started_at: Instant,
 }
 
 /// Global statistics
@@ -128,6 +196,8 @@ struct Stats {
     dropped_in: AtomicU64,
     /// Response packets dropped
     dropped_out: AtomicU64,
+    /// Users currently in throttled state (reserved for quota integration)
+    throttled_users: AtomicU64,
 }
 
 impl Stats {
@@ -141,6 +211,7 @@ impl Stats {
             active_sessions: AtomicU64::new(0),
             dropped_in: AtomicU64::new(0),
             dropped_out: AtomicU64::new(0),
+            throttled_users: AtomicU64::new(0),
         }
     }
 }
@@ -150,6 +221,8 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let listen_port = get_listen_port();
+    let stats_port = get_stats_port();
+    let stats_token = get_stats_token();
 
     log::info!("╔════════════════════════════════════════════╗");
     log::info!("║     SwiftTunnel V3 UDP Relay v1.4.0        ║");
@@ -163,28 +236,64 @@ async fn main() -> Result<()> {
 
     log::info!("Listening on 0.0.0.0:{}", listen_port);
 
+    if stats_token.is_some() {
+        log::info!("Local stats API enabled on 127.0.0.1:{}", stats_port);
+    } else {
+        log::warn!(
+            "Local stats API disabled (set RELAY_STATS_TOKEN to enable localhost endpoints)"
+        );
+    }
+
     let socket = Arc::new(socket);
     let stats = Arc::new(Stats::new());
+    let started_at = Instant::now();
 
-    // Session tracking: session_id -> client_addr
-    let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SocketAddr>> = Arc::new(DashMap::new());
+    // Session tracking
+    let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
+    let session_traffic: Arc<DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>> =
+        Arc::new(DashMap::new());
 
     // Flow tracking: "session_hex:game_addr" -> FlowEntry
     let flows: Arc<DashMap<String, FlowEntry>> = Arc::new(DashMap::new());
 
+    if let Some(token) = stats_token {
+        let ctx = Arc::new(StatsApiContext {
+            sessions: Arc::clone(&sessions),
+            session_traffic: Arc::clone(&session_traffic),
+            stats: Arc::clone(&stats),
+            started_at,
+        });
+
+        tokio::spawn(async move {
+            if let Err(e) = run_stats_http_server(stats_port, token, ctx).await {
+                log::error!("Stats API server error: {}", e);
+            }
+        });
+    }
+
     // Channel for sending responses back to clients
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+    let (response_tx, mut response_rx) =
+        mpsc::unbounded_channel::<(SocketAddr, [u8; SESSION_ID_LEN], Vec<u8>)>();
 
     // Spawn response sender task
     let socket_sender = Arc::clone(&socket);
     let stats_out = Arc::clone(&stats);
+    let session_traffic_out = Arc::clone(&session_traffic);
     tokio::spawn(async move {
-        while let Some((addr, data)) = response_rx.recv().await {
+        while let Some((addr, session_id, data)) = response_rx.recv().await {
             if let Err(e) = socket_sender.send_to(&data, addr).await {
                 log::warn!("Failed to send response to {}: {}", addr, e);
             } else {
                 stats_out.packets_out.fetch_add(1, Ordering::Relaxed);
-                stats_out.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
+                stats_out
+                    .bytes_out
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                if let Some(entry) = session_traffic_out.get(&session_id) {
+                    entry
+                        .value()
+                        .bytes_out
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
             }
         }
     });
@@ -193,6 +302,7 @@ async fn main() -> Result<()> {
     let sessions_cleanup = Arc::clone(&sessions);
     let flows_cleanup = Arc::clone(&flows);
     let stats_cleanup = Arc::clone(&stats);
+    let session_traffic_cleanup = Arc::clone(&session_traffic);
     tokio::spawn(async move {
         let mut cleanup_timer = interval(CLEANUP_INTERVAL);
         loop {
@@ -227,22 +337,42 @@ async fn main() -> Result<()> {
                 // Not marked yet - mark if idle past timeout
                 if idle_time >= SESSION_TIMEOUT {
                     flow.marked_for_removal = Some(now);
-                    log::debug!("Marking flow {} for removal (idle {}s)", key, idle_time.as_secs());
+                    log::debug!(
+                        "Marking flow {} for removal (idle {}s)",
+                        key,
+                        idle_time.as_secs()
+                    );
                     marked_count += 1;
                 }
                 true
             });
 
-            // Update stats
-            stats_cleanup.active_flows.store(flows_cleanup.len() as u64, Ordering::Relaxed);
-            stats_cleanup.active_sessions.store(sessions_cleanup.len() as u64, Ordering::Relaxed);
+            let mut sessions_removed = 0u32;
+            let session_idle_limit = SESSION_TIMEOUT + FLOW_GRACE_PERIOD;
+            sessions_cleanup.retain(|session_id, session| {
+                if now.duration_since(session.last_activity) >= session_idle_limit {
+                    session_traffic_cleanup.remove(session_id);
+                    sessions_removed += 1;
+                    return false;
+                }
+                true
+            });
 
-            if removed_count > 0 || marked_count > 0 || revived_count > 0 {
+            // Update stats
+            stats_cleanup
+                .active_flows
+                .store(flows_cleanup.len() as u64, Ordering::Relaxed);
+            stats_cleanup
+                .active_sessions
+                .store(sessions_cleanup.len() as u64, Ordering::Relaxed);
+
+            if removed_count > 0 || marked_count > 0 || revived_count > 0 || sessions_removed > 0 {
                 log::info!(
-                    "Cleanup: marked={}, revived={}, removed={}, sessions={}, flows={}",
+                    "Cleanup: marked={}, revived={}, removed={}, session_removed={}, sessions={}, flows={}",
                     marked_count,
                     revived_count,
                     removed_count,
+                    sessions_removed,
                     sessions_cleanup.len(),
                     flows_cleanup.len()
                 );
@@ -304,8 +434,35 @@ async fn main() -> Result<()> {
         let mut session_id = [0u8; SESSION_ID_LEN];
         session_id.copy_from_slice(&buf[..SESSION_ID_LEN]);
 
+        let now = Instant::now();
+        let now_unix = unix_timestamp_secs();
+
         // Update session
-        sessions.insert(session_id, client_addr);
+        match sessions.entry(session_id) {
+            Entry::Occupied(mut entry) => {
+                let session = entry.get_mut();
+                session.client_addr = client_addr;
+                session.last_activity = now;
+                session.last_activity_unix = now_unix;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(SessionEntry {
+                    user_id: derive_user_id(session_id),
+                    client_addr,
+                    created_at_unix: now_unix,
+                    last_activity: now,
+                    last_activity_unix: now_unix,
+                });
+            }
+        }
+
+        let session_bytes = session_traffic
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(SessionTraffic::new(now_unix)));
+        session_bytes
+            .value()
+            .bytes_in
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         // Keepalive packet (just session ID, no payload)
         if len == SESSION_ID_LEN {
@@ -324,8 +481,11 @@ async fn main() -> Result<()> {
                 }
             }
             if flows_refreshed > 0 {
-                log::trace!("Keepalive refreshed {} flows for session {:016x}",
-                    flows_refreshed, u64::from_be_bytes(session_id));
+                log::trace!(
+                    "Keepalive refreshed {} flows for session {:016x}",
+                    flows_refreshed,
+                    u64::from_be_bytes(session_id)
+                );
             }
 
             continue;
@@ -341,6 +501,11 @@ async fn main() -> Result<()> {
         let Some((game_addr, udp_payload, original_info)) = parse_ip_packet_full(ip_packet) else {
             continue;
         };
+
+        // Prefer tunnel source IP as stable identity until strict auth user_id mapping is added.
+        if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+            session_entry.user_id = original_info.src_ip.to_string();
+        }
 
         // Create flow key
         let flow_key = format!("{:016x}:{}", u64::from_be_bytes(session_id), game_addr);
@@ -427,7 +592,7 @@ async fn run_flow_handler(
     mut rx: mpsc::Receiver<Vec<u8>>,
     response_tx: ResponseTx,
     flows: Arc<DashMap<String, FlowEntry>>,
-    sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SocketAddr>>,
+    sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>>,
     stats: Arc<Stats>,
 ) {
     // Create socket for this flow
@@ -447,7 +612,11 @@ async fn run_flow_handler(
         return;
     }
 
-    log::trace!("Flow {} started, local {}", flow_key, socket.local_addr().unwrap_or_else(|_| "?".parse().unwrap()));
+    log::trace!(
+        "Flow {} started, local {}",
+        flow_key,
+        socket.local_addr().unwrap_or_else(|_| "?".parse().unwrap())
+    );
 
     let mut recv_buf = [0u8; MAX_PACKET_SIZE];
     let mut consecutive_recv_errors: u32 = 0;
@@ -516,7 +685,7 @@ async fn run_flow_handler(
                         response.extend_from_slice(&response_ip_packet);
 
                         // Send to client (non-blocking, track drops)
-                        if response_tx.send((client_addr, response)).is_err() {
+                        if response_tx.send((client_addr, session_id, response)).is_err() {
                             stats.dropped_out.fetch_add(1, Ordering::Relaxed);
                         }
 
@@ -524,6 +693,10 @@ async fn run_flow_handler(
                         if let Some(mut entry) = flows.get_mut(&flow_key) {
                             entry.last_activity = Instant::now();
                             entry.marked_for_removal = None; // Keep alive
+                        }
+                        if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+                            session_entry.last_activity = Instant::now();
+                            session_entry.last_activity_unix = unix_timestamp_secs();
                         }
                     }
                     Err(e) if is_transient_recv_error(&e) => {
@@ -554,6 +727,303 @@ async fn run_flow_handler(
     // Cleanup
     flows.remove(&flow_key);
     log::trace!("Flow {} ended", flow_key);
+}
+
+async fn run_stats_http_server(
+    port: u16,
+    token: String,
+    context: Arc<StatsApiContext>,
+) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .context("Failed to bind stats API listener")?;
+
+    log::info!("Stats API listening on 127.0.0.1:{}", port);
+
+    loop {
+        let (stream, addr) = listener
+            .accept()
+            .await
+            .context("Failed to accept stats API client")?;
+        let token = token.clone();
+        let context = Arc::clone(&context);
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_stats_http_client(stream, &token, context).await {
+                log::debug!("Stats API client {} error: {}", addr, e);
+            }
+        });
+    }
+}
+
+async fn handle_stats_http_client(
+    mut stream: TcpStream,
+    token: &str,
+    context: Arc<StatsApiContext>,
+) -> Result<()> {
+    let mut request_buf = [0u8; MAX_HTTP_REQUEST_SIZE];
+    let mut total_read = 0usize;
+    let mut header_complete = false;
+
+    loop {
+        if total_read >= MAX_HTTP_REQUEST_SIZE {
+            write_http_response(
+                &mut stream,
+                431,
+                "Request Header Fields Too Large",
+                "{\"error\":\"request_too_large\"}",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let read_len = match tokio::time::timeout(
+            Duration::from_secs(STATS_HTTP_READ_TIMEOUT_SECS),
+            stream.read(&mut request_buf[total_read..]),
+        )
+        .await
+        {
+            Ok(read_result) => read_result.context("Failed to read stats API request")?,
+            Err(_) => {
+                write_http_response(
+                    &mut stream,
+                    408,
+                    "Request Timeout",
+                    "{\"error\":\"request_timeout\"}",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if read_len == 0 {
+            break;
+        }
+
+        total_read += read_len;
+
+        if find_http_header_end(&request_buf[..total_read]).is_some() {
+            header_complete = true;
+            break;
+        }
+    }
+
+    if total_read == 0 {
+        return Ok(());
+    }
+
+    if !header_complete {
+        write_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            "{\"error\":\"incomplete_request_headers\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let header_end = find_http_header_end(&request_buf[..total_read]).unwrap_or(total_read);
+    let request = String::from_utf8_lossy(&request_buf[..header_end]);
+    let mut lines = request.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let path = request_parts.next().unwrap_or("");
+
+    if method.is_empty() || path.is_empty() {
+        write_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            "{\"error\":\"bad_request_line\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut auth_header: Option<String> = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("authorization") {
+                auth_header = Some(value.trim().to_string());
+            }
+        }
+    }
+
+    if method != "GET" {
+        write_http_response(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "{\"error\":\"method_not_allowed\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let expected_auth = format!("Bearer {}", token);
+    if auth_header.as_deref() != Some(expected_auth.as_str()) {
+        write_http_response(
+            &mut stream,
+            401,
+            "Unauthorized",
+            "{\"error\":\"unauthorized\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match path {
+        "/v1/stats" => {
+            let body = render_stats_payload(&context);
+            write_http_response(&mut stream, 200, "OK", &body).await?;
+        }
+        "/v1/connections" => {
+            let body = render_connections_payload(&context);
+            write_http_response(&mut stream, 200, "OK", &body).await?;
+        }
+        _ => {
+            write_http_response(&mut stream, 404, "Not Found", "{\"error\":\"not_found\"}").await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    status_text: &str,
+    body: &str,
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code,
+        status_text,
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("Failed to write stats API response")?;
+    Ok(())
+}
+
+fn render_stats_payload(context: &StatsApiContext) -> String {
+    let elapsed_secs = context.started_at.elapsed().as_secs();
+    let bytes_in = context.stats.bytes_in.load(Ordering::Relaxed);
+    let bytes_out = context.stats.bytes_out.load(Ordering::Relaxed);
+    let inbound_bps = if elapsed_secs > 0 {
+        bytes_in / elapsed_secs
+    } else {
+        0
+    };
+    let outbound_bps = if elapsed_secs > 0 {
+        bytes_out / elapsed_secs
+    } else {
+        0
+    };
+
+    let mut active_user_ids = HashSet::<String>::new();
+    for entry in context.sessions.iter() {
+        active_user_ids.insert(entry.user_id.clone());
+    }
+
+    format!(
+        "{{\"version\":\"1.4.0\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{}}}",
+        unix_timestamp_secs(),
+        active_user_ids.len(),
+        context.sessions.len(),
+        context.stats.throttled_users.load(Ordering::Relaxed),
+        inbound_bps,
+        outbound_bps
+    )
+}
+
+fn find_http_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|i| i + 4)
+}
+
+fn render_connections_payload(context: &StatsApiContext) -> String {
+    struct ConnectionSnapshot {
+        user_id: String,
+        session_id: String,
+        connected_at: u64,
+        last_activity_at: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+        client_endpoint: String,
+    }
+
+    let mut snapshots = Vec::<ConnectionSnapshot>::new();
+    for entry in context.sessions.iter() {
+        let session_id = *entry.key();
+        let session_hex = format!("{:016x}", u64::from_be_bytes(session_id));
+        let (bytes_in, bytes_out, connected_at) = match context.session_traffic.get(&session_id) {
+            Some(traffic) => (
+                traffic.bytes_in.load(Ordering::Relaxed),
+                traffic.bytes_out.load(Ordering::Relaxed),
+                traffic.connected_at_unix,
+            ),
+            None => (0, 0, entry.created_at_unix),
+        };
+
+        snapshots.push(ConnectionSnapshot {
+            user_id: entry.user_id.clone(),
+            session_id: session_hex,
+            connected_at,
+            last_activity_at: entry.last_activity_unix,
+            bytes_in,
+            bytes_out,
+            client_endpoint: entry.client_addr.to_string(),
+        });
+    }
+
+    snapshots.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+
+    let mut body = format!(
+        "{{\"timestamp\":{},\"connections\":[",
+        unix_timestamp_secs()
+    );
+    for (index, conn) in snapshots.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(
+            "{{\"user_id\":\"{}\",\"session_id\":\"{}\",\"connected_at\":{},\"last_activity_at\":{},\"bytes_in\":{},\"bytes_out\":{},\"client_endpoint\":\"{}\"}}",
+            escape_json(&conn.user_id),
+            escape_json(&conn.session_id),
+            conn.connected_at,
+            conn.last_activity_at,
+            conn.bytes_in,
+            conn.bytes_out,
+            escape_json(&conn.client_endpoint),
+        ));
+    }
+    body.push_str("]}");
+    body
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Parse an IP packet and extract destination, UDP payload, and original packet info
@@ -815,9 +1285,8 @@ mod tests {
     fn test_ip_checksum() {
         // Test vector from RFC 1071
         let header = [
-            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
-            0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01,
-            0xc0, 0xa8, 0x00, 0xc7,
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
         ];
         let checksum = calculate_ip_checksum(&header);
         // The checksum should make the header sum to 0xFFFF
