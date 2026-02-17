@@ -47,6 +47,7 @@ const SESSION_ID_LEN: usize = 8;
 const DEFAULT_PORT: u16 = 51821;
 const DEFAULT_STATS_PORT: u16 = 51822;
 const MAX_HTTP_REQUEST_SIZE: usize = 8192;
+const STATS_HTTP_READ_TIMEOUT_SECS: u64 = 5;
 
 /// Get listen port from RELAY_PORT env var or use default
 fn get_listen_port() -> u16 {
@@ -761,20 +762,85 @@ async fn handle_stats_http_client(
     context: Arc<StatsApiContext>,
 ) -> Result<()> {
     let mut request_buf = [0u8; MAX_HTTP_REQUEST_SIZE];
-    let read_len = stream
-        .read(&mut request_buf)
+    let mut total_read = 0usize;
+    let mut header_complete = false;
+
+    loop {
+        if total_read >= MAX_HTTP_REQUEST_SIZE {
+            write_http_response(
+                &mut stream,
+                431,
+                "Request Header Fields Too Large",
+                "{\"error\":\"request_too_large\"}",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let read_len = match tokio::time::timeout(
+            Duration::from_secs(STATS_HTTP_READ_TIMEOUT_SECS),
+            stream.read(&mut request_buf[total_read..]),
+        )
         .await
-        .context("Failed to read stats API request")?;
-    if read_len == 0 {
+        {
+            Ok(read_result) => read_result.context("Failed to read stats API request")?,
+            Err(_) => {
+                write_http_response(
+                    &mut stream,
+                    408,
+                    "Request Timeout",
+                    "{\"error\":\"request_timeout\"}",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if read_len == 0 {
+            break;
+        }
+
+        total_read += read_len;
+
+        if find_http_header_end(&request_buf[..total_read]).is_some() {
+            header_complete = true;
+            break;
+        }
+    }
+
+    if total_read == 0 {
         return Ok(());
     }
 
-    let request = String::from_utf8_lossy(&request_buf[..read_len]);
+    if !header_complete {
+        write_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            "{\"error\":\"incomplete_request_headers\"}",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let header_end = find_http_header_end(&request_buf[..total_read]).unwrap_or(total_read);
+    let request = String::from_utf8_lossy(&request_buf[..header_end]);
     let mut lines = request.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts.next().unwrap_or("");
     let path = request_parts.next().unwrap_or("");
+
+    if method.is_empty() || path.is_empty() {
+        write_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            "{\"error\":\"bad_request_line\"}",
+        )
+        .await?;
+        return Ok(());
+    }
 
     let mut auth_header: Option<String> = None;
     for line in lines {
@@ -849,9 +915,19 @@ async fn write_http_response(
 }
 
 fn render_stats_payload(context: &StatsApiContext) -> String {
-    let elapsed_secs = context.started_at.elapsed().as_secs().max(1);
+    let elapsed_secs = context.started_at.elapsed().as_secs();
     let bytes_in = context.stats.bytes_in.load(Ordering::Relaxed);
     let bytes_out = context.stats.bytes_out.load(Ordering::Relaxed);
+    let inbound_bps = if elapsed_secs > 0 {
+        bytes_in / elapsed_secs
+    } else {
+        0
+    };
+    let outbound_bps = if elapsed_secs > 0 {
+        bytes_out / elapsed_secs
+    } else {
+        0
+    };
 
     let mut active_user_ids = HashSet::<String>::new();
     for entry in context.sessions.iter() {
@@ -864,9 +940,15 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
         active_user_ids.len(),
         context.sessions.len(),
         context.stats.throttled_users.load(Ordering::Relaxed),
-        bytes_in / elapsed_secs,
-        bytes_out / elapsed_secs
+        inbound_bps,
+        outbound_bps
     )
+}
+
+fn find_http_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|i| i + 4)
 }
 
 fn render_connections_payload(context: &StatsApiContext) -> String {
