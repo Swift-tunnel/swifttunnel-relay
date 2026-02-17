@@ -281,7 +281,7 @@ fn verify_relay_ticket(
     }
 
     if claims.iat > now_unix.saturating_add(AUTH_CLOCK_SKEW_SECS) {
-        return Err(RelayAuthVerifyError::Expired);
+        return Err(RelayAuthVerifyError::BadFormat);
     }
     if now_unix > claims.exp.saturating_add(AUTH_CLOCK_SKEW_SECS) {
         return Err(RelayAuthVerifyError::Expired);
@@ -1709,6 +1709,19 @@ mod tests {
 
         let result = verify_relay_ticket(&token, session_id, &auth_config, now);
         assert!(matches!(result, Err(RelayAuthVerifyError::Expired)));
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_iat_in_future_is_bad_format() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let future_iat = now + AUTH_CLOCK_SKEW_SECS + 1;
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", future_iat, future_iat + 300);
+
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
     }
 
     #[test]
