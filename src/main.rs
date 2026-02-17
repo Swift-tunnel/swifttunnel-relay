@@ -28,8 +28,15 @@
 //! - Flow soft-delete with grace period
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::{
+    STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE,
+    URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+};
+use base64::Engine as _;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use ring::signature::{UnparsedPublicKey, ED25519};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
 use std::io::ErrorKind;
@@ -48,6 +55,144 @@ const DEFAULT_PORT: u16 = 51821;
 const DEFAULT_STATS_PORT: u16 = 51822;
 const MAX_HTTP_REQUEST_SIZE: usize = 8192;
 const STATS_HTTP_READ_TIMEOUT_SECS: u64 = 5;
+const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
+const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
+const AUTH_ACK_OK: u8 = 0;
+const AUTH_ACK_BAD_FORMAT: u8 = 1;
+const AUTH_ACK_BAD_SIGNATURE: u8 = 2;
+const AUTH_ACK_EXPIRED: u8 = 3;
+const AUTH_ACK_SID_MISMATCH: u8 = 4;
+const AUTH_ACK_SERVER_MISMATCH: u8 = 5;
+const AUTH_ACK_AUTH_DISABLED: u8 = 6;
+const MAX_AUTH_TOKEN_LEN: usize = 4096;
+const AUTH_CLOCK_SKEW_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayAuthMode {
+    Off,
+    Optional,
+    Required,
+}
+
+impl RelayAuthMode {
+    fn from_env(value: Option<String>) -> Self {
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("required") => Self::Required,
+            Some("optional") => Self::Optional,
+            _ => Self::Off,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+
+    fn requires_auth(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
+#[derive(Clone)]
+struct RelayAuthConfig {
+    mode: RelayAuthMode,
+    public_key: Option<Vec<u8>>,
+    server_id: Option<String>,
+}
+
+impl RelayAuthConfig {
+    fn from_env() -> Result<Self> {
+        let mode = RelayAuthMode::from_env(env::var("RELAY_AUTH_MODE").ok());
+        if mode == RelayAuthMode::Off {
+            return Ok(Self {
+                mode,
+                public_key: None,
+                server_id: None,
+            });
+        }
+
+        let key_b64 = env::var("RELAY_AUTH_PUBLIC_KEY_B64")
+            .context("RELAY_AUTH_PUBLIC_KEY_B64 is required when RELAY_AUTH_MODE != off")?;
+        let key_bytes = decode_base64_flexible(key_b64.trim())
+            .context("RELAY_AUTH_PUBLIC_KEY_B64 is not valid base64/base64url")?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!(
+                "RELAY_AUTH_PUBLIC_KEY_B64 must decode to 32 bytes (got {})",
+                key_bytes.len()
+            );
+        }
+
+        let server_id = env::var("RELAY_SERVER_ID")
+            .context("RELAY_SERVER_ID is required when RELAY_AUTH_MODE != off")?;
+        if server_id.trim().is_empty() {
+            anyhow::bail!("RELAY_SERVER_ID cannot be empty");
+        }
+
+        Ok(Self {
+            mode,
+            public_key: Some(key_bytes),
+            server_id: Some(server_id),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAuthState {
+    Legacy,
+    Authenticated,
+}
+
+impl SessionAuthState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Authenticated => "authenticated",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayTicketClaims {
+    v: u8,
+    iss: String,
+    aud: String,
+    sub: String,
+    sid: String,
+    srv: String,
+    iat: u64,
+    exp: u64,
+    #[allow(dead_code)]
+    jti: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayAuthVerifyError {
+    BadFormat,
+    BadSignature,
+    Expired,
+    SidMismatch,
+    ServerMismatch,
+}
+
+impl RelayAuthVerifyError {
+    fn ack_status(self) -> u8 {
+        match self {
+            Self::BadFormat => AUTH_ACK_BAD_FORMAT,
+            Self::BadSignature => AUTH_ACK_BAD_SIGNATURE,
+            Self::Expired => AUTH_ACK_EXPIRED,
+            Self::SidMismatch => AUTH_ACK_SID_MISMATCH,
+            Self::ServerMismatch => AUTH_ACK_SERVER_MISMATCH,
+        }
+    }
+}
 
 /// Get listen port from RELAY_PORT env var or use default
 fn get_listen_port() -> u16 {
@@ -74,6 +219,108 @@ fn get_stats_token() -> Option<String> {
             Some(token)
         }
     })
+}
+
+fn decode_base64_flexible(input: &str) -> Option<Vec<u8>> {
+    BASE64_URL_SAFE_NO_PAD
+        .decode(input)
+        .ok()
+        .or_else(|| BASE64_URL_SAFE.decode(input).ok())
+        .or_else(|| BASE64_STANDARD.decode(input).ok())
+}
+
+fn verify_relay_ticket(
+    token: &str,
+    session_id: [u8; SESSION_ID_LEN],
+    auth: &RelayAuthConfig,
+    now_unix: u64,
+) -> Result<String, RelayAuthVerifyError> {
+    if token.is_empty() || token.len() > MAX_AUTH_TOKEN_LEN {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+
+    let (payload_b64, signature_b64) = token
+        .split_once('.')
+        .ok_or(RelayAuthVerifyError::BadFormat)?;
+    let payload = decode_base64_flexible(payload_b64).ok_or(RelayAuthVerifyError::BadFormat)?;
+    let signature = decode_base64_flexible(signature_b64).ok_or(RelayAuthVerifyError::BadFormat)?;
+
+    if signature.len() != 64 {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+
+    let public_key = auth
+        .public_key
+        .as_deref()
+        .ok_or(RelayAuthVerifyError::BadFormat)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&payload, &signature)
+        .map_err(|_| RelayAuthVerifyError::BadSignature)?;
+
+    let claims: RelayTicketClaims =
+        serde_json::from_slice(&payload).map_err(|_| RelayAuthVerifyError::BadFormat)?;
+    if claims.v != 1 {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+    if claims.iss != "swifttunnel-web" || claims.aud != "swifttunnel-relay" || claims.sub.is_empty()
+    {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+
+    let expected_sid = format!("{:016x}", u64::from_be_bytes(session_id));
+    if claims.sid != expected_sid {
+        return Err(RelayAuthVerifyError::SidMismatch);
+    }
+
+    let expected_server = auth
+        .server_id
+        .as_deref()
+        .ok_or(RelayAuthVerifyError::BadFormat)?;
+    if claims.srv != expected_server {
+        return Err(RelayAuthVerifyError::ServerMismatch);
+    }
+
+    if claims.iat > now_unix.saturating_add(AUTH_CLOCK_SKEW_SECS) {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+    if now_unix > claims.exp.saturating_add(AUTH_CLOCK_SKEW_SECS) {
+        return Err(RelayAuthVerifyError::Expired);
+    }
+
+    Ok(claims.sub)
+}
+
+fn parse_auth_hello_token(frame: &[u8], len: usize) -> Result<&str, RelayAuthVerifyError> {
+    if len < SESSION_ID_LEN + 3 {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+
+    let token_len = u16::from_be_bytes([frame[SESSION_ID_LEN + 1], frame[SESSION_ID_LEN + 2]]);
+    let token_len = token_len as usize;
+    let payload_start = SESSION_ID_LEN + 3;
+    let payload_end = payload_start + token_len;
+
+    if token_len == 0 || token_len > MAX_AUTH_TOKEN_LEN || payload_end > len || payload_end != len {
+        return Err(RelayAuthVerifyError::BadFormat);
+    }
+
+    std::str::from_utf8(&frame[payload_start..payload_end])
+        .map_err(|_| RelayAuthVerifyError::BadFormat)
+}
+
+async fn send_auth_ack(
+    socket: &UdpSocket,
+    client_addr: SocketAddr,
+    session_id: [u8; SESSION_ID_LEN],
+    status: u8,
+) {
+    let mut packet = [0u8; SESSION_ID_LEN + 2];
+    packet[..SESSION_ID_LEN].copy_from_slice(&session_id);
+    packet[SESSION_ID_LEN] = AUTH_ACK_FRAME_TYPE;
+    packet[SESSION_ID_LEN + 1] = status;
+    if let Err(e) = socket.send_to(&packet, client_addr).await {
+        log::debug!("Failed to send auth ack to {}: {}", client_addr, e);
+    }
 }
 /// Session timeout increased from 60s to 180s to survive network hiccups
 const SESSION_TIMEOUT: Duration = Duration::from_secs(180);
@@ -143,6 +390,7 @@ struct OriginalPacketInfo {
 /// Session metadata tracked by the relay
 struct SessionEntry {
     user_id: String,
+    auth_state: SessionAuthState,
     client_addr: SocketAddr,
     created_at_unix: u64,
     last_activity: Instant,
@@ -223,6 +471,7 @@ async fn main() -> Result<()> {
     let listen_port = get_listen_port();
     let stats_port = get_stats_port();
     let stats_token = get_stats_token();
+    let auth_config = RelayAuthConfig::from_env()?;
 
     log::info!("╔════════════════════════════════════════════╗");
     log::info!("║     SwiftTunnel V3 UDP Relay v1.4.0        ║");
@@ -243,6 +492,7 @@ async fn main() -> Result<()> {
             "Local stats API disabled (set RELAY_STATS_TOKEN to enable localhost endpoints)"
         );
     }
+    log::info!("Relay auth mode: {}", auth_config.mode.as_str());
 
     let socket = Arc::new(socket);
     let stats = Arc::new(Stats::new());
@@ -438,16 +688,20 @@ async fn main() -> Result<()> {
         let now_unix = unix_timestamp_secs();
 
         // Update session
+        let mut session_authenticated = false;
         match sessions.entry(session_id) {
             Entry::Occupied(mut entry) => {
                 let session = entry.get_mut();
                 session.client_addr = client_addr;
                 session.last_activity = now;
                 session.last_activity_unix = now_unix;
+                session_authenticated =
+                    matches!(session.auth_state, SessionAuthState::Authenticated);
             }
             Entry::Vacant(entry) => {
                 entry.insert(SessionEntry {
                     user_id: derive_user_id(session_id),
+                    auth_state: SessionAuthState::Legacy,
                     client_addr,
                     created_at_unix: now_unix,
                     last_activity: now,
@@ -463,6 +717,43 @@ async fn main() -> Result<()> {
             .value()
             .bytes_in
             .fetch_add(len as u64, Ordering::Relaxed);
+
+        // Auth hello control frame:
+        // [session_id:8][0xA1][token_len_be_u16][token_utf8]
+        if len >= SESSION_ID_LEN + 3 && buf[SESSION_ID_LEN] == AUTH_HELLO_FRAME_TYPE {
+            if auth_config.mode == RelayAuthMode::Off {
+                send_auth_ack(
+                    socket.as_ref(),
+                    client_addr,
+                    session_id,
+                    AUTH_ACK_AUTH_DISABLED,
+                )
+                .await;
+                continue;
+            }
+
+            let token = match parse_auth_hello_token(&buf, len) {
+                Ok(value) => value,
+                Err(err) => {
+                    send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
+                    continue;
+                }
+            };
+
+            match verify_relay_ticket(token, session_id, &auth_config, now_unix) {
+                Ok(user_id) => {
+                    if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+                        session_entry.user_id = user_id;
+                        session_entry.auth_state = SessionAuthState::Authenticated;
+                    }
+                    send_auth_ack(socket.as_ref(), client_addr, session_id, AUTH_ACK_OK).await;
+                }
+                Err(err) => {
+                    send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
+                }
+            }
+            continue;
+        }
 
         // Keepalive packet (just session ID, no payload)
         if len == SESSION_ID_LEN {
@@ -491,6 +782,11 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        if auth_config.mode.requires_auth() && !session_authenticated {
+            stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
         // Need enough for IP header
         if len < SESSION_ID_LEN + IP_HEADER_MIN {
             continue;
@@ -502,9 +798,11 @@ async fn main() -> Result<()> {
             continue;
         };
 
-        // Prefer tunnel source IP as stable identity until strict auth user_id mapping is added.
+        // In legacy mode, use tunnel source IP as best-effort user identity.
         if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-            session_entry.user_id = original_info.src_ip.to_string();
+            if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
+                session_entry.user_id = original_info.src_ip.to_string();
+            }
         }
 
         // Create flow key
@@ -955,6 +1253,7 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
     struct ConnectionSnapshot {
         user_id: String,
         session_id: String,
+        auth_state: String,
         connected_at: u64,
         last_activity_at: u64,
         bytes_in: u64,
@@ -978,6 +1277,7 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
         snapshots.push(ConnectionSnapshot {
             user_id: entry.user_id.clone(),
             session_id: session_hex,
+            auth_state: entry.auth_state.as_str().to_string(),
             connected_at,
             last_activity_at: entry.last_activity_unix,
             bytes_in,
@@ -997,9 +1297,10 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
             body.push(',');
         }
         body.push_str(&format!(
-            "{{\"user_id\":\"{}\",\"session_id\":\"{}\",\"connected_at\":{},\"last_activity_at\":{},\"bytes_in\":{},\"bytes_out\":{},\"client_endpoint\":\"{}\"}}",
+            "{{\"user_id\":\"{}\",\"session_id\":\"{}\",\"auth_state\":\"{}\",\"connected_at\":{},\"last_activity_at\":{},\"bytes_in\":{},\"bytes_out\":{},\"client_endpoint\":\"{}\"}}",
             escape_json(&conn.user_id),
             escape_json(&conn.session_id),
+            escape_json(&conn.auth_state),
             conn.connected_at,
             conn.last_activity_at,
             conn.bytes_in,
@@ -1200,6 +1501,46 @@ mod rand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn test_auth_materials() -> (Ed25519KeyPair, RelayAuthConfig) {
+        let seed = [7u8; 32];
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed).expect("seed must be valid");
+        let auth_config = RelayAuthConfig {
+            mode: RelayAuthMode::Required,
+            public_key: Some(key_pair.public_key().as_ref().to_vec()),
+            server_id: Some("us-east-nj".to_string()),
+        };
+        (key_pair, auth_config)
+    }
+
+    fn make_ticket_token(
+        key_pair: &Ed25519KeyPair,
+        sid: &str,
+        server: &str,
+        now: u64,
+        exp: u64,
+    ) -> String {
+        let payload = serde_json::json!({
+            "v": 1,
+            "iss": "swifttunnel-web",
+            "aud": "swifttunnel-relay",
+            "sub": "11111111-1111-1111-1111-111111111111",
+            "sid": sid,
+            "srv": server,
+            "iat": now,
+            "exp": exp,
+            "jti": "22222222-2222-2222-2222-222222222222",
+        });
+        let payload_bytes = serde_json::to_vec(&payload).expect("json serialization must work");
+        let signature = key_pair.sign(&payload_bytes);
+        format!(
+            "{}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(&payload_bytes),
+            BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
 
     #[test]
     fn test_parse_ip_packet_full() {
@@ -1300,5 +1641,107 @@ mod tests {
         packet[9] = 6; // TCP, not UDP
 
         assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_auth_hello_token_valid_and_malformed() {
+        let token = "abc.def";
+        let mut frame = Vec::with_capacity(SESSION_ID_LEN + 3 + token.len());
+        frame.extend_from_slice(&[0u8; SESSION_ID_LEN]);
+        frame.push(AUTH_HELLO_FRAME_TYPE);
+        frame.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        frame.extend_from_slice(token.as_bytes());
+
+        let parsed = parse_auth_hello_token(&frame, frame.len()).expect("frame should parse");
+        assert_eq!(parsed, token);
+
+        let mut malformed = frame.clone();
+        malformed[SESSION_ID_LEN + 1] = 0;
+        malformed[SESSION_ID_LEN + 2] = (token.len() as u8).saturating_add(1);
+        assert!(matches!(
+            parse_auth_hello_token(&malformed, malformed.len()),
+            Err(RelayAuthVerifyError::BadFormat)
+        ));
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_valid() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", now, now + 300);
+
+        let user = verify_relay_ticket(&token, session_id, &auth_config, now).expect("valid token");
+        assert_eq!(user, "11111111-1111-1111-1111-111111111111");
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_sid_mismatch() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let token = make_ticket_token(&key_pair, "ffffffffffffffff", "us-east-nj", now, now + 300);
+
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::SidMismatch)));
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_server_mismatch() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let token = make_ticket_token(&key_pair, &sid, "tokyo-02", now, now + 300);
+
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::ServerMismatch)));
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_expired() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", now - 600, now - 200);
+
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::Expired)));
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_iat_in_future_is_bad_format() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let future_iat = now + AUTH_CLOCK_SKEW_SECS + 1;
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", future_iat, future_iat + 300);
+
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_bad_signature() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", now, now + 300);
+
+        let (payload, signature) = token
+            .split_once('.')
+            .expect("token should contain separator");
+        let mut sig_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(signature)
+            .expect("signature should decode");
+        sig_bytes[0] ^= 0xAA;
+        let tampered = format!("{}.{}", payload, BASE64_URL_SAFE_NO_PAD.encode(sig_bytes));
+
+        let result = verify_relay_ticket(&tampered, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadSignature)));
     }
 }
