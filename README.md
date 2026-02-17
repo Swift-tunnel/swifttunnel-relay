@@ -35,6 +35,7 @@ The relay:
 - **Graceful error recovery** - Transient errors don't kill flows
 - **Bounded channels** - Backpressure prevents OOM (games handle packet loss)
 - **Soft-delete with grace period** - Late packets can revive sessions
+- **Authenticated localhost telemetry API** - `/v1/stats` and `/v1/connections`
 
 ## Installation
 
@@ -69,6 +70,9 @@ cargo build --release --target x86_64-unknown-linux-gnu
 # Run on custom port
 RELAY_PORT=9000 ./swifttunnel-relay
 
+# Enable localhost telemetry API (recommended for server integrations)
+RELAY_STATS_TOKEN=change-me RELAY_STATS_PORT=51822 ./swifttunnel-relay
+
 # With debug logging
 RUST_LOG=debug ./swifttunnel-relay
 ```
@@ -78,6 +82,8 @@ RUST_LOG=debug ./swifttunnel-relay
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RELAY_PORT` | `51821` | UDP port to listen on |
+| `RELAY_STATS_PORT` | `51822` | Localhost HTTP telemetry port (`127.0.0.1` only) |
+| `RELAY_STATS_TOKEN` | _(unset)_ | Enables/authenticates localhost telemetry API when set |
 | `RUST_LOG` | `info` | Log level (trace, debug, info, warn, error) |
 
 ### systemd Service
@@ -93,6 +99,8 @@ Type=simple
 ExecStart=/usr/local/bin/swifttunnel-relay
 Environment=RUST_LOG=info
 Environment=RELAY_PORT=51821
+Environment=RELAY_STATS_PORT=51822
+Environment=RELAY_STATS_TOKEN=replace-with-long-random-token
 Restart=always
 RestartSec=5
 
@@ -171,6 +179,44 @@ View logs:
 ```bash
 journalctl -u swifttunnel-relay -f
 ```
+
+### Localhost Telemetry API
+
+When `RELAY_STATS_TOKEN` is configured, relay exposes authenticated HTTP telemetry endpoints on:
+
+`http://127.0.0.1:${RELAY_STATS_PORT}`
+
+Authentication header (required):
+
+`Authorization: Bearer ${RELAY_STATS_TOKEN}`
+
+Available endpoints:
+- `GET /v1/stats` - relay-level counters and rates
+- `GET /v1/connections` - live session rows (`user_id`, `session_id`, activity, bytes, endpoint)
+
+Current `user_id` behavior:
+- uses authenticated identity when available
+- otherwise falls back to tunnel source IP/session-derived identity
+
+Example:
+```bash
+curl -s \
+  -H "Authorization: Bearer $RELAY_STATS_TOKEN" \
+  http://127.0.0.1:51822/v1/stats
+
+curl -s \
+  -H "Authorization: Bearer $RELAY_STATS_TOKEN" \
+  http://127.0.0.1:51822/v1/connections
+```
+
+`/v1/stats` response fields:
+- `version`
+- `timestamp`
+- `active_users`
+- `active_sessions`
+- `throttled_users`
+- `inbound_bps`
+- `outbound_bps`
 
 ## Performance Tuning
 
