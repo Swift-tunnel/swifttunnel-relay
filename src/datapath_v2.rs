@@ -1,0 +1,1179 @@
+use anyhow::{Context, Result};
+use dashmap::DashMap;
+use mio::net::UdpSocket as MioUdpSocket;
+use mio::{Events, Interest, Poll, Token, Waker};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::env;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const DEFAULT_POOL_SLOTS: usize = 8192;
+const MIN_POOL_SLOTS: usize = 512;
+const MAX_POOL_SLOTS: usize = 262_144;
+
+const DEFAULT_SHARD_QUEUE_CAP: usize = 4096;
+const MIN_SHARD_QUEUE_CAP: usize = 256;
+const MAX_SHARD_QUEUE_CAP: usize = 262_144;
+
+const DEFAULT_TX_QUEUE_CAP: usize = 8192;
+const MIN_TX_QUEUE_CAP: usize = 256;
+const MAX_TX_QUEUE_CAP: usize = 262_144;
+
+const DEFAULT_SOCKET_RCVBUF_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_SOCKET_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
+
+const DEFAULT_FLOW_SOCKET_RCVBUF_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_FLOW_SOCKET_SNDBUF_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelayDatapath {
+    V1,
+    V2,
+}
+
+pub(super) fn get_relay_datapath() -> RelayDatapath {
+    match env::var("RELAY_DATAPATH")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("v1") | Some("tokio") => RelayDatapath::V1,
+        Some("v2") | Some("sharded") => RelayDatapath::V2,
+        _ => RelayDatapath::V2,
+    }
+}
+
+fn parse_usize_env(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn clamp_usize(value: usize, min: usize, max: usize) -> usize {
+    value.clamp(min, max)
+}
+
+fn get_shard_count() -> usize {
+    let default = num_cpus::get_physical().max(1);
+    clamp_usize(parse_usize_env("RELAY_SHARDS").unwrap_or(default), 1, 256)
+}
+
+fn get_pool_slots() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_V2_POOL_SLOTS").unwrap_or(DEFAULT_POOL_SLOTS),
+        MIN_POOL_SLOTS,
+        MAX_POOL_SLOTS,
+    )
+}
+
+fn get_shard_queue_cap() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_V2_SHARD_QUEUE").unwrap_or(DEFAULT_SHARD_QUEUE_CAP),
+        MIN_SHARD_QUEUE_CAP,
+        MAX_SHARD_QUEUE_CAP,
+    )
+}
+
+fn get_tx_queue_cap() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_V2_TX_QUEUE").unwrap_or(DEFAULT_TX_QUEUE_CAP),
+        MIN_TX_QUEUE_CAP,
+        MAX_TX_QUEUE_CAP,
+    )
+}
+
+fn get_socket_rcvbuf_bytes() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_SOCKET_RCVBUF_BYTES").unwrap_or(DEFAULT_SOCKET_RCVBUF_BYTES),
+        256 * 1024,
+        64 * 1024 * 1024,
+    )
+}
+
+fn get_socket_sndbuf_bytes() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_SOCKET_SNDBUF_BYTES").unwrap_or(DEFAULT_SOCKET_SNDBUF_BYTES),
+        256 * 1024,
+        64 * 1024 * 1024,
+    )
+}
+
+fn get_flow_socket_rcvbuf_bytes() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_FLOW_RCVBUF_BYTES").unwrap_or(DEFAULT_FLOW_SOCKET_RCVBUF_BYTES),
+        256 * 1024,
+        64 * 1024 * 1024,
+    )
+}
+
+fn get_flow_socket_sndbuf_bytes() -> usize {
+    clamp_usize(
+        parse_usize_env("RELAY_FLOW_SNDBUF_BYTES").unwrap_or(DEFAULT_FLOW_SOCKET_SNDBUF_BYTES),
+        256 * 1024,
+        64 * 1024 * 1024,
+    )
+}
+
+struct BufferPool {
+    buffers: Vec<UnsafeCell<[u8; super::MAX_PACKET_SIZE]>>,
+    free_tx: crossbeam_channel::Sender<usize>,
+    free_rx: crossbeam_channel::Receiver<usize>,
+}
+
+// Safety: buffer indices are checked out exclusively via the free list.
+unsafe impl Sync for BufferPool {}
+unsafe impl Send for BufferPool {}
+
+impl BufferPool {
+    fn new(slots: usize) -> Self {
+        let (free_tx, free_rx) = crossbeam_channel::bounded(slots);
+        let mut buffers = Vec::with_capacity(slots);
+        for i in 0..slots {
+            buffers.push(UnsafeCell::new([0u8; super::MAX_PACKET_SIZE]));
+            free_tx
+                .send(i)
+                .expect("buffer pool free list must accept initial slots");
+        }
+        Self {
+            buffers,
+            free_tx,
+            free_rx,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<usize> {
+        self.free_rx.try_recv().ok()
+    }
+
+    fn release(&self, idx: usize) {
+        let _ = self.free_tx.send(idx);
+    }
+
+    unsafe fn buffer_mut(&self, idx: usize) -> &mut [u8; super::MAX_PACKET_SIZE] {
+        &mut *self.buffers[idx].get()
+    }
+
+    unsafe fn buffer(&self, idx: usize) -> &[u8; super::MAX_PACKET_SIZE] {
+        &*self.buffers[idx].get()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FlowKey {
+    session_id: [u8; super::SESSION_ID_LEN],
+    game_addr: SocketAddr,
+}
+
+struct FlowState {
+    socket: MioUdpSocket,
+    client_addr: SocketAddr,
+    original_info: super::OriginalPacketInfo,
+    last_activity: Instant,
+    marked_for_removal: Option<Instant>,
+    token: Token,
+}
+
+enum ShardMsg {
+    ClientPacket {
+        session_id: [u8; super::SESSION_ID_LEN],
+        client_addr: SocketAddr,
+        game_addr: SocketAddr,
+        original_info: super::OriginalPacketInfo,
+        payload_idx: usize,
+        payload_len: usize,
+    },
+    Keepalive {
+        session_id: [u8; super::SESSION_ID_LEN],
+        client_addr: SocketAddr,
+    },
+    RemoveSession {
+        session_id: [u8; super::SESSION_ID_LEN],
+    },
+}
+
+#[derive(Clone, Copy)]
+struct TxPacket {
+    addr: SocketAddr,
+    session_id: [u8; super::SESSION_ID_LEN],
+    buf_idx: usize,
+    len: usize,
+}
+
+fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize) -> usize {
+    let sid = u64::from_be_bytes(session_id);
+    (sid as usize) % shard_count
+}
+
+fn bind_main_socket(listen_port: u16) -> Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("Failed to create UDP socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("Failed to set SO_REUSEADDR")?;
+    socket
+        .set_recv_buffer_size(get_socket_rcvbuf_bytes())
+        .context("Failed to set SO_RCVBUF")?;
+    socket
+        .set_send_buffer_size(get_socket_sndbuf_bytes())
+        .context("Failed to set SO_SNDBUF")?;
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port);
+    socket
+        .bind(&addr.into())
+        .context("Failed to bind UDP socket")?;
+    Ok(socket.into())
+}
+
+fn create_flow_socket(game_addr: SocketAddr) -> Result<MioUdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("Failed to create flow UDP socket")?;
+    socket
+        .set_recv_buffer_size(get_flow_socket_rcvbuf_bytes())
+        .context("Failed to set flow SO_RCVBUF")?;
+    socket
+        .set_send_buffer_size(get_flow_socket_sndbuf_bytes())
+        .context("Failed to set flow SO_SNDBUF")?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
+        .context("Failed to bind flow socket")?;
+    let std_socket: UdpSocket = socket.into();
+    std_socket
+        .set_nonblocking(true)
+        .context("Failed to set flow socket nonblocking")?;
+    std_socket
+        .connect(game_addr)
+        .context("Failed to connect flow socket")?;
+    Ok(MioUdpSocket::from_std(std_socket))
+}
+
+fn write_response_ip_packet_into(
+    dst: &mut [u8],
+    udp_payload: &[u8],
+    original: super::OriginalPacketInfo,
+) -> Option<usize> {
+    let udp_len = super::UDP_HEADER_SIZE + udp_payload.len();
+    let total_len = super::IP_HEADER_MIN + udp_len;
+    if total_len > dst.len() {
+        return None;
+    }
+
+    let packet = &mut dst[..total_len];
+
+    // === IP Header (20 bytes) ===
+    packet[0] = 0x45; // v4, ihl=5
+    packet[1] = 0; // DSCP/ECN
+    packet[2] = ((total_len >> 8) & 0xFF) as u8;
+    packet[3] = (total_len & 0xFF) as u8;
+    // Identification (unused when DF is set; keep deterministic to avoid RNG overhead).
+    packet[4] = 0;
+    packet[5] = 0;
+    packet[6] = 0x40; // DF
+    packet[7] = 0;
+    packet[8] = 64; // TTL
+    packet[9] = 17; // UDP
+    packet[10] = 0;
+    packet[11] = 0;
+    packet[12..16].copy_from_slice(&original.dst_ip.octets());
+    packet[16..20].copy_from_slice(&original.src_ip.octets());
+
+    let ip_checksum = super::calculate_ip_checksum(&packet[..super::IP_HEADER_MIN]);
+    packet[10] = (ip_checksum >> 8) as u8;
+    packet[11] = (ip_checksum & 0xFF) as u8;
+
+    // === UDP Header (8 bytes) ===
+    let udp_start = super::IP_HEADER_MIN;
+    packet[udp_start] = (original.dst_port >> 8) as u8;
+    packet[udp_start + 1] = (original.dst_port & 0xFF) as u8;
+    packet[udp_start + 2] = (original.src_port >> 8) as u8;
+    packet[udp_start + 3] = (original.src_port & 0xFF) as u8;
+    packet[udp_start + 4] = ((udp_len >> 8) & 0xFF) as u8;
+    packet[udp_start + 5] = (udp_len & 0xFF) as u8;
+    packet[udp_start + 6] = 0;
+    packet[udp_start + 7] = 0;
+
+    let payload_start = udp_start + super::UDP_HEADER_SIZE;
+    packet[payload_start..].copy_from_slice(udp_payload);
+
+    Some(total_len)
+}
+
+fn remove_flow_from_session_index(
+    session_flows: &mut HashMap<[u8; super::SESSION_ID_LEN], Vec<SocketAddr>>,
+    flow: &FlowKey,
+) {
+    let Some(list) = session_flows.get_mut(&flow.session_id) else {
+        return;
+    };
+    if let Some(pos) = list.iter().position(|addr| *addr == flow.game_addr) {
+        list.swap_remove(pos);
+    }
+    if list.is_empty() {
+        session_flows.remove(&flow.session_id);
+    }
+}
+
+fn run_shard(
+    shard_id: usize,
+    inbox: crossbeam_channel::Receiver<ShardMsg>,
+    tx_data: crossbeam_channel::Sender<TxPacket>,
+    _tx_control: crossbeam_channel::Sender<TxPacket>,
+    pool: Arc<BufferPool>,
+    sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>>,
+    stats: Arc<super::Stats>,
+    flow_counts: Arc<Vec<AtomicU64>>,
+    waker_pub: crossbeam_channel::Sender<(usize, Arc<Waker>)>,
+) -> Result<()> {
+    const TOKEN_WAKE: Token = Token(0);
+
+    let mut poll = Poll::new().context("Failed to create mio Poll")?;
+    let waker =
+        Arc::new(Waker::new(poll.registry(), TOKEN_WAKE).context("Failed to create mio Waker")?);
+    waker_pub
+        .send((shard_id, Arc::clone(&waker)))
+        .expect("waker publish must succeed");
+
+    let mut events = Events::with_capacity(1024);
+
+    let mut next_token: usize = 1;
+    let mut token_to_flow: HashMap<Token, FlowKey> = HashMap::new();
+    let mut flows: HashMap<FlowKey, FlowState> = HashMap::new();
+    let mut session_flows: HashMap<[u8; super::SESSION_ID_LEN], Vec<SocketAddr>> = HashMap::new();
+
+    let mut recv_buf = [0u8; super::MAX_PACKET_SIZE];
+    let mut cleanup_at = Instant::now() + super::CLEANUP_INTERVAL;
+
+    log::info!("V2 shard {} started", shard_id);
+
+    loop {
+        let now = Instant::now();
+        let timeout = cleanup_at.saturating_duration_since(now);
+        poll.poll(&mut events, Some(timeout))
+            .context("mio poll failed")?;
+
+        for event in events.iter() {
+            let token = event.token();
+            if token == TOKEN_WAKE {
+                // Drain inbox below.
+                continue;
+            }
+
+            let Some(flow_key) = token_to_flow.get(&token).copied() else {
+                continue;
+            };
+            let Some(flow) = flows.get_mut(&flow_key) else {
+                continue;
+            };
+
+            // Drain all available datagrams.
+            loop {
+                match flow.socket.recv(&mut recv_buf) {
+                    Ok(len) => {
+                        flow.last_activity = Instant::now();
+                        flow.marked_for_removal = None;
+
+                        if let Some(mut session_entry) = sessions.get_mut(&flow_key.session_id) {
+                            session_entry.last_activity = Instant::now();
+                            session_entry.last_activity_unix = super::unix_timestamp_secs();
+                        }
+
+                        let Some(buf_idx) = pool.try_acquire() else {
+                            stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        };
+
+                        let total_len = unsafe {
+                            let out = pool.buffer_mut(buf_idx);
+                            out[..super::SESSION_ID_LEN].copy_from_slice(&flow_key.session_id);
+                            let ip_len = match write_response_ip_packet_into(
+                                &mut out[super::SESSION_ID_LEN..],
+                                &recv_buf[..len],
+                                flow.original_info,
+                            ) {
+                                Some(value) => value,
+                                None => {
+                                    pool.release(buf_idx);
+                                    break;
+                                }
+                            };
+                            super::SESSION_ID_LEN + ip_len
+                        };
+
+                        let packet = TxPacket {
+                            addr: flow.client_addr,
+                            session_id: flow_key.session_id,
+                            buf_idx,
+                            len: total_len,
+                        };
+
+                        if tx_data.try_send(packet).is_err() {
+                            stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+                            pool.release(buf_idx);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        log::debug!(
+                            "V2 shard {} flow {} recv error: {} (kind={:?})",
+                            shard_id,
+                            flow_key.game_addr,
+                            e,
+                            e.kind()
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Drain inbox (woken by RX thread).
+        while let Ok(msg) = inbox.try_recv() {
+            match msg {
+                ShardMsg::ClientPacket {
+                    session_id,
+                    client_addr,
+                    game_addr,
+                    original_info,
+                    payload_idx,
+                    payload_len,
+                } => {
+                    let key = FlowKey {
+                        session_id,
+                        game_addr,
+                    };
+
+                    let flow = match flows.get_mut(&key) {
+                        Some(existing) => existing,
+                        None => {
+                            let mut socket = match create_flow_socket(game_addr) {
+                                Ok(sock) => sock,
+                                Err(e) => {
+                                    log::debug!(
+                                        "V2 shard {} failed to create flow socket for {}: {}",
+                                        shard_id,
+                                        game_addr,
+                                        e
+                                    );
+                                    pool.release(payload_idx);
+                                    continue;
+                                }
+                            };
+
+                            let token = Token(next_token);
+                            next_token = next_token.saturating_add(1);
+                            if let Err(e) =
+                                poll.registry()
+                                    .register(&mut socket, token, Interest::READABLE)
+                            {
+                                log::debug!(
+                                    "V2 shard {} failed to register flow socket for {}: {}",
+                                    shard_id,
+                                    game_addr,
+                                    e
+                                );
+                                pool.release(payload_idx);
+                                continue;
+                            }
+
+                            token_to_flow.insert(token, key);
+                            session_flows.entry(session_id).or_default().push(game_addr);
+                            flows.entry(key).or_insert(FlowState {
+                                socket,
+                                client_addr,
+                                original_info,
+                                last_activity: Instant::now(),
+                                marked_for_removal: None,
+                                token,
+                            })
+                        }
+                    };
+
+                    flow.client_addr = client_addr;
+                    flow.original_info = original_info;
+                    flow.last_activity = Instant::now();
+                    flow.marked_for_removal = None;
+
+                    let send_result = unsafe {
+                        let buf = pool.buffer(payload_idx);
+                        flow.socket.send(&buf[..payload_len])
+                    };
+                    pool.release(payload_idx);
+
+                    match send_result {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "V2 shard {} flow {} send error: {} (kind={:?})",
+                                shard_id,
+                                game_addr,
+                                e,
+                                e.kind()
+                            );
+                        }
+                    }
+                }
+                ShardMsg::Keepalive {
+                    session_id,
+                    client_addr,
+                } => {
+                    if let Some(flow_list) = session_flows.get(&session_id) {
+                        let now = Instant::now();
+                        for &game_addr in flow_list.iter() {
+                            let key = FlowKey {
+                                session_id,
+                                game_addr,
+                            };
+                            if let Some(flow) = flows.get_mut(&key) {
+                                flow.client_addr = client_addr;
+                                flow.last_activity = now;
+                                flow.marked_for_removal = None;
+                            }
+                        }
+                    }
+                }
+                ShardMsg::RemoveSession { session_id } => {
+                    if let Some(flow_list) = session_flows.remove(&session_id) {
+                        for game_addr in flow_list {
+                            let key = FlowKey {
+                                session_id,
+                                game_addr,
+                            };
+                            if let Some(mut flow) = flows.remove(&key) {
+                                let _ = poll.registry().deregister(&mut flow.socket);
+                                token_to_flow.remove(&flow.token);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cleanup flows periodically.
+        if Instant::now() >= cleanup_at {
+            cleanup_at = Instant::now() + super::CLEANUP_INTERVAL;
+            let now = Instant::now();
+
+            let mut removed = 0u32;
+            let mut marked = 0u32;
+            let mut revived = 0u32;
+
+            flows.retain(|key, flow| {
+                let idle_time = now.duration_since(flow.last_activity);
+
+                if let Some(marked_at) = flow.marked_for_removal {
+                    if now.duration_since(marked_at) >= super::FLOW_GRACE_PERIOD {
+                        let _ = poll.registry().deregister(&mut flow.socket);
+                        token_to_flow.remove(&flow.token);
+                        remove_flow_from_session_index(&mut session_flows, key);
+                        removed += 1;
+                        return false;
+                    }
+
+                    if idle_time < Duration::from_secs(10) {
+                        flow.marked_for_removal = None;
+                        revived += 1;
+                    }
+                    return true;
+                }
+
+                if idle_time >= super::SESSION_TIMEOUT {
+                    flow.marked_for_removal = Some(now);
+                    marked += 1;
+                }
+
+                true
+            });
+
+            flow_counts[shard_id].store(flows.len() as u64, Ordering::Relaxed);
+
+            if removed > 0 || marked > 0 || revived > 0 {
+                log::debug!(
+                    "V2 shard {} cleanup: marked={}, revived={}, removed={}, flows={}",
+                    shard_id,
+                    marked,
+                    revived,
+                    removed,
+                    flows.len()
+                );
+            }
+        }
+    }
+}
+
+pub(super) async fn run_datapath_v2(
+    listen_port: u16,
+    stats_port: u16,
+    stats_token: Option<String>,
+    auth_config: super::RelayAuthConfig,
+    stats: Arc<super::Stats>,
+    started_at: Instant,
+) -> Result<()> {
+    let shard_count = get_shard_count();
+    let shard_queue_cap = get_shard_queue_cap();
+    let tx_queue_cap = get_tx_queue_cap();
+    let pool_slots = get_pool_slots();
+
+    log::info!("Relay datapath: v2 (sharded)");
+    log::info!("  Shards: {} (env RELAY_SHARDS)", shard_count);
+    log::info!("  Pool slots: {} (env RELAY_V2_POOL_SLOTS)", pool_slots);
+    log::info!(
+        "  Shard queue: {} (env RELAY_V2_SHARD_QUEUE)",
+        shard_queue_cap
+    );
+    log::info!("  TX queue: {} (env RELAY_V2_TX_QUEUE)", tx_queue_cap);
+
+    let sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>> =
+        Arc::new(DashMap::new());
+    let session_traffic: Arc<DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>> =
+        Arc::new(DashMap::new());
+
+    if let Some(token) = stats_token {
+        let ctx = Arc::new(super::StatsApiContext {
+            sessions: Arc::clone(&sessions),
+            session_traffic: Arc::clone(&session_traffic),
+            stats: Arc::clone(&stats),
+            started_at,
+        });
+
+        tokio::spawn(async move {
+            if let Err(e) = super::run_stats_http_server(stats_port, token, ctx).await {
+                log::error!("Stats API server error: {}", e);
+            }
+        });
+    }
+
+    let pool = Arc::new(BufferPool::new(pool_slots));
+
+    let socket = bind_main_socket(listen_port)?;
+    let rx_socket = socket.try_clone().context("Failed to clone RX socket")?;
+    let tx_socket = socket;
+
+    let (tx_control_s, tx_control_r) = crossbeam_channel::bounded::<TxPacket>(tx_queue_cap);
+    let (tx_data_s, tx_data_r) = crossbeam_channel::bounded::<TxPacket>(tx_queue_cap);
+
+    let mut counts = Vec::with_capacity(shard_count);
+    for _ in 0..shard_count {
+        counts.push(AtomicU64::new(0));
+    }
+    let flow_counts = Arc::new(counts);
+
+    // TX thread.
+    let stats_out = Arc::clone(&stats);
+    let session_traffic_out = Arc::clone(&session_traffic);
+    let pool_out = Arc::clone(&pool);
+    let tx_thread = std::thread::Builder::new()
+        .name("relay-tx".to_string())
+        .spawn(move || -> Result<()> {
+            loop {
+                crossbeam_channel::select_biased! {
+                    recv(tx_control_r) -> msg => {
+                        let packet = match msg {
+                            Ok(value) => value,
+                            Err(_) => break,
+                        };
+                        send_tx_packet(&tx_socket, &pool_out, &stats_out, &session_traffic_out, packet);
+                    }
+                    recv(tx_data_r) -> msg => {
+                        let packet = match msg {
+                            Ok(value) => value,
+                            Err(_) => break,
+                        };
+                        send_tx_packet(&tx_socket, &pool_out, &stats_out, &session_traffic_out, packet);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .context("Failed to spawn TX thread")?;
+
+    // Shards.
+    let mut shard_senders = Vec::with_capacity(shard_count);
+    let (waker_pub_s, waker_pub_r) = crossbeam_channel::bounded::<(usize, Arc<Waker>)>(shard_count);
+    for shard_id in 0..shard_count {
+        let (shard_s, shard_r) = crossbeam_channel::bounded::<ShardMsg>(shard_queue_cap);
+        shard_senders.push(shard_s);
+
+        let tx_data = tx_data_s.clone();
+        let tx_control = tx_control_s.clone();
+        let pool = Arc::clone(&pool);
+        let sessions = Arc::clone(&sessions);
+        let stats = Arc::clone(&stats);
+        let flow_counts = Arc::clone(&flow_counts);
+        let waker_pub = waker_pub_s.clone();
+
+        std::thread::Builder::new()
+            .name(format!("relay-shard-{}", shard_id))
+            .spawn(move || -> Result<()> {
+                run_shard(
+                    shard_id,
+                    shard_r,
+                    tx_data,
+                    tx_control,
+                    pool,
+                    sessions,
+                    stats,
+                    flow_counts,
+                    waker_pub,
+                )
+            })
+            .context("Failed to spawn shard thread")?;
+    }
+    drop(waker_pub_s);
+
+    let mut shard_wakers: Vec<Option<Arc<Waker>>> = vec![None; shard_count];
+    for _ in 0..shard_count {
+        let (id, waker) = waker_pub_r
+            .recv()
+            .context("Failed to receive shard waker")?;
+        shard_wakers[id] = Some(waker);
+    }
+    let shard_wakers: Vec<Arc<Waker>> = shard_wakers
+        .into_iter()
+        .map(|item| item.expect("every shard must publish a waker"))
+        .collect();
+
+    // Session cleanup task (drops sessions and signals shard flow cleanup).
+    let sessions_cleanup = Arc::clone(&sessions);
+    let session_traffic_cleanup = Arc::clone(&session_traffic);
+    let stats_cleanup = Arc::clone(&stats);
+    let shard_senders_cleanup = shard_senders.clone();
+    let shard_wakers_cleanup = shard_wakers.clone();
+    tokio::spawn(async move {
+        let mut cleanup_timer = tokio::time::interval(super::CLEANUP_INTERVAL);
+        loop {
+            cleanup_timer.tick().await;
+            let now = Instant::now();
+            let session_idle_limit = super::SESSION_TIMEOUT + super::FLOW_GRACE_PERIOD;
+
+            let mut sessions_removed = 0u32;
+            sessions_cleanup.retain(|session_id, session| {
+                if now.duration_since(session.last_activity) >= session_idle_limit {
+                    session_traffic_cleanup.remove(session_id);
+                    sessions_removed += 1;
+
+                    let shard_id = shard_for_session(*session_id, shard_senders_cleanup.len());
+                    if let Some(sender) = shard_senders_cleanup.get(shard_id) {
+                        let _ = sender.try_send(ShardMsg::RemoveSession {
+                            session_id: *session_id,
+                        });
+                    }
+                    if let Some(waker) = shard_wakers_cleanup.get(shard_id) {
+                        let _ = waker.wake();
+                    }
+
+                    return false;
+                }
+                true
+            });
+
+            // Update stats counters.
+            stats_cleanup
+                .active_sessions
+                .store(sessions_cleanup.len() as u64, Ordering::Relaxed);
+
+            if sessions_removed > 0 {
+                log::info!(
+                    "V2 cleanup: sessions_removed={}, sessions={}",
+                    sessions_removed,
+                    sessions_cleanup.len()
+                );
+            }
+        }
+    });
+
+    // Stats logging task.
+    let stats_log = Arc::clone(&stats);
+    let flow_counts_log = Arc::clone(&flow_counts);
+    tokio::spawn(async move {
+        let mut stats_timer = tokio::time::interval(Duration::from_secs(60));
+        let start = Instant::now();
+        loop {
+            stats_timer.tick().await;
+            let elapsed = start.elapsed().as_secs_f64();
+            let pkts_in = stats_log.packets_in.load(Ordering::Relaxed);
+            let pkts_out = stats_log.packets_out.load(Ordering::Relaxed);
+            let bytes_in = stats_log.bytes_in.load(Ordering::Relaxed);
+            let bytes_out = stats_log.bytes_out.load(Ordering::Relaxed);
+            let dropped_in = stats_log.dropped_in.load(Ordering::Relaxed);
+            let dropped_out = stats_log.dropped_out.load(Ordering::Relaxed);
+
+            let flows: u64 = flow_counts_log
+                .iter()
+                .map(|value| value.load(Ordering::Relaxed))
+                .sum();
+            stats_log.active_flows.store(flows, Ordering::Relaxed);
+
+            log::info!(
+                "Stats: in={} out={} ({:.1}/{:.1} MB), {:.0} pkt/s, sessions={}, flows={}, dropped={}+{}",
+                pkts_in,
+                pkts_out,
+                bytes_in as f64 / 1_000_000.0,
+                bytes_out as f64 / 1_000_000.0,
+                (pkts_in + pkts_out) as f64 / elapsed,
+                stats_log.active_sessions.load(Ordering::Relaxed),
+                flows,
+                dropped_in,
+                dropped_out,
+            );
+        }
+    });
+
+    // RX thread.
+    let auth_config_rx = auth_config.clone();
+    let sessions_rx = Arc::clone(&sessions);
+    let session_traffic_rx = Arc::clone(&session_traffic);
+    let stats_rx = Arc::clone(&stats);
+    let pool_rx = Arc::clone(&pool);
+    let shard_senders_rx = shard_senders.clone();
+    let shard_wakers_rx = shard_wakers.clone();
+    let tx_control_rx = tx_control_s.clone();
+    let rx_thread = std::thread::Builder::new()
+        .name("relay-rx".to_string())
+        .spawn(move || -> Result<()> {
+            let mut buf = [0u8; super::MAX_PACKET_SIZE];
+
+            loop {
+                let (len, client_addr) = match rx_socket.recv_from(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("Recv error: {}", e);
+                        continue;
+                    }
+                };
+
+                stats_rx.packets_in.fetch_add(1, Ordering::Relaxed);
+                stats_rx.bytes_in.fetch_add(len as u64, Ordering::Relaxed);
+
+                if len < super::SESSION_ID_LEN {
+                    continue;
+                }
+
+                let mut session_id = [0u8; super::SESSION_ID_LEN];
+                session_id.copy_from_slice(&buf[..super::SESSION_ID_LEN]);
+
+                let now = Instant::now();
+                let now_unix = super::unix_timestamp_secs();
+
+                let mut session_authenticated = false;
+                match sessions_rx.entry(session_id) {
+                    dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                        let session = entry.get_mut();
+                        session.client_addr = client_addr;
+                        session.last_activity = now;
+                        session.last_activity_unix = now_unix;
+                        session_authenticated =
+                            matches!(session.auth_state, super::SessionAuthState::Authenticated);
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(super::SessionEntry {
+                            user_id: super::derive_user_id(session_id),
+                            auth_state: super::SessionAuthState::Legacy,
+                            client_addr,
+                            created_at_unix: now_unix,
+                            last_activity: now,
+                            last_activity_unix: now_unix,
+                        });
+                    }
+                }
+
+                let session_bytes = session_traffic_rx
+                    .entry(session_id)
+                    .or_insert_with(|| Arc::new(super::SessionTraffic::new(now_unix)));
+                session_bytes
+                    .value()
+                    .bytes_in
+                    .fetch_add(len as u64, Ordering::Relaxed);
+
+                // Auth hello:
+                if len >= super::SESSION_ID_LEN + 3
+                    && buf[super::SESSION_ID_LEN] == super::AUTH_HELLO_FRAME_TYPE
+                {
+                    if auth_config_rx.mode == super::RelayAuthMode::Off {
+                        send_small_control_frame(
+                            &tx_control_rx,
+                            &pool_rx,
+                            client_addr,
+                            session_id,
+                            super::AUTH_ACK_FRAME_TYPE,
+                            super::AUTH_ACK_AUTH_DISABLED,
+                            &stats_rx,
+                        );
+                        continue;
+                    }
+
+                    let token = match super::parse_auth_hello_token(&buf, len) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            send_small_control_frame(
+                                &tx_control_rx,
+                                &pool_rx,
+                                client_addr,
+                                session_id,
+                                super::AUTH_ACK_FRAME_TYPE,
+                                err.ack_status(),
+                                &stats_rx,
+                            );
+                            continue;
+                        }
+                    };
+
+                    match super::verify_relay_ticket(token, session_id, &auth_config_rx, now_unix) {
+                        Ok(user_id) => {
+                            if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                                session_entry.user_id = user_id;
+                                session_entry.auth_state = super::SessionAuthState::Authenticated;
+                            }
+                            send_small_control_frame(
+                                &tx_control_rx,
+                                &pool_rx,
+                                client_addr,
+                                session_id,
+                                super::AUTH_ACK_FRAME_TYPE,
+                                super::AUTH_ACK_OK,
+                                &stats_rx,
+                            );
+                        }
+                        Err(err) => {
+                            send_small_control_frame(
+                                &tx_control_rx,
+                                &pool_rx,
+                                client_addr,
+                                session_id,
+                                super::AUTH_ACK_FRAME_TYPE,
+                                err.ack_status(),
+                                &stats_rx,
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // RTT/jitter ping:
+                if len == super::PING_FRAME_LEN
+                    && buf[super::SESSION_ID_LEN] == super::PING_FRAME_TYPE
+                {
+                    if auth_config_rx.mode.requires_auth() && !session_authenticated {
+                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    let seq = u32::from_be_bytes([
+                        buf[super::SESSION_ID_LEN + 1],
+                        buf[super::SESSION_ID_LEN + 2],
+                        buf[super::SESSION_ID_LEN + 3],
+                        buf[super::SESSION_ID_LEN + 4],
+                    ]);
+                    let client_ts_mono_ms = u64::from_be_bytes([
+                        buf[super::SESSION_ID_LEN + 5],
+                        buf[super::SESSION_ID_LEN + 6],
+                        buf[super::SESSION_ID_LEN + 7],
+                        buf[super::SESSION_ID_LEN + 8],
+                        buf[super::SESSION_ID_LEN + 9],
+                        buf[super::SESSION_ID_LEN + 10],
+                        buf[super::SESSION_ID_LEN + 11],
+                        buf[super::SESSION_ID_LEN + 12],
+                    ]);
+                    let server_rx_ts_mono_ms = super::mono_timestamp_ms();
+
+                    let Some(buf_idx) = pool_rx.try_acquire() else {
+                        stats_rx.dropped_out.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+
+                    let out_len = unsafe {
+                        let out = pool_rx.buffer_mut(buf_idx);
+                        out[..super::SESSION_ID_LEN].copy_from_slice(&session_id);
+                        out[super::SESSION_ID_LEN] = super::PONG_FRAME_TYPE;
+                        out[super::SESSION_ID_LEN + 1..super::SESSION_ID_LEN + 5]
+                            .copy_from_slice(&seq.to_be_bytes());
+                        out[super::SESSION_ID_LEN + 5..super::SESSION_ID_LEN + 13]
+                            .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
+                        out[super::SESSION_ID_LEN + 13..super::SESSION_ID_LEN + 21]
+                            .copy_from_slice(&server_rx_ts_mono_ms.to_be_bytes());
+                        super::PONG_FRAME_LEN
+                    };
+
+                    let packet = TxPacket {
+                        addr: client_addr,
+                        session_id,
+                        buf_idx,
+                        len: out_len,
+                    };
+                    if tx_control_rx.try_send(packet).is_err() {
+                        stats_rx.dropped_out.fetch_add(1, Ordering::Relaxed);
+                        pool_rx.release(buf_idx);
+                    }
+                    continue;
+                }
+
+                if len == super::PONG_FRAME_LEN
+                    && buf[super::SESSION_ID_LEN] == super::PONG_FRAME_TYPE
+                {
+                    continue;
+                }
+
+                // Keepalive:
+                if len == super::SESSION_ID_LEN {
+                    if auth_config_rx.mode.requires_auth() && !session_authenticated {
+                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    let shard_id = shard_for_session(session_id, shard_senders_rx.len());
+                    if let Some(sender) = shard_senders_rx.get(shard_id) {
+                        if sender
+                            .try_send(ShardMsg::Keepalive {
+                                session_id,
+                                client_addr,
+                            })
+                            .is_err()
+                        {
+                            stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
+                            let _ = waker.wake();
+                        }
+                    }
+                    continue;
+                }
+
+                if auth_config_rx.mode.requires_auth() && !session_authenticated {
+                    stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                if len < super::SESSION_ID_LEN + super::IP_HEADER_MIN {
+                    continue;
+                }
+
+                let ip_packet = &buf[super::SESSION_ID_LEN..len];
+                let Some((game_addr, udp_payload, original_info)) =
+                    super::parse_ip_packet_full(ip_packet)
+                else {
+                    continue;
+                };
+
+                if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                    if !matches!(
+                        session_entry.auth_state,
+                        super::SessionAuthState::Authenticated
+                    ) {
+                        session_entry.user_id = original_info.src_ip.to_string();
+                    }
+                }
+
+                let Some(payload_idx) = pool_rx.try_acquire() else {
+                    stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+
+                unsafe {
+                    let out = pool_rx.buffer_mut(payload_idx);
+                    out[..udp_payload.len()].copy_from_slice(udp_payload);
+                }
+
+                let shard_id = shard_for_session(session_id, shard_senders_rx.len());
+                if let Some(sender) = shard_senders_rx.get(shard_id) {
+                    if sender
+                        .try_send(ShardMsg::ClientPacket {
+                            session_id,
+                            client_addr,
+                            game_addr,
+                            original_info,
+                            payload_idx,
+                            payload_len: udp_payload.len(),
+                        })
+                        .is_err()
+                    {
+                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        pool_rx.release(payload_idx);
+                    } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
+                        let _ = waker.wake();
+                    }
+                } else {
+                    stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                    pool_rx.release(payload_idx);
+                }
+            }
+        })
+        .context("Failed to spawn RX thread")?;
+
+    // Keep this async task alive; we treat thread termination as fatal.
+    tokio::task::spawn_blocking(move || {
+        let _ = tx_thread.join();
+        let _ = rx_thread.join();
+    })
+    .await
+    .ok();
+
+    Ok(())
+}
+
+fn send_tx_packet(
+    socket: &UdpSocket,
+    pool: &BufferPool,
+    stats: &super::Stats,
+    session_traffic: &DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>,
+    packet: TxPacket,
+) {
+    let bytes = unsafe { pool.buffer(packet.buf_idx) };
+    if let Err(e) = socket.send_to(&bytes[..packet.len], packet.addr) {
+        log::trace!("TX send error to {}: {}", packet.addr, e);
+        stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats.packets_out.fetch_add(1, Ordering::Relaxed);
+        stats
+            .bytes_out
+            .fetch_add(packet.len as u64, Ordering::Relaxed);
+        if let Some(entry) = session_traffic.get(&packet.session_id) {
+            entry
+                .value()
+                .bytes_out
+                .fetch_add(packet.len as u64, Ordering::Relaxed);
+        }
+    }
+    pool.release(packet.buf_idx);
+}
+
+fn send_small_control_frame(
+    tx_control: &crossbeam_channel::Sender<TxPacket>,
+    pool: &BufferPool,
+    client_addr: SocketAddr,
+    session_id: [u8; super::SESSION_ID_LEN],
+    frame_type: u8,
+    status: u8,
+    stats: &super::Stats,
+) {
+    let Some(buf_idx) = pool.try_acquire() else {
+        stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    let len = unsafe {
+        let out = pool.buffer_mut(buf_idx);
+        out[..super::SESSION_ID_LEN].copy_from_slice(&session_id);
+        out[super::SESSION_ID_LEN] = frame_type;
+        out[super::SESSION_ID_LEN + 1] = status;
+        super::SESSION_ID_LEN + 2
+    };
+
+    let packet = TxPacket {
+        addr: client_addr,
+        session_id,
+        buf_idx,
+        len,
+    };
+
+    if tx_control.try_send(packet).is_err() {
+        stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+        pool.release(buf_idx);
+    }
+}

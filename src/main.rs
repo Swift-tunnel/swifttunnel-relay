@@ -10,9 +10,12 @@
 //! - Relay reconstructs IP packet and sends: [session_id:8][IP packet] back to client
 //!
 //! Architecture:
-//! - Main task: Receives from clients, parses packets, routes to flow tasks
-//! - Flow tasks: One per (session, game_server) pair, handles bidirectional forwarding
-//! - Response task: Sends responses back to clients
+//! - Datapath v1: Main task receives from clients and routes to per-flow tasks
+//! - Datapath v2: Sharded event loop (mio) + buffer pool + single TX thread
+//!
+//! v1.5.0 Improvements:
+//! - Optional sharded datapath (env RELAY_DATAPATH=v2) to cut jitter under load
+//! - Optional control-plane ping/pong frames (0xA3/0xA4) for RTT/jitter measurement
 //!
 //! v1.4.0 Changes:
 //! - Configurable port via RELAY_PORT env var (default: 51821)
@@ -50,13 +53,19 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::interval;
 
+mod datapath_v2;
+
 const SESSION_ID_LEN: usize = 8;
 const DEFAULT_PORT: u16 = 51821;
 const DEFAULT_STATS_PORT: u16 = 51822;
 const MAX_HTTP_REQUEST_SIZE: usize = 8192;
 const STATS_HTTP_READ_TIMEOUT_SECS: u64 = 5;
+const RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
 const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
+// Control plane: RTT/jitter pings (optional, backward-compatible).
+const PING_FRAME_TYPE: u8 = 0xA3;
+const PONG_FRAME_TYPE: u8 = 0xA4;
 const AUTH_ACK_OK: u8 = 0;
 const AUTH_ACK_BAD_FORMAT: u8 = 1;
 const AUTH_ACK_BAD_SIGNATURE: u8 = 2;
@@ -66,6 +75,8 @@ const AUTH_ACK_SERVER_MISMATCH: u8 = 5;
 const AUTH_ACK_AUTH_DISABLED: u8 = 6;
 const MAX_AUTH_TOKEN_LEN: usize = 4096;
 const AUTH_CLOCK_SKEW_SECS: u64 = 30;
+const PING_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8;
+const PONG_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8 + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayAuthMode {
@@ -329,7 +340,9 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const FLOW_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const MAX_PACKET_SIZE: usize = 1600;
 /// Channel capacity per flow (prevents OOM, games handle packet loss)
-const FLOW_CHANNEL_CAPACITY: usize = 64;
+const DEFAULT_FLOW_CHANNEL_CAPACITY: usize = 256;
+const MIN_FLOW_CHANNEL_CAPACITY: usize = 8;
+const MAX_FLOW_CHANNEL_CAPACITY: usize = 4096;
 
 /// Minimum IP header size
 const IP_HEADER_MIN: usize = 20;
@@ -367,6 +380,26 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
+}
+
+fn mono_timestamp_ms() -> u64 {
+    use std::sync::OnceLock;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn parse_flow_channel_capacity(raw: Option<String>) -> usize {
+    let parsed = raw
+        .as_deref()
+        .map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FLOW_CHANNEL_CAPACITY);
+    parsed.clamp(MIN_FLOW_CHANNEL_CAPACITY, MAX_FLOW_CHANNEL_CAPACITY)
+}
+
+fn get_flow_channel_capacity() -> usize {
+    parse_flow_channel_capacity(env::var("RELAY_FLOW_CHANNEL_CAPACITY").ok())
 }
 
 /// Default identity until we observe a tunnel source IP or strict auth identity.
@@ -472,11 +505,31 @@ async fn main() -> Result<()> {
     let stats_port = get_stats_port();
     let stats_token = get_stats_token();
     let auth_config = RelayAuthConfig::from_env()?;
+    let datapath = datapath_v2::get_relay_datapath();
+
+    let stats = Arc::new(Stats::new());
+    let started_at = Instant::now();
 
     log::info!("╔════════════════════════════════════════════╗");
-    log::info!("║     SwiftTunnel V3 UDP Relay v1.4.0        ║");
+    log::info!("║     SwiftTunnel V3 UDP Relay v{}        ║", RELAY_VERSION);
     log::info!("║     Low Latency Game Packet Forwarding     ║");
     log::info!("╚════════════════════════════════════════════╝");
+
+    if matches!(datapath, datapath_v2::RelayDatapath::V2) {
+        return datapath_v2::run_datapath_v2(
+            listen_port,
+            stats_port,
+            stats_token,
+            auth_config,
+            stats,
+            started_at,
+        )
+        .await;
+    }
+
+    log::info!("Relay datapath: v1 (tokio per-flow tasks)");
+
+    let flow_channel_capacity = get_flow_channel_capacity();
 
     // Bind main socket
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", listen_port))
@@ -493,10 +546,12 @@ async fn main() -> Result<()> {
         );
     }
     log::info!("Relay auth mode: {}", auth_config.mode.as_str());
+    log::info!(
+        "Flow channel capacity: {} (env RELAY_FLOW_CHANNEL_CAPACITY)",
+        flow_channel_capacity
+    );
 
     let socket = Arc::new(socket);
-    let stats = Arc::new(Stats::new());
-    let started_at = Instant::now();
 
     // Session tracking
     let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
@@ -755,6 +810,64 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        // RTT/jitter ping:
+        // [session_id:8][0xA3][seq_be_u32][client_ts_mono_ms_be_u64]
+        if len == PING_FRAME_LEN && buf[SESSION_ID_LEN] == PING_FRAME_TYPE {
+            if auth_config.mode.requires_auth() && !session_authenticated {
+                stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            let seq = u32::from_be_bytes([
+                buf[SESSION_ID_LEN + 1],
+                buf[SESSION_ID_LEN + 2],
+                buf[SESSION_ID_LEN + 3],
+                buf[SESSION_ID_LEN + 4],
+            ]);
+            let client_ts_mono_ms = u64::from_be_bytes([
+                buf[SESSION_ID_LEN + 5],
+                buf[SESSION_ID_LEN + 6],
+                buf[SESSION_ID_LEN + 7],
+                buf[SESSION_ID_LEN + 8],
+                buf[SESSION_ID_LEN + 9],
+                buf[SESSION_ID_LEN + 10],
+                buf[SESSION_ID_LEN + 11],
+                buf[SESSION_ID_LEN + 12],
+            ]);
+            let server_rx_ts_mono_ms = mono_timestamp_ms();
+
+            let mut response = [0u8; PONG_FRAME_LEN];
+            response[..SESSION_ID_LEN].copy_from_slice(&session_id);
+            response[SESSION_ID_LEN] = PONG_FRAME_TYPE;
+            response[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5].copy_from_slice(&seq.to_be_bytes());
+            response[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
+                .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
+            response[SESSION_ID_LEN + 13..SESSION_ID_LEN + 21]
+                .copy_from_slice(&server_rx_ts_mono_ms.to_be_bytes());
+
+            if let Err(e) = socket.send_to(&response, client_addr).await {
+                log::trace!("Failed to send pong to {}: {}", client_addr, e);
+            } else {
+                stats.packets_out.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .bytes_out
+                    .fetch_add(response.len() as u64, Ordering::Relaxed);
+                if let Some(entry) = session_traffic.get(&session_id) {
+                    entry
+                        .value()
+                        .bytes_out
+                        .fetch_add(response.len() as u64, Ordering::Relaxed);
+                }
+            }
+
+            continue;
+        }
+
+        // Ignore unexpected pong frames from clients (defensive).
+        if len == PONG_FRAME_LEN && buf[SESSION_ID_LEN] == PONG_FRAME_TYPE {
+            continue;
+        }
+
         // Keepalive packet (just session ID, no payload)
         if len == SESSION_ID_LEN {
             log::trace!("Keepalive from {:016x}", u64::from_be_bytes(session_id));
@@ -833,7 +946,7 @@ async fn main() -> Result<()> {
             }
             Entry::Vacant(entry) => {
                 // New flow - create atomically
-                let (tx, rx) = mpsc::channel(FLOW_CHANNEL_CAPACITY);
+                let (tx, rx) = mpsc::channel(flow_channel_capacity);
 
                 // Send first packet (should never fail on fresh channel)
                 if tx.try_send(udp_payload.to_vec()).is_err() {
@@ -1216,6 +1329,8 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
     let elapsed_secs = context.started_at.elapsed().as_secs();
     let bytes_in = context.stats.bytes_in.load(Ordering::Relaxed);
     let bytes_out = context.stats.bytes_out.load(Ordering::Relaxed);
+    let dropped_in = context.stats.dropped_in.load(Ordering::Relaxed);
+    let dropped_out = context.stats.dropped_out.load(Ordering::Relaxed);
     let inbound_bps = if elapsed_secs > 0 {
         bytes_in / elapsed_secs
     } else {
@@ -1226,6 +1341,11 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
     } else {
         0
     };
+    let dropped_pps = if elapsed_secs > 0 {
+        (dropped_in + dropped_out) / elapsed_secs
+    } else {
+        0
+    };
 
     let mut active_user_ids = HashSet::<String>::new();
     for entry in context.sessions.iter() {
@@ -1233,13 +1353,17 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
     }
 
     format!(
-        "{{\"version\":\"1.4.0\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{}}}",
+        "{{\"version\":\"{}\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{},\"dropped_in\":{},\"dropped_out\":{},\"dropped_pps\":{}}}",
+        RELAY_VERSION,
         unix_timestamp_secs(),
         active_user_ids.len(),
         context.sessions.len(),
         context.stats.throttled_users.load(Ordering::Relaxed),
         inbound_bps,
-        outbound_bps
+        outbound_bps,
+        dropped_in,
+        dropped_out,
+        dropped_pps
     )
 }
 
@@ -1403,10 +1527,9 @@ fn build_response_ip_packet(udp_payload: &[u8], original: OriginalPacketInfo) ->
     // Total length
     packet[2] = ((total_len >> 8) & 0xFF) as u8;
     packet[3] = (total_len & 0xFF) as u8;
-    // Identification (random)
-    let id = rand::random::<u16>();
-    packet[4] = (id >> 8) as u8;
-    packet[5] = (id & 0xFF) as u8;
+    // Identification (unused when DF is set; keep deterministic to avoid RNG overhead).
+    packet[4] = 0;
+    packet[5] = 0;
     // Flags + Fragment offset (Don't Fragment)
     packet[6] = 0x40;
     packet[7] = 0;
@@ -1474,30 +1597,6 @@ fn calculate_ip_checksum(header: &[u8]) -> u16 {
     !sum as u16
 }
 
-/// Generate random u16 (simple LCG for packet ID)
-mod rand {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static SEED: AtomicU32 = AtomicU32::new(0);
-
-    pub fn random<T>() -> T
-    where
-        T: From<u16>,
-    {
-        let mut seed = SEED.load(Ordering::Relaxed);
-        if seed == 0 {
-            seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u32;
-        }
-        // LCG: next = (a * seed + c) mod m
-        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-        SEED.store(seed, Ordering::Relaxed);
-        T::from((seed >> 16) as u16)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,6 +1639,23 @@ mod tests {
             BASE64_URL_SAFE_NO_PAD.encode(&payload_bytes),
             BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref())
         )
+    }
+
+    #[test]
+    fn test_parse_flow_channel_capacity_defaults_and_clamps() {
+        assert_eq!(
+            parse_flow_channel_capacity(None),
+            DEFAULT_FLOW_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            parse_flow_channel_capacity(Some("2".to_string())),
+            MIN_FLOW_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            parse_flow_channel_capacity(Some("999999".to_string())),
+            MAX_FLOW_CHANNEL_CAPACITY
+        );
+        assert_eq!(parse_flow_channel_capacity(Some("512".to_string())), 512);
     }
 
     #[test]

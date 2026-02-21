@@ -15,10 +15,12 @@ SwiftTunnel Relay provides **~0.5-1ms latency overhead** for game packet forward
 ```
 Client → Relay:  [session_id:8][IP packet with destination]
 Client → Relay:  [session_id:8][0xA1][token_len:2][relay_ticket_utf8]
+Client → Relay:  [session_id:8][0xA3][seq:4][client_ts_mono_ms:8]
 Relay → Game:    [UDP payload only]
 Game → Relay:    [UDP response]
 Relay → Client:  [session_id:8][reconstructed IP packet]
 Relay → Client:  [session_id:8][0xA2][status]
+Relay → Client:  [session_id:8][0xA4][seq:4][client_ts_mono_ms:8][server_rx_ts_mono_ms:8]
 ```
 
 The relay:
@@ -32,12 +34,14 @@ The relay:
 ## Features
 
 - **Ultra-low latency** - No encryption overhead
-- **Per-flow async tasks** - Efficient handling of multiple game connections
+- **Selectable datapath** - `RELAY_DATAPATH=v1` (tokio per-flow tasks) or `v2` (sharded mio loop)
+- **Lower p99 jitter (v2)** - buffer pool + single TX thread + sharded flow sockets
 - **NAT rebinding resilience** - Handles client IP changes gracefully
 - **Keepalive support** - Prevents NAT timeouts during idle periods
 - **Graceful error recovery** - Transient errors don't kill flows
 - **Bounded channels** - Backpressure prevents OOM (games handle packet loss)
 - **Soft-delete with grace period** - Late packets can revive sessions
+- **RTT/jitter ping (optional)** - ping/pong control frames for benchmarking/telemetry
 - **Authenticated localhost telemetry API** - `/v1/stats` and `/v1/connections`
 
 ## Installation
@@ -90,6 +94,16 @@ RUST_LOG=debug ./swifttunnel-relay
 | `RELAY_AUTH_MODE` | `off` | Relay auth mode: `off`, `optional`, `required` |
 | `RELAY_AUTH_PUBLIC_KEY_B64` | _(unset)_ | Ed25519 public key (required when auth mode is `optional`/`required`) |
 | `RELAY_SERVER_ID` | _(unset)_ | Server region identifier expected in ticket `srv` claim |
+| `RELAY_DATAPATH` | `v2` | Datapath: `v1` (tokio per-flow tasks) or `v2` (sharded mio loop) |
+| `RELAY_SHARDS` | _(physical CPU count)_ | Shard count for `v2` (1..256) |
+| `RELAY_V2_POOL_SLOTS` | `8192` | Fixed buffer pool slots for `v2` (512..262144) |
+| `RELAY_V2_SHARD_QUEUE` | `4096` | Per-shard inbound queue depth for `v2` (256..262144) |
+| `RELAY_V2_TX_QUEUE` | `8192` | TX queue depth for `v2` control/data (256..262144) |
+| `RELAY_SOCKET_RCVBUF_BYTES` | `4194304` | `v2` main socket SO_RCVBUF size |
+| `RELAY_SOCKET_SNDBUF_BYTES` | `4194304` | `v2` main socket SO_SNDBUF size |
+| `RELAY_FLOW_RCVBUF_BYTES` | `2097152` | `v2` per-flow socket SO_RCVBUF size |
+| `RELAY_FLOW_SNDBUF_BYTES` | `2097152` | `v2` per-flow socket SO_SNDBUF size |
+| `RELAY_FLOW_CHANNEL_CAPACITY` | `256` | `v1` only: bounded channel size per flow (clamped to 8..4096) |
 | `RUST_LOG` | `info` | Log level (trace, debug, info, warn, error) |
 
 ### systemd Service
@@ -105,6 +119,7 @@ Type=simple
 ExecStart=/usr/local/bin/swifttunnel-relay
 Environment=RUST_LOG=info
 Environment=RELAY_PORT=51821
+Environment=RELAY_DATAPATH=v2
 Environment=RELAY_STATS_PORT=51822
 Environment=RELAY_STATS_TOKEN=replace-with-long-random-token
 Environment=RELAY_AUTH_MODE=optional
@@ -123,6 +138,8 @@ sudo systemctl start swifttunnel-relay
 ```
 
 ## Architecture
+
+### Datapath v1 (tokio per-flow tasks)
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -151,6 +168,32 @@ sudo systemctl start swifttunnel-relay
                 └───────────────┘
 ```
 
+### Datapath v2 (sharded mio loop)
+
+```
+┌────────────────────────────────────────────────┐
+│                  RX Thread                      │
+│  - Receives from clients on configured port     │
+│  - Parses control + data frames                 │
+│  - Dispatches by session_id -> shard inbox      │
+└───────────────────────┬────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│    Shard 0    │ │    Shard 1    │ │    Shard N    │
+│  - mio poll   │ │  - mio poll   │ │  - mio poll   │
+│  - flow map   │ │  - flow map   │ │  - flow map   │
+└───────────────┴───────────────┴───────────────┘
+                        │
+                        ▼
+                ┌───────────────┐
+                │   TX Thread   │
+                │ Single sender │
+                │  to clients   │
+                └───────────────┘
+```
+
 ## Client Implementation
 
 To connect to this relay, your client needs to:
@@ -159,11 +202,12 @@ To connect to this relay, your client needs to:
 2. **Fetch a short-lived relay ticket** from your control-plane/web API
 3. **Send auth hello**: `[session_id:8][0xA1][token_len:2][ticket_utf8]`
 4. **Wait for auth ack**: `[session_id:8][0xA2][status]`
-5. **Intercept game UDP packets** (e.g., using NDIS, WFP, or iptables)
-6. **Wrap packets**: `[session_id:8][original IP packet]`
-7. **Send to relay server** on configured port
-8. **Receive responses**: `[session_id:8][response IP packet]`
-9. **Inject responses** back to the game
+5. **(Optional) RTT/jitter ping**: `[session_id:8][0xA3][seq:4][client_ts_mono_ms:8]` → `[session_id:8][0xA4]...`
+6. **Intercept game UDP packets** (e.g., using NDIS, WFP, or iptables)
+7. **Wrap packets**: `[session_id:8][original IP packet]`
+8. **Send to relay server** on configured port
+9. **Receive responses**: `[session_id:8][response IP packet]`
+10. **Inject responses** back to the game
 
 Auth ack status codes:
 - `0` ok
@@ -238,6 +282,9 @@ curl -s \
 - `throttled_users`
 - `inbound_bps`
 - `outbound_bps`
+- `dropped_in`
+- `dropped_out`
+- `dropped_pps`
 
 ## Performance Tuning
 
