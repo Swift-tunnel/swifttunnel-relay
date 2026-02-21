@@ -15,19 +15,14 @@ SERVER="$1"
 KEY_FILE="$2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASS_MD="$(cd "$SCRIPT_DIR/.." && pwd)/swifttunnel-web/pass.md"
-
-get_generic_pass() {
-    # Best-effort: extract password from a markdown snippet like: `root / PASSWORD`
-    if [ ! -f "$PASS_MD" ]; then
-        return 1
-    fi
-    sed -n 's/.*`root \\/ \\([^`]*\\)`.*/\\1/p' "$PASS_MD" | head -n1
-}
+source "$SCRIPT_DIR/deploy-utils.sh"
 
 SSH_PASS="${SWIFTTUNNEL_SSH_PASS:-}"
 if [ -z "$SSH_PASS" ] && [ -z "$KEY_FILE" ]; then
     SSH_PASS="$(get_generic_pass || true)"
 fi
+
+SSHPASS_ENV=()
 
 if [ -n "$KEY_FILE" ]; then
     SSH_CMD="ssh -i $KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
@@ -42,23 +37,24 @@ else
         echo "Missing SWIFTTUNNEL_SSH_PASS and couldn't infer from $PASS_MD"
         exit 1
     fi
-    SSH_CMD="sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
-    SCP_CMD="sshpass -p $SSH_PASS scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
+    SSHPASS_ENV=(SSHPASS="$SSH_PASS")
+    SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
+    SCP_CMD="sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
     SUDO=""
 fi
 
 echo "📦 Building and deploying to $SERVER..."
 
 # Copy source
-$SSH_CMD "$SERVER" "rm -rf /tmp/v3-relay && mkdir -p /tmp/v3-relay/src"
-$SCP_CMD "$SCRIPT_DIR/Cargo.lock" "$SERVER:/tmp/v3-relay/" 2>/dev/null || true
-$SCP_CMD "$SCRIPT_DIR/Cargo.toml" "$SERVER:/tmp/v3-relay/"
-$SCP_CMD "$SCRIPT_DIR/src/main.rs" "$SERVER:/tmp/v3-relay/src/"
-$SCP_CMD "$SCRIPT_DIR/src/datapath_v2.rs" "$SERVER:/tmp/v3-relay/src/"
-$SCP_CMD "$SCRIPT_DIR/v3-relay.service" "$SERVER:/tmp/v3-relay/"
+"${SSHPASS_ENV[@]}" $SSH_CMD "$SERVER" "rm -rf /tmp/v3-relay && mkdir -p /tmp/v3-relay/src"
+"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/Cargo.lock" "$SERVER:/tmp/v3-relay/" 2>/dev/null || true
+"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/Cargo.toml" "$SERVER:/tmp/v3-relay/"
+"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/src/main.rs" "$SERVER:/tmp/v3-relay/src/"
+"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/src/datapath_v2.rs" "$SERVER:/tmp/v3-relay/src/"
+"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/v3-relay.service" "$SERVER:/tmp/v3-relay/"
 
 # Build and install
-$SSH_CMD "$SERVER" "
+"${SSHPASS_ENV[@]}" $SSH_CMD "$SERVER" "
     # Install Rust if needed
     if ! command -v cargo &> /dev/null; then
         echo 'Installing Rust...'

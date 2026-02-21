@@ -18,14 +18,7 @@ BUILD_DIR="/tmp/v3-relay-build"
 # - SWIFTTUNNEL_SSH_PASS: generic password-auth servers + build server
 # - SWIFTTUNNEL_DO_SSH_PASS: DigitalOcean password (defaults to SWIFTTUNNEL_SSH_PASS)
 PASS_MD="$(cd "$SCRIPT_DIR/.." && pwd)/swifttunnel-web/pass.md"
-
-get_generic_pass() {
-    # Best-effort: extract password from a markdown snippet like: `root / PASSWORD`
-    if [ ! -f "$PASS_MD" ]; then
-        return 1
-    fi
-    sed -n 's/.*`root \\/ \\([^`]*\\)`.*/\\1/p' "$PASS_MD" | head -n1
-}
+source "$SCRIPT_DIR/deploy-utils.sh"
 
 SSH_PASS="${SWIFTTUNNEL_SSH_PASS:-}"
 DO_SSH_PASS="${SWIFTTUNNEL_DO_SSH_PASS:-}"
@@ -109,12 +102,12 @@ fi
 
 # Function to run SSH command with password
 ssh_pass() {
-    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 "$@"
+    SSHPASS="$SSH_PASS" sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 "$@"
 }
 
 # Function to run SCP with password
 scp_pass() {
-    sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 "$@"
+    SSHPASS="$SSH_PASS" sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 "$@"
 }
 
 # Step 1: Build on remote server
@@ -172,25 +165,30 @@ deploy_to_server() {
         sudo_prefix="sudo"
     else
         # Password auth
-        ssh_cmd="sshpass -p $password ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10"
-        scp_cmd="sshpass -p $password scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10"
+        ssh_cmd="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10"
+        scp_cmd="sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10"
         sudo_prefix=""
     fi
 
+    local sshpass_env=()
+    if [ "$is_aws" != "true" ]; then
+        sshpass_env=(SSHPASS="$password")
+    fi
+
     # Copy binary
-    if ! $scp_cmd "/tmp/$BINARY_NAME" "$server:/tmp/$BINARY_NAME" 2>/dev/null; then
+    if ! "${sshpass_env[@]}" $scp_cmd "/tmp/$BINARY_NAME" "$server:/tmp/$BINARY_NAME" 2>/dev/null; then
         echo "❌ Failed to copy binary"
         return 1
     fi
 
     # Copy service file
-    if ! $scp_cmd "$SCRIPT_DIR/$SERVICE_FILE" "$server:/tmp/$SERVICE_FILE" 2>/dev/null; then
+    if ! "${sshpass_env[@]}" $scp_cmd "$SCRIPT_DIR/$SERVICE_FILE" "$server:/tmp/$SERVICE_FILE" 2>/dev/null; then
         echo "❌ Failed to copy service file"
         return 1
     fi
 
     # Install, configure env, and start service
-    if ! $ssh_cmd "$server" "
+    if ! "${sshpass_env[@]}" $ssh_cmd "$server" "
         # Stop first; atomic replace avoids ETXTBSY and cross-fs mv weirdness
         $sudo_prefix systemctl stop v3-relay >/dev/null 2>&1 || true
         $sudo_prefix mkdir -p /usr/local/bin
@@ -257,9 +255,9 @@ FAILED=0
 
 for server in "${SERVERS[@]}"; do
     if deploy_to_server "$server" "false" "" "$SSH_PASS"; then
-        ((SUCCESS++))
+        ((++SUCCESS))
     else
-        ((FAILED++))
+        ((++FAILED))
     fi
 done
 
@@ -270,15 +268,15 @@ echo
 if [ -f "$VULTR_US_KEY_FILE" ]; then
     for server in "${VULTR_US_SERVERS[@]}"; do
         if deploy_to_server "$server" "true" "$VULTR_US_KEY_FILE"; then
-            ((SUCCESS++))
+            ((++SUCCESS))
         else
-            ((FAILED++))
+            ((++FAILED))
         fi
     done
 else
     for server in "${VULTR_US_SERVERS[@]}"; do
         echo "  → $server: ⚠️  Key file not found: $VULTR_US_KEY_FILE"
-        ((FAILED++))
+        ((++FAILED))
     done
 fi
 
@@ -289,9 +287,9 @@ echo
 
 for server in "${DO_SERVERS[@]}"; do
     if deploy_to_server "$server" "false" "" "$DO_SSH_PASS"; then
-        ((SUCCESS++))
+        ((++SUCCESS))
     else
-        ((FAILED++))
+        ((++FAILED))
     fi
 done
 
@@ -308,13 +306,13 @@ for entry in "${AWS_SERVERS[@]}"; do
 
     if [ -f "$key_file" ]; then
         if deploy_to_server "$server" "true" "$key_file"; then
-            ((SUCCESS++))
+            ((++SUCCESS))
         else
-            ((FAILED++))
+            ((++FAILED))
         fi
     else
         echo "  → $server: ⚠️  Key file not found: $key_file"
-        ((FAILED++))
+        ((++FAILED))
     fi
 done
 

@@ -30,11 +30,13 @@ const DEFAULT_FLOW_SOCKET_RCVBUF_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_FLOW_SOCKET_SNDBUF_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Selectable relay datapath implementation.
 pub(super) enum RelayDatapath {
     V1,
     V2,
 }
 
+/// Read `RELAY_DATAPATH` and select datapath implementation.
 pub(super) fn get_relay_datapath() -> RelayDatapath {
     match env::var("RELAY_DATAPATH")
         .ok()
@@ -49,6 +51,7 @@ pub(super) fn get_relay_datapath() -> RelayDatapath {
     }
 }
 
+/// Parse an env var as `usize`, returning `None` for missing or invalid values.
 fn parse_usize_env(name: &str) -> Option<usize> {
     env::var(name)
         .ok()
@@ -57,15 +60,18 @@ fn parse_usize_env(name: &str) -> Option<usize> {
         .and_then(|raw| raw.parse::<usize>().ok())
 }
 
+/// Clamp a `usize` value to a min/max range.
 fn clamp_usize(value: usize, min: usize, max: usize) -> usize {
     value.clamp(min, max)
 }
 
+/// Determine shard count for datapath v2.
 fn get_shard_count() -> usize {
     let default = num_cpus::get_physical().max(1);
     clamp_usize(parse_usize_env("RELAY_SHARDS").unwrap_or(default), 1, 256)
 }
 
+/// Determine buffer pool slots for datapath v2.
 fn get_pool_slots() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_V2_POOL_SLOTS").unwrap_or(DEFAULT_POOL_SLOTS),
@@ -74,6 +80,7 @@ fn get_pool_slots() -> usize {
     )
 }
 
+/// Determine per-shard inbox queue capacity for datapath v2.
 fn get_shard_queue_cap() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_V2_SHARD_QUEUE").unwrap_or(DEFAULT_SHARD_QUEUE_CAP),
@@ -82,6 +89,7 @@ fn get_shard_queue_cap() -> usize {
     )
 }
 
+/// Determine TX queue capacity for datapath v2.
 fn get_tx_queue_cap() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_V2_TX_QUEUE").unwrap_or(DEFAULT_TX_QUEUE_CAP),
@@ -90,6 +98,7 @@ fn get_tx_queue_cap() -> usize {
     )
 }
 
+/// Determine OS receive buffer size for the main socket.
 fn get_socket_rcvbuf_bytes() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_SOCKET_RCVBUF_BYTES").unwrap_or(DEFAULT_SOCKET_RCVBUF_BYTES),
@@ -98,6 +107,7 @@ fn get_socket_rcvbuf_bytes() -> usize {
     )
 }
 
+/// Determine OS send buffer size for the main socket.
 fn get_socket_sndbuf_bytes() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_SOCKET_SNDBUF_BYTES").unwrap_or(DEFAULT_SOCKET_SNDBUF_BYTES),
@@ -106,6 +116,7 @@ fn get_socket_sndbuf_bytes() -> usize {
     )
 }
 
+/// Determine OS receive buffer size for per-flow sockets.
 fn get_flow_socket_rcvbuf_bytes() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_FLOW_RCVBUF_BYTES").unwrap_or(DEFAULT_FLOW_SOCKET_RCVBUF_BYTES),
@@ -114,6 +125,7 @@ fn get_flow_socket_rcvbuf_bytes() -> usize {
     )
 }
 
+/// Determine OS send buffer size for per-flow sockets.
 fn get_flow_socket_sndbuf_bytes() -> usize {
     clamp_usize(
         parse_usize_env("RELAY_FLOW_SNDBUF_BYTES").unwrap_or(DEFAULT_FLOW_SOCKET_SNDBUF_BYTES),
@@ -122,6 +134,7 @@ fn get_flow_socket_sndbuf_bytes() -> usize {
     )
 }
 
+/// Fixed-size pool of packet buffers shared across RX/TX/shards.
 struct BufferPool {
     buffers: Vec<UnsafeCell<[u8; super::MAX_PACKET_SIZE]>>,
     free_tx: crossbeam_channel::Sender<usize>,
@@ -133,6 +146,7 @@ unsafe impl Sync for BufferPool {}
 unsafe impl Send for BufferPool {}
 
 impl BufferPool {
+    /// Create a new pool with `slots` buffers and an index free list.
     fn new(slots: usize) -> Self {
         let (free_tx, free_rx) = crossbeam_channel::bounded(slots);
         let mut buffers = Vec::with_capacity(slots);
@@ -149,18 +163,27 @@ impl BufferPool {
         }
     }
 
+    /// Try to acquire a free buffer index.
     fn try_acquire(&self) -> Option<usize> {
         self.free_rx.try_recv().ok()
     }
 
+    /// Release a buffer index back into the free list.
     fn release(&self, idx: usize) {
-        let _ = self.free_tx.send(idx);
+        if self.free_tx.send(idx).is_err() {
+            log::error!(
+                "V2 buffer pool release failed; dropping buffer index {}",
+                idx
+            );
+        }
     }
 
+    /// Get a mutable reference to the buffer for `idx`.
     unsafe fn buffer_mut(&self, idx: usize) -> &mut [u8; super::MAX_PACKET_SIZE] {
         &mut *self.buffers[idx].get()
     }
 
+    /// Get an immutable reference to the buffer for `idx`.
     unsafe fn buffer(&self, idx: usize) -> &[u8; super::MAX_PACKET_SIZE] {
         &*self.buffers[idx].get()
     }
@@ -207,11 +230,13 @@ struct TxPacket {
     len: usize,
 }
 
+/// Select a shard index for a given session ID.
 fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize) -> usize {
     let sid = u64::from_be_bytes(session_id);
     (sid as usize) % shard_count
 }
 
+/// Bind the relay's main UDP socket (client-facing) with tuned buffer sizes.
 fn bind_main_socket(listen_port: u16) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("Failed to create UDP socket")?;
@@ -231,6 +256,7 @@ fn bind_main_socket(listen_port: u16) -> Result<UdpSocket> {
     Ok(socket.into())
 }
 
+/// Create and connect a per-flow UDP socket to the target game address.
 fn create_flow_socket(game_addr: SocketAddr) -> Result<MioUdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("Failed to create flow UDP socket")?;
@@ -253,6 +279,7 @@ fn create_flow_socket(game_addr: SocketAddr) -> Result<MioUdpSocket> {
     Ok(MioUdpSocket::from_std(std_socket))
 }
 
+/// Write a reconstructed IPv4+UDP packet into `dst` from a response payload.
 fn write_response_ip_packet_into(
     dst: &mut [u8],
     udp_payload: &[u8],
@@ -304,6 +331,7 @@ fn write_response_ip_packet_into(
     Some(total_len)
 }
 
+/// Remove a flow from the per-session flow index.
 fn remove_flow_from_session_index(
     session_flows: &mut HashMap<[u8; super::SESSION_ID_LEN], Vec<SocketAddr>>,
     flow: &FlowKey,
@@ -319,6 +347,40 @@ fn remove_flow_from_session_index(
     }
 }
 
+/// Allocate a unique mio `Token` for a new flow socket.
+///
+/// Token(0) is reserved for the shard waker.
+fn allocate_flow_token(
+    next_token: &mut usize,
+    token_to_flow: &HashMap<Token, FlowKey>,
+) -> Option<Token> {
+    if *next_token == 0 {
+        *next_token = 1;
+    }
+
+    let start = *next_token;
+    loop {
+        let token = Token(*next_token);
+
+        // Advance for the next allocation attempt; skip reserved token 0.
+        *next_token = next_token.wrapping_add(1);
+        if *next_token == 0 {
+            *next_token = 1;
+        }
+
+        if token == Token(0) || token_to_flow.contains_key(&token) {
+            if *next_token == start {
+                // Full cycle with no free tokens found (practically impossible).
+                return None;
+            }
+            continue;
+        }
+
+        return Some(token);
+    }
+}
+
+/// Run a shard event loop: manages per-flow sockets and forwards responses back to clients.
 fn run_shard(
     shard_id: usize,
     inbox: crossbeam_channel::Receiver<ShardMsg>,
@@ -465,8 +527,16 @@ fn run_shard(
                                 }
                             };
 
-                            let token = Token(next_token);
-                            next_token = next_token.saturating_add(1);
+                            let Some(token) = allocate_flow_token(&mut next_token, &token_to_flow)
+                            else {
+                                log::error!(
+                                    "V2 shard {} token allocator exhausted (flows={})",
+                                    shard_id,
+                                    flows.len()
+                                );
+                                pool.release(payload_idx);
+                                continue;
+                            };
                             if let Err(e) =
                                 poll.registry()
                                     .register(&mut socket, token, Interest::READABLE)
@@ -609,6 +679,7 @@ fn run_shard(
     }
 }
 
+/// Run the v2 sharded datapath (RX thread + shard threads + TX thread).
 pub(super) async fn run_datapath_v2(
     listen_port: u16,
     stats_port: u16,
@@ -1108,8 +1179,16 @@ pub(super) async fn run_datapath_v2(
 
     // Keep this async task alive; we treat thread termination as fatal.
     tokio::task::spawn_blocking(move || {
-        let _ = tx_thread.join();
-        let _ = rx_thread.join();
+        match tx_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::error!("relay-tx thread exited with error: {}", e),
+            Err(panic) => log::error!("relay-tx thread panicked: {:?}", panic),
+        }
+        match rx_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::error!("relay-rx thread exited with error: {}", e),
+            Err(panic) => log::error!("relay-rx thread panicked: {:?}", panic),
+        }
     })
     .await
     .ok();
@@ -1117,6 +1196,7 @@ pub(super) async fn run_datapath_v2(
     Ok(())
 }
 
+/// Send a pre-built client frame and update global/session traffic counters.
 fn send_tx_packet(
     socket: &UdpSocket,
     pool: &BufferPool,
@@ -1143,6 +1223,7 @@ fn send_tx_packet(
     pool.release(packet.buf_idx);
 }
 
+/// Build and send a small control frame (session_id + type + status) via the TX thread.
 fn send_small_control_frame(
     tx_control: &crossbeam_channel::Sender<TxPacket>,
     pool: &BufferPool,
