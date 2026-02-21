@@ -232,7 +232,14 @@ struct TxPacket {
 
 /// Select a shard index for a given session ID.
 fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize) -> usize {
-    let sid = u64::from_be_bytes(session_id);
+    // Mix the raw session_id to avoid shard hotspots if session IDs aren't uniformly random.
+    // (Our client uses getrandom(), but this keeps the server resilient to other clients.)
+    let mut sid = u64::from_be_bytes(session_id);
+    sid ^= sid >> 33;
+    sid = sid.wrapping_mul(0xff51afd7ed558ccd);
+    sid ^= sid >> 33;
+    sid = sid.wrapping_mul(0xc4ceb9fe1a85ec53);
+    sid ^= sid >> 33;
     (sid as usize) % shard_count
 }
 
