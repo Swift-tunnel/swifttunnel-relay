@@ -1000,6 +1000,10 @@ async fn main() -> Result<()> {
 
         // Client-reported RTT: [session_id:8][0xA5][rtt_us_be_u32]
         if len == RTT_REPORT_FRAME_LEN && buf[SESSION_ID_LEN] == RTT_REPORT_FRAME_TYPE {
+            if auth_config.mode.requires_auth() && !session_authenticated {
+                stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let rtt_us = u32::from_be_bytes([
                 buf[SESSION_ID_LEN + 1],
                 buf[SESSION_ID_LEN + 2],
