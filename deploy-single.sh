@@ -22,8 +22,6 @@ if [ -z "$SSH_PASS" ] && [ -z "$KEY_FILE" ]; then
     SSH_PASS="$(get_generic_pass || true)"
 fi
 
-SSHPASS_ENV=()
-
 if [ -n "$KEY_FILE" ]; then
     SSH_CMD="ssh -i $KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
     SCP_CMD="scp -i $KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
@@ -37,7 +35,7 @@ else
         echo "Missing SWIFTTUNNEL_SSH_PASS and couldn't infer from $PASS_MD"
         exit 1
     fi
-    SSHPASS_ENV=(SSHPASS="$SSH_PASS")
+    export SSHPASS="$SSH_PASS"
     SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
     SCP_CMD="sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null"
     SUDO=""
@@ -46,15 +44,16 @@ fi
 echo "📦 Building and deploying to $SERVER..."
 
 # Copy source
-"${SSHPASS_ENV[@]}" $SSH_CMD "$SERVER" "rm -rf /tmp/v3-relay && mkdir -p /tmp/v3-relay/src"
-"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/Cargo.lock" "$SERVER:/tmp/v3-relay/" 2>/dev/null || true
-"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/Cargo.toml" "$SERVER:/tmp/v3-relay/"
-"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/src/main.rs" "$SERVER:/tmp/v3-relay/src/"
-"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/src/datapath_v2.rs" "$SERVER:/tmp/v3-relay/src/"
-"${SSHPASS_ENV[@]}" $SCP_CMD "$SCRIPT_DIR/v3-relay.service" "$SERVER:/tmp/v3-relay/"
+$SSH_CMD "$SERVER" "rm -rf /tmp/v3-relay && mkdir -p /tmp/v3-relay/src"
+$SCP_CMD "$SCRIPT_DIR/Cargo.lock" "$SERVER:/tmp/v3-relay/" 2>/dev/null || true
+$SCP_CMD "$SCRIPT_DIR/Cargo.toml" "$SERVER:/tmp/v3-relay/"
+$SCP_CMD "$SCRIPT_DIR/src/main.rs" "$SERVER:/tmp/v3-relay/src/"
+$SCP_CMD "$SCRIPT_DIR/src/datapath_v2.rs" "$SERVER:/tmp/v3-relay/src/"
+$SCP_CMD "$SCRIPT_DIR/src/tcp_tun.rs" "$SERVER:/tmp/v3-relay/src/"
+$SCP_CMD "$SCRIPT_DIR/v3-relay.service" "$SERVER:/tmp/v3-relay/"
 
 # Build and install
-"${SSHPASS_ENV[@]}" $SSH_CMD "$SERVER" "
+$SSH_CMD "$SERVER" "
     # Install Rust if needed
     if ! command -v cargo &> /dev/null; then
         echo 'Installing Rust...'
@@ -89,5 +88,7 @@ echo "📦 Building and deploying to $SERVER..."
     sleep 2
     $SUDO systemctl status v3-relay --no-pager
 "
+
+unset SSHPASS 2>/dev/null || true
 
 echo "✅ Deployed to $SERVER"

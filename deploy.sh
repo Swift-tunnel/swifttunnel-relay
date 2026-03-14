@@ -120,6 +120,7 @@ scp_pass "$SCRIPT_DIR/Cargo.lock" "$BUILD_SERVER:$BUILD_DIR/" 2>/dev/null || tru
 scp_pass "$SCRIPT_DIR/Cargo.toml" "$BUILD_SERVER:$BUILD_DIR/"
 scp_pass "$SCRIPT_DIR/src/main.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
 scp_pass "$SCRIPT_DIR/src/datapath_v2.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
+scp_pass "$SCRIPT_DIR/src/tcp_tun.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
 
 # Install Rust if needed and build
 ssh_pass "$BUILD_SERVER" "
@@ -170,25 +171,27 @@ deploy_to_server() {
         sudo_prefix=""
     fi
 
-    local sshpass_env=()
+    # For password-auth, set SSHPASS as an exported env var for child processes.
     if [ "$is_aws" != "true" ]; then
-        sshpass_env=(SSHPASS="$password")
+        export SSHPASS="$password"
     fi
 
     # Copy binary
-    if ! "${sshpass_env[@]}" $scp_cmd "/tmp/$BINARY_NAME" "$server:/tmp/$BINARY_NAME" 2>/dev/null; then
+    if ! $scp_cmd "/tmp/$BINARY_NAME" "$server:/tmp/$BINARY_NAME" 2>/dev/null; then
         echo "❌ Failed to copy binary"
+        unset SSHPASS 2>/dev/null
         return 1
     fi
 
     # Copy service file
-    if ! "${sshpass_env[@]}" $scp_cmd "$SCRIPT_DIR/$SERVICE_FILE" "$server:/tmp/$SERVICE_FILE" 2>/dev/null; then
+    if ! $scp_cmd "$SCRIPT_DIR/$SERVICE_FILE" "$server:/tmp/$SERVICE_FILE" 2>/dev/null; then
         echo "❌ Failed to copy service file"
+        unset SSHPASS 2>/dev/null
         return 1
     fi
 
     # Install, configure env, and start service
-    if ! "${sshpass_env[@]}" $ssh_cmd "$server" "
+    if ! $ssh_cmd "$server" "
         # Stop first; atomic replace avoids ETXTBSY and cross-fs mv weirdness
         $sudo_prefix systemctl stop v3-relay >/dev/null 2>&1 || true
         $sudo_prefix mkdir -p /usr/local/bin
@@ -234,6 +237,12 @@ EOF
             exit 1
         fi
 
+        # Assign TUN IP if TCP tunneling is enabled (relay creates the device on start)
+        if $sudo_prefix ip link show swifttun0 &>/dev/null; then
+            $sudo_prefix ip addr add 10.200.0.1/16 dev swifttun0 2>/dev/null || true
+            $sudo_prefix ip link set swifttun0 up 2>/dev/null || true
+        fi
+
         # Verify stats JSON includes new fields (dropped_in/out/pps)
         token=\$(grep -E '^RELAY_STATS_TOKEN=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || true)
         port=\$(grep -E '^RELAY_STATS_PORT=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || echo 51822)
@@ -242,9 +251,11 @@ EOF
         fi
     " 2>/dev/null; then
         echo "❌ Failed to install/start"
+        unset SSHPASS 2>/dev/null
         return 1
     fi
 
+    unset SSHPASS 2>/dev/null
     echo "✅"
     return 0
 }
