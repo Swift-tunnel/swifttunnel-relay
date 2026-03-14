@@ -89,4 +89,6 @@ $SSH_CMD "$SERVER" "
     $SUDO systemctl status v3-relay --no-pager
 "
 
+unset SSHPASS 2>/dev/null || true
+
 echo "✅ Deployed to $SERVER"
