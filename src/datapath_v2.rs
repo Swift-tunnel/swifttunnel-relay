@@ -1121,6 +1121,10 @@ pub(super) async fn run_datapath_v2(
                 if len == super::RTT_REPORT_FRAME_LEN
                     && buf[super::SESSION_ID_LEN] == super::RTT_REPORT_FRAME_TYPE
                 {
+                    if auth_config_rx.mode.requires_auth() && !session_authenticated {
+                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let rtt_us = u32::from_be_bytes([
                         buf[super::SESSION_ID_LEN + 1],
                         buf[super::SESSION_ID_LEN + 2],
