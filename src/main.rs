@@ -54,6 +54,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::interval;
 
 mod datapath_v2;
+mod tcp_tun;
 
 const SESSION_ID_LEN: usize = 8;
 const DEFAULT_PORT: u16 = 51821;
@@ -345,7 +346,7 @@ const MIN_FLOW_CHANNEL_CAPACITY: usize = 8;
 const MAX_FLOW_CHANNEL_CAPACITY: usize = 4096;
 
 /// Minimum IP header size
-const IP_HEADER_MIN: usize = 20;
+pub(crate) const IP_HEADER_MIN: usize = 20;
 /// UDP header size
 const UDP_HEADER_SIZE: usize = 8;
 
@@ -479,6 +480,10 @@ struct Stats {
     dropped_out: AtomicU64,
     /// Users currently in throttled state (reserved for quota integration)
     throttled_users: AtomicU64,
+    /// TCP packets forwarded to the TUN handler
+    tcp_forwarded: AtomicU64,
+    /// UDP IPv4 packets forwarded to the TUN handler
+    tun_udp_forwarded: AtomicU64,
 }
 
 impl Stats {
@@ -493,6 +498,8 @@ impl Stats {
             dropped_in: AtomicU64::new(0),
             dropped_out: AtomicU64::new(0),
             throttled_users: AtomicU64::new(0),
+            tcp_forwarded: AtomicU64::new(0),
+            tun_udp_forwarded: AtomicU64::new(0),
         }
     }
 }
@@ -515,14 +522,108 @@ async fn main() -> Result<()> {
     log::info!("║     Low Latency Game Packet Forwarding     ║");
     log::info!("╚════════════════════════════════════════════╝");
 
+    // Bind the main UDP socket early so the TUN response thread can share it.
+    // Reuse the existing datapath-v2 helper so RELAY_SOCKET_RCVBUF_BYTES /
+    // RELAY_SOCKET_SNDBUF_BYTES tuning still applies.
+    let main_std_socket = datapath_v2::bind_main_socket(listen_port)?;
+    log::info!("Listening on 0.0.0.0:{}", listen_port);
+
+    // TUN-backed forwarding (opt-in).
+    let mut tcp_enabled = env::var("RELAY_TCP_ENABLED")
+        .ok()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut tun_udp_enabled = env::var("RELAY_TUN_UDP")
+        .ok()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let tun_session_cleanup: Option<tcp_tun::TunSessionCleanup>;
+    let tun_tx_sender: Option<crossbeam_channel::Sender<tcp_tun::InboundTunPacket>> =
+        if tcp_enabled || tun_udp_enabled {
+            log::info!(
+                "TUN forwarding enabled (RELAY_TCP_ENABLED={}, RELAY_TUN_UDP={})",
+                tcp_enabled,
+                tun_udp_enabled
+            );
+            // Bounded to prevent OOM if the response thread falls behind.
+            let (tcp_response_tx, tcp_response_rx) =
+                crossbeam_channel::bounded::<tcp_tun::TxPacket>(4096);
+            match tcp_tun::TunHandler::new(tcp_response_tx) {
+                Ok((handler, sender, tun_cleanup)) => {
+                    // Spawn the TUN handler on its own thread.
+                    std::thread::Builder::new()
+                        .name("relay-tun".into())
+                        .spawn(move || handler.run())
+                        .expect("Failed to spawn relay TUN handler");
+
+                    // Clone the main socket so TUN responses go out on port 51821.
+                    let resp_socket = main_std_socket
+                        .try_clone()
+                        .expect("Failed to clone main socket for TUN responses");
+
+                    // Spawn a thread that drains TUN response packets and sends
+                    // them back to clients via the main relay socket.
+                    let stats_tun_resp = Arc::clone(&stats);
+                    std::thread::Builder::new()
+                        .name("relay-tun-resp".into())
+                        .spawn(move || {
+                            while let Ok(tx_pkt) = tcp_response_rx.recv() {
+                                // Build relay frame: [session_id][ip_packet]
+                                let mut frame =
+                                    Vec::with_capacity(SESSION_ID_LEN + tx_pkt.ip_packet.len());
+                                frame.extend_from_slice(&tx_pkt.session_id);
+                                frame.extend_from_slice(&tx_pkt.ip_packet);
+                                if let Err(e) = resp_socket.send_to(&frame, tx_pkt.client_addr) {
+                                    log::trace!(
+                                        "TCP response send error to {}: {}",
+                                        tx_pkt.client_addr,
+                                        e
+                                    );
+                                } else {
+                                    stats_tun_resp.packets_out.fetch_add(1, Ordering::Relaxed);
+                                    stats_tun_resp
+                                        .bytes_out
+                                        .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                }
+                            }
+                        })
+                        .expect("Failed to spawn TUN response thread");
+
+                    tun_session_cleanup = Some(tun_cleanup);
+                    Some(sender)
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to create relay TUN handler: {}. TUN forwarding disabled.",
+                        e
+                    );
+                    tcp_enabled = false;
+                    tun_udp_enabled = false;
+                    tun_session_cleanup = None;
+                    None
+                }
+            }
+        } else {
+            log::info!(
+                "TUN forwarding disabled (set RELAY_TCP_ENABLED=true and/or RELAY_TUN_UDP=true)"
+            );
+            tun_session_cleanup = None;
+            None
+        };
+
     if matches!(datapath, datapath_v2::RelayDatapath::V2) {
         return datapath_v2::run_datapath_v2(
-            listen_port,
+            main_std_socket,
             stats_port,
             stats_token,
             auth_config,
             stats,
             started_at,
+            tun_tx_sender,
+            tun_session_cleanup,
+            tun_udp_enabled,
+            tcp_enabled,
         )
         .await;
     }
@@ -531,12 +632,12 @@ async fn main() -> Result<()> {
 
     let flow_channel_capacity = get_flow_channel_capacity();
 
-    // Bind main socket
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", listen_port))
-        .await
-        .context(format!("Failed to bind to port {}", listen_port))?;
-
-    log::info!("Listening on 0.0.0.0:{}", listen_port);
+    // Convert std socket to tokio async socket for v1 datapath.
+    main_std_socket
+        .set_nonblocking(true)
+        .context("Failed to set non-blocking for tokio")?;
+    let socket =
+        UdpSocket::from_std(main_std_socket).context("Failed to convert to tokio UdpSocket")?;
 
     if stats_token.is_some() {
         log::info!("Local stats API enabled on 127.0.0.1:{}", stats_port);
@@ -608,6 +709,7 @@ async fn main() -> Result<()> {
     let flows_cleanup = Arc::clone(&flows);
     let stats_cleanup = Arc::clone(&stats);
     let session_traffic_cleanup = Arc::clone(&session_traffic);
+    let tcp_cleanup = tun_session_cleanup;
     tokio::spawn(async move {
         let mut cleanup_timer = interval(CLEANUP_INTERVAL);
         loop {
@@ -662,6 +764,11 @@ async fn main() -> Result<()> {
                 }
                 true
             });
+
+            // Clean up TCP TUN session mappings for expired sessions.
+            if let Some(ref tcp) = tcp_cleanup {
+                tcp.remove_expired(|sid| sessions_cleanup.contains_key(sid));
+            }
 
             // Update stats
             stats_cleanup
@@ -907,89 +1014,139 @@ async fn main() -> Result<()> {
 
         // Parse IP packet
         let ip_packet = &buf[SESSION_ID_LEN..len];
-        let Some((game_addr, udp_payload, original_info)) = parse_ip_packet_full(ip_packet) else {
-            continue;
+        let parsed = match parse_ip_packet_full(ip_packet) {
+            Some(p) => p,
+            None => continue,
         };
 
-        // In legacy mode, use tunnel source IP as best-effort user identity.
-        if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-            if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
-                session_entry.user_id = original_info.src_ip.to_string();
+        match parsed {
+            ParsedPacket::Tcp {
+                original_info,
+                raw_ip_packet,
+            } => {
+                if tcp_enabled {
+                    if let Some(ref tun_sender) = tun_tx_sender {
+                        let _ = tun_sender.try_send(tcp_tun::InboundTunPacket {
+                            session_id,
+                            client_addr,
+                            raw_ip_packet: raw_ip_packet.to_vec(),
+                        });
+                        stats.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // Update session user_id for TCP too
+                if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+                    if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
+                        session_entry.user_id = original_info.src_ip.to_string();
+                    }
+                }
+                continue;
             }
-        }
-
-        // Create flow key
-        let flow_key = format!("{:016x}:{}", u64::from_be_bytes(session_id), game_addr);
-
-        // Atomic get-or-create using entry() API to prevent race conditions
-        match flows.entry(flow_key.clone()) {
-            Entry::Occupied(mut entry) => {
-                // Existing flow - update and send
-                let flow = entry.get_mut();
-                flow.last_activity = Instant::now();
-                flow.client_addr = client_addr; // NAT rebind support
-                flow.original_info = original_info;
-                flow.marked_for_removal = None; // Revive if was marked
-
-                // Bounded channel - drop packet if full (games handle packet loss)
-                match flow.tx.try_send(udp_payload.to_vec()) {
-                    Ok(_) => {}
-                    Err(TrySendError::Full(_)) => {
+            ParsedPacket::Udp {
+                game_addr,
+                payload: udp_payload,
+                original_info,
+            } => {
+                if tun_udp_enabled {
+                    if let Some(ref tun_sender) = tun_tx_sender {
+                        let _ = tun_sender.try_send(tcp_tun::InboundTunPacket {
+                            session_id,
+                            client_addr,
+                            raw_ip_packet: ip_packet.to_vec(),
+                        });
+                        stats.tun_udp_forwarded.fetch_add(1, Ordering::Relaxed);
+                    } else {
                         stats.dropped_in.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(TrySendError::Closed(_)) => {
-                        // Flow task died, remove entry so it can be recreated
-                        drop(entry);
-                        flows.remove(&flow_key);
+                    if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+                        if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
+                            session_entry.user_id = original_info.src_ip.to_string();
+                        }
+                    }
+                    continue;
+                }
+
+                // In legacy mode, use tunnel source IP as best-effort user identity.
+                if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+                    if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
+                        session_entry.user_id = original_info.src_ip.to_string();
                     }
                 }
-            }
-            Entry::Vacant(entry) => {
-                // New flow - create atomically
-                let (tx, rx) = mpsc::channel(flow_channel_capacity);
 
-                // Send first packet (should never fail on fresh channel)
-                if tx.try_send(udp_payload.to_vec()).is_err() {
-                    log::warn!("Failed to queue first packet for new flow {}", flow_key);
+                // Create flow key
+                let flow_key = format!("{:016x}:{}", u64::from_be_bytes(session_id), game_addr);
+
+                // Atomic get-or-create using entry() API to prevent race conditions
+                match flows.entry(flow_key.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        // Existing flow - update and send
+                        let flow = entry.get_mut();
+                        flow.last_activity = Instant::now();
+                        flow.client_addr = client_addr; // NAT rebind support
+                        flow.original_info = original_info;
+                        flow.marked_for_removal = None; // Revive if was marked
+
+                        // Bounded channel - drop packet if full (games handle packet loss)
+                        match flow.tx.try_send(udp_payload.to_vec()) {
+                            Ok(_) => {}
+                            Err(TrySendError::Full(_)) => {
+                                stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                // Flow task died, remove entry so it can be recreated
+                                drop(entry);
+                                flows.remove(&flow_key);
+                            }
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        // New flow - create atomically
+                        let (tx, rx) = mpsc::channel(flow_channel_capacity);
+
+                        // Send first packet (should never fail on fresh channel)
+                        if tx.try_send(udp_payload.to_vec()).is_err() {
+                            log::warn!("Failed to queue first packet for new flow {}", flow_key);
+                        }
+
+                        // Insert atomically
+                        entry.insert(FlowEntry {
+                            tx,
+                            client_addr,
+                            last_activity: Instant::now(),
+                            original_info,
+                            marked_for_removal: None,
+                        });
+
+                        // Spawn flow handler
+                        let response_tx = response_tx.clone();
+                        let flows_ref = Arc::clone(&flows);
+                        let sessions_ref = Arc::clone(&sessions);
+                        let stats_ref = Arc::clone(&stats);
+
+                        tokio::spawn(async move {
+                            run_flow_handler(
+                                flow_key,
+                                game_addr,
+                                session_id,
+                                rx,
+                                response_tx,
+                                flows_ref,
+                                sessions_ref,
+                                stats_ref,
+                            )
+                            .await;
+                        });
+
+                        log::debug!(
+                            "New flow: {:016x} -> {} from {} (client {}:{} -> game)",
+                            u64::from_be_bytes(session_id),
+                            game_addr,
+                            client_addr,
+                            original_info.src_ip,
+                            original_info.src_port
+                        );
+                    }
                 }
-
-                // Insert atomically
-                entry.insert(FlowEntry {
-                    tx,
-                    client_addr,
-                    last_activity: Instant::now(),
-                    original_info,
-                    marked_for_removal: None,
-                });
-
-                // Spawn flow handler
-                let response_tx = response_tx.clone();
-                let flows_ref = Arc::clone(&flows);
-                let sessions_ref = Arc::clone(&sessions);
-                let stats_ref = Arc::clone(&stats);
-
-                tokio::spawn(async move {
-                    run_flow_handler(
-                        flow_key,
-                        game_addr,
-                        session_id,
-                        rx,
-                        response_tx,
-                        flows_ref,
-                        sessions_ref,
-                        stats_ref,
-                    )
-                    .await;
-                });
-
-                log::debug!(
-                    "New flow: {:016x} -> {} from {} (client {}:{} -> game)",
-                    u64::from_be_bytes(session_id),
-                    game_addr,
-                    client_addr,
-                    original_info.src_ip,
-                    original_info.src_port
-                );
             }
         }
     }
@@ -1353,7 +1510,7 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
     }
 
     format!(
-        "{{\"version\":\"{}\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{},\"dropped_in\":{},\"dropped_out\":{},\"dropped_pps\":{}}}",
+        "{{\"version\":\"{}\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{},\"dropped_in\":{},\"dropped_out\":{},\"dropped_pps\":{},\"tcp_forwarded\":{},\"tun_udp_forwarded\":{}}}",
         RELAY_VERSION,
         unix_timestamp_secs(),
         active_user_ids.len(),
@@ -1363,7 +1520,9 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
         outbound_bps,
         dropped_in,
         dropped_out,
-        dropped_pps
+        dropped_pps,
+        context.stats.tcp_forwarded.load(Ordering::Relaxed),
+        context.stats.tun_udp_forwarded.load(Ordering::Relaxed)
     )
 }
 
@@ -1451,8 +1610,26 @@ fn escape_json(value: &str) -> String {
     escaped
 }
 
-/// Parse an IP packet and extract destination, UDP payload, and original packet info
-fn parse_ip_packet_full(packet: &[u8]) -> Option<(SocketAddr, &[u8], OriginalPacketInfo)> {
+/// Parsed result from `parse_ip_packet_full`.
+pub(crate) enum ParsedPacket<'a> {
+    Udp {
+        game_addr: SocketAddr,
+        payload: &'a [u8],
+        original_info: OriginalPacketInfo,
+    },
+    Tcp {
+        original_info: OriginalPacketInfo,
+        raw_ip_packet: &'a [u8],
+    },
+}
+
+/// Parse an IP packet and extract protocol-specific information.
+///
+/// Returns `ParsedPacket::Udp` for UDP (protocol 17) with the game address,
+/// payload, and original packet info. Returns `ParsedPacket::Tcp` for TCP
+/// (protocol 6) with the original packet info and a reference to the raw IP
+/// packet. Returns `None` for other protocols or malformed packets.
+fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     if packet.len() < IP_HEADER_MIN {
         return None;
     }
@@ -1469,11 +1646,7 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<(SocketAddr, &[u8], OriginalPac
         return None;
     }
 
-    // Check protocol (should be UDP = 17)
     let protocol = packet[9];
-    if protocol != 17 {
-        return None;
-    }
 
     // Extract source IP (bytes 12-15)
     let src_ip = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
@@ -1481,34 +1654,66 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<(SocketAddr, &[u8], OriginalPac
     // Extract destination IP (bytes 16-19)
     let dst_ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
 
-    // Parse UDP header
-    let udp_start = ihl;
-    if packet.len() < udp_start + UDP_HEADER_SIZE {
-        return None;
+    match protocol {
+        17 => {
+            // UDP
+            let udp_start = ihl;
+            if packet.len() < udp_start + UDP_HEADER_SIZE {
+                return None;
+            }
+
+            // Source port (bytes 0-1 of UDP header)
+            let src_port = u16::from_be_bytes([packet[udp_start], packet[udp_start + 1]]);
+
+            // Destination port (bytes 2-3 of UDP header)
+            let dst_port = u16::from_be_bytes([packet[udp_start + 2], packet[udp_start + 3]]);
+
+            // UDP payload starts after 8-byte UDP header
+            let payload_start = udp_start + UDP_HEADER_SIZE;
+            let payload = if packet.len() > payload_start {
+                &packet[payload_start..]
+            } else {
+                &[]
+            };
+
+            let original_info = OriginalPacketInfo {
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+            };
+
+            Some(ParsedPacket::Udp {
+                game_addr: SocketAddr::from((dst_ip, dst_port)),
+                payload,
+                original_info,
+            })
+        }
+        6 => {
+            // TCP — need at least the TCP header (20 bytes) after the IP header
+            const TCP_HEADER_MIN: usize = 20;
+            let tcp_start = ihl;
+            if packet.len() < tcp_start + TCP_HEADER_MIN {
+                return None;
+            }
+
+            let src_port = u16::from_be_bytes([packet[tcp_start], packet[tcp_start + 1]]);
+            let dst_port = u16::from_be_bytes([packet[tcp_start + 2], packet[tcp_start + 3]]);
+
+            let original_info = OriginalPacketInfo {
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+            };
+
+            Some(ParsedPacket::Tcp {
+                original_info,
+                raw_ip_packet: packet,
+            })
+        }
+        _ => None,
     }
-
-    // Source port (bytes 0-1 of UDP header)
-    let src_port = u16::from_be_bytes([packet[udp_start], packet[udp_start + 1]]);
-
-    // Destination port (bytes 2-3 of UDP header)
-    let dst_port = u16::from_be_bytes([packet[udp_start + 2], packet[udp_start + 3]]);
-
-    // UDP payload starts after 8-byte UDP header
-    let payload_start = udp_start + UDP_HEADER_SIZE;
-    let payload = if packet.len() > payload_start {
-        &packet[payload_start..]
-    } else {
-        &[]
-    };
-
-    let original_info = OriginalPacketInfo {
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
-    };
-
-    Some((SocketAddr::from((dst_ip, dst_port)), payload, original_info))
 }
 
 /// Build a response IP packet from game server response
@@ -1575,7 +1780,7 @@ fn build_response_ip_packet(udp_payload: &[u8], original: OriginalPacketInfo) ->
 }
 
 /// Calculate IP header checksum (RFC 1071)
-fn calculate_ip_checksum(header: &[u8]) -> u16 {
+pub(crate) fn calculate_ip_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Sum 16-bit words
@@ -1689,14 +1894,23 @@ mod tests {
         let result = parse_ip_packet_full(&packet);
         assert!(result.is_some());
 
-        let (addr, payload, info) = result.unwrap();
-        assert_eq!(addr.ip().to_string(), "1.2.3.4");
-        assert_eq!(addr.port(), 12345);
-        assert_eq!(payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(info.src_ip.to_string(), "10.0.0.5");
-        assert_eq!(info.src_port, 54321);
-        assert_eq!(info.dst_ip.to_string(), "1.2.3.4");
-        assert_eq!(info.dst_port, 12345);
+        let result = result.unwrap();
+        match result {
+            ParsedPacket::Udp {
+                game_addr: addr,
+                payload,
+                original_info: info,
+            } => {
+                assert_eq!(addr.ip().to_string(), "1.2.3.4");
+                assert_eq!(addr.port(), 12345);
+                assert_eq!(payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
+                assert_eq!(info.src_ip.to_string(), "10.0.0.5");
+                assert_eq!(info.src_port, 54321);
+                assert_eq!(info.dst_ip.to_string(), "1.2.3.4");
+                assert_eq!(info.dst_port, 12345);
+            }
+            _ => panic!("Expected ParsedPacket::Udp"),
+        }
     }
 
     #[test]
@@ -1859,5 +2073,1450 @@ mod tests {
 
         let result = verify_relay_ticket(&tampered, session_id, &auth_config, now);
         assert!(matches!(result, Err(RelayAuthVerifyError::BadSignature)));
+    }
+}
+
+#[cfg(test)]
+mod auth_config_utility_tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn test_auth_materials() -> (Ed25519KeyPair, RelayAuthConfig) {
+        let seed = [7u8; 32];
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed).expect("seed must be valid");
+        let auth_config = RelayAuthConfig {
+            mode: RelayAuthMode::Required,
+            public_key: Some(key_pair.public_key().as_ref().to_vec()),
+            server_id: Some("us-east-nj".to_string()),
+        };
+        (key_pair, auth_config)
+    }
+
+    fn make_ticket_token(
+        key_pair: &Ed25519KeyPair,
+        sid: &str,
+        server: &str,
+        now: u64,
+        exp: u64,
+    ) -> String {
+        let payload = serde_json::json!({
+            "v": 1,
+            "iss": "swifttunnel-web",
+            "aud": "swifttunnel-relay",
+            "sub": "11111111-1111-1111-1111-111111111111",
+            "sid": sid,
+            "srv": server,
+            "iat": now,
+            "exp": exp,
+            "jti": "22222222-2222-2222-2222-222222222222",
+        });
+        let payload_bytes = serde_json::to_vec(&payload).expect("json serialization must work");
+        let signature = key_pair.sign(&payload_bytes);
+        format!(
+            "{}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(&payload_bytes),
+            BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    fn make_custom_ticket_token(
+        key_pair: &Ed25519KeyPair,
+        payload_json: serde_json::Value,
+    ) -> String {
+        let payload_bytes = serde_json::to_vec(&payload_json).unwrap();
+        let signature = key_pair.sign(&payload_bytes);
+        format!(
+            "{}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(&payload_bytes),
+            BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    // ---- RelayAuthMode::from_env tests ----
+
+    #[test]
+    fn test_from_env_required() {
+        assert_eq!(
+            RelayAuthMode::from_env(Some("required".into())),
+            RelayAuthMode::Required
+        );
+    }
+
+    #[test]
+    fn test_from_env_optional() {
+        assert_eq!(
+            RelayAuthMode::from_env(Some("optional".into())),
+            RelayAuthMode::Optional
+        );
+    }
+
+    #[test]
+    fn test_from_env_off() {
+        assert_eq!(
+            RelayAuthMode::from_env(Some("off".into())),
+            RelayAuthMode::Off
+        );
+    }
+
+    #[test]
+    fn test_from_env_none() {
+        assert_eq!(RelayAuthMode::from_env(None), RelayAuthMode::Off);
+    }
+
+    #[test]
+    fn test_from_env_whitespace_trimmed() {
+        assert_eq!(
+            RelayAuthMode::from_env(Some(" required ".into())),
+            RelayAuthMode::Required
+        );
+    }
+
+    #[test]
+    fn test_from_env_case_insensitive() {
+        assert_eq!(
+            RelayAuthMode::from_env(Some("REQUIRED".into())),
+            RelayAuthMode::Required
+        );
+    }
+
+    // ---- RelayAuthMode::as_str tests ----
+
+    #[test]
+    fn test_as_str_off() {
+        assert_eq!(RelayAuthMode::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn test_as_str_optional() {
+        assert_eq!(RelayAuthMode::Optional.as_str(), "optional");
+    }
+
+    #[test]
+    fn test_as_str_required() {
+        assert_eq!(RelayAuthMode::Required.as_str(), "required");
+    }
+
+    // ---- RelayAuthMode::requires_auth tests ----
+
+    #[test]
+    fn test_requires_auth_off() {
+        assert!(!RelayAuthMode::Off.requires_auth());
+    }
+
+    #[test]
+    fn test_requires_auth_optional() {
+        assert!(!RelayAuthMode::Optional.requires_auth());
+    }
+
+    #[test]
+    fn test_requires_auth_required() {
+        assert!(RelayAuthMode::Required.requires_auth());
+    }
+
+    // ---- SessionAuthState::as_str tests ----
+
+    #[test]
+    fn test_session_auth_state_legacy() {
+        assert_eq!(SessionAuthState::Legacy.as_str(), "legacy");
+    }
+
+    #[test]
+    fn test_session_auth_state_authenticated() {
+        assert_eq!(SessionAuthState::Authenticated.as_str(), "authenticated");
+    }
+
+    // ---- RelayAuthVerifyError::ack_status tests ----
+
+    #[test]
+    fn test_ack_status_bad_format() {
+        assert_eq!(
+            RelayAuthVerifyError::BadFormat.ack_status(),
+            AUTH_ACK_BAD_FORMAT
+        );
+    }
+
+    #[test]
+    fn test_ack_status_bad_signature() {
+        assert_eq!(
+            RelayAuthVerifyError::BadSignature.ack_status(),
+            AUTH_ACK_BAD_SIGNATURE
+        );
+    }
+
+    #[test]
+    fn test_ack_status_expired() {
+        assert_eq!(RelayAuthVerifyError::Expired.ack_status(), AUTH_ACK_EXPIRED);
+    }
+
+    #[test]
+    fn test_ack_status_sid_mismatch() {
+        assert_eq!(
+            RelayAuthVerifyError::SidMismatch.ack_status(),
+            AUTH_ACK_SID_MISMATCH
+        );
+    }
+
+    #[test]
+    fn test_ack_status_server_mismatch() {
+        assert_eq!(
+            RelayAuthVerifyError::ServerMismatch.ack_status(),
+            AUTH_ACK_SERVER_MISMATCH
+        );
+    }
+
+    // ---- decode_base64_flexible tests ----
+
+    #[test]
+    fn test_decode_base64_url_safe_no_pad() {
+        let input = BASE64_URL_SAFE_NO_PAD.encode(b"hello");
+        let result = decode_base64_flexible(&input);
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_decode_base64_url_safe_padded() {
+        let input = BASE64_URL_SAFE.encode(b"hello");
+        let result = decode_base64_flexible(&input);
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_decode_base64_standard() {
+        let input = BASE64_STANDARD.encode(b"hello");
+        let result = decode_base64_flexible(&input);
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_decode_base64_invalid() {
+        let result = decode_base64_flexible("!!!not-valid-base64!!!");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_decode_base64_empty() {
+        let result = decode_base64_flexible("");
+        assert_eq!(result, Some(vec![]));
+    }
+
+    // ---- verify_relay_ticket edge cases ----
+
+    #[test]
+    fn test_verify_ticket_empty_token() {
+        let (_, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let result = verify_relay_ticket("", session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_too_long() {
+        let (_, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let long_token = "a".repeat(MAX_AUTH_TOKEN_LEN + 1);
+        let result = verify_relay_ticket(&long_token, session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_no_dot_separator() {
+        let (_, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let result = verify_relay_ticket("nodothere", session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_bad_base64_payload() {
+        let (_, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let sig_b64 = BASE64_URL_SAFE_NO_PAD.encode(&[0u8; 64]);
+        let token = format!("!!!invalid!!!.{}", sig_b64);
+        let result = verify_relay_ticket(&token, session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_bad_base64_signature() {
+        let (_, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let payload_b64 = BASE64_URL_SAFE_NO_PAD.encode(b"{}");
+        let token = format!("{}.!!!invalid!!!", payload_b64);
+        let result = verify_relay_ticket(&token, session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_signature_wrong_length() {
+        let (_, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let payload_b64 = BASE64_URL_SAFE_NO_PAD.encode(b"{}");
+        let sig_b64 = BASE64_URL_SAFE_NO_PAD.encode(&[0u8; 32]); // 32 != 64
+        let token = format!("{}.{}", payload_b64, sig_b64);
+        let result = verify_relay_ticket(&token, session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_no_public_key() {
+        let auth_config = RelayAuthConfig {
+            mode: RelayAuthMode::Required,
+            public_key: None,
+            server_id: Some("us-east-nj".to_string()),
+        };
+        let session_id = [0u8; SESSION_ID_LEN];
+        let payload_b64 = BASE64_URL_SAFE_NO_PAD.encode(b"{}");
+        let sig_b64 = BASE64_URL_SAFE_NO_PAD.encode(&[0u8; 64]);
+        let token = format!("{}.{}", payload_b64, sig_b64);
+        let result = verify_relay_ticket(&token, session_id, &auth_config, 1_739_790_000);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_wrong_version() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let now = 1_739_790_000_u64;
+        let token = make_custom_ticket_token(
+            &key_pair,
+            serde_json::json!({
+                "v": 2,
+                "iss": "swifttunnel-web",
+                "aud": "swifttunnel-relay",
+                "sub": "user-1",
+                "sid": sid,
+                "srv": "us-east-nj",
+                "iat": now,
+                "exp": now + 300,
+                "jti": "jti-1",
+            }),
+        );
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_wrong_issuer() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let now = 1_739_790_000_u64;
+        let token = make_custom_ticket_token(
+            &key_pair,
+            serde_json::json!({
+                "v": 1,
+                "iss": "wrong-issuer",
+                "aud": "swifttunnel-relay",
+                "sub": "user-1",
+                "sid": sid,
+                "srv": "us-east-nj",
+                "iat": now,
+                "exp": now + 300,
+                "jti": "jti-1",
+            }),
+        );
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_wrong_audience() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let now = 1_739_790_000_u64;
+        let token = make_custom_ticket_token(
+            &key_pair,
+            serde_json::json!({
+                "v": 1,
+                "iss": "swifttunnel-web",
+                "aud": "wrong-audience",
+                "sub": "user-1",
+                "sid": sid,
+                "srv": "us-east-nj",
+                "iat": now,
+                "exp": now + 300,
+                "jti": "jti-1",
+            }),
+        );
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_empty_sub() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = [0u8; SESSION_ID_LEN];
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let now = 1_739_790_000_u64;
+        let token = make_custom_ticket_token(
+            &key_pair,
+            serde_json::json!({
+                "v": 1,
+                "iss": "swifttunnel-web",
+                "aud": "swifttunnel-relay",
+                "sub": "",
+                "sid": sid,
+                "srv": "us-east-nj",
+                "iat": now,
+                "exp": now + 300,
+                "jti": "jti-1",
+            }),
+        );
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_verify_ticket_iat_at_exact_clock_skew_boundary_passes() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        // iat = now + AUTH_CLOCK_SKEW_SECS exactly should pass (not strictly greater)
+        let iat = now + AUTH_CLOCK_SKEW_SECS;
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", iat, iat + 300);
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(
+            result.is_ok(),
+            "iat at exact clock skew boundary should pass"
+        );
+    }
+
+    #[test]
+    fn test_verify_ticket_exp_at_exact_clock_skew_boundary_passes() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let iat = 1_739_789_000_u64;
+        let exp = 1_739_789_500_u64;
+        // now = exp + AUTH_CLOCK_SKEW_SECS exactly should pass
+        let now = exp + AUTH_CLOCK_SKEW_SECS;
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", iat, exp);
+        let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(
+            result.is_ok(),
+            "exp at exact clock skew boundary should pass"
+        );
+    }
+
+    // ---- parse_auth_hello_token edge cases ----
+
+    #[test]
+    fn test_parse_auth_hello_frame_too_short() {
+        // Fewer than SESSION_ID_LEN + 3 = 11 bytes
+        let frame = [0u8; 10];
+        let result = parse_auth_hello_token(&frame, frame.len());
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_parse_auth_hello_token_len_zero() {
+        let mut frame = vec![0u8; SESSION_ID_LEN + 3];
+        frame[SESSION_ID_LEN] = AUTH_HELLO_FRAME_TYPE;
+        // token_len = 0
+        frame[SESSION_ID_LEN + 1] = 0;
+        frame[SESSION_ID_LEN + 2] = 0;
+        let result = parse_auth_hello_token(&frame, frame.len());
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_parse_auth_hello_token_len_exceeds_max() {
+        let token_len = (MAX_AUTH_TOKEN_LEN + 1) as u16;
+        let mut frame = vec![0u8; SESSION_ID_LEN + 3 + MAX_AUTH_TOKEN_LEN + 1];
+        frame[SESSION_ID_LEN] = AUTH_HELLO_FRAME_TYPE;
+        frame[SESSION_ID_LEN + 1] = (token_len >> 8) as u8;
+        frame[SESSION_ID_LEN + 2] = (token_len & 0xFF) as u8;
+        let result = parse_auth_hello_token(&frame, frame.len());
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_parse_auth_hello_payload_end_exceeds_frame_len() {
+        let token = "abc";
+        // Declare token_len as 10 but only provide 3 bytes
+        let mut frame = vec![0u8; SESSION_ID_LEN + 3 + token.len()];
+        frame[SESSION_ID_LEN] = AUTH_HELLO_FRAME_TYPE;
+        frame[SESSION_ID_LEN + 1] = 0;
+        frame[SESSION_ID_LEN + 2] = 10; // says 10 but frame only has 3 token bytes
+        frame[SESSION_ID_LEN + 3..].copy_from_slice(token.as_bytes());
+        let result = parse_auth_hello_token(&frame, frame.len());
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_parse_auth_hello_extra_trailing_bytes() {
+        let token = "abc";
+        // payload_end != len because we add extra trailing bytes
+        let mut frame = vec![0u8; SESSION_ID_LEN + 3 + token.len() + 5];
+        frame[SESSION_ID_LEN] = AUTH_HELLO_FRAME_TYPE;
+        frame[SESSION_ID_LEN + 1] = 0;
+        frame[SESSION_ID_LEN + 2] = token.len() as u8;
+        frame[SESSION_ID_LEN + 3..SESSION_ID_LEN + 3 + token.len()]
+            .copy_from_slice(token.as_bytes());
+        let result = parse_auth_hello_token(&frame, frame.len());
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    #[test]
+    fn test_parse_auth_hello_invalid_utf8() {
+        let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let token_len = invalid_bytes.len() as u16;
+        let mut frame = vec![0u8; SESSION_ID_LEN + 3 + invalid_bytes.len()];
+        frame[SESSION_ID_LEN] = AUTH_HELLO_FRAME_TYPE;
+        frame[SESSION_ID_LEN + 1] = (token_len >> 8) as u8;
+        frame[SESSION_ID_LEN + 2] = (token_len & 0xFF) as u8;
+        frame[SESSION_ID_LEN + 3..].copy_from_slice(invalid_bytes);
+        let result = parse_auth_hello_token(&frame, frame.len());
+        assert!(matches!(result, Err(RelayAuthVerifyError::BadFormat)));
+    }
+
+    // ---- is_transient_recv_error tests ----
+
+    #[test]
+    fn test_transient_recv_would_block() {
+        let e = std::io::Error::new(ErrorKind::WouldBlock, "would block");
+        assert!(is_transient_recv_error(&e));
+    }
+
+    #[test]
+    fn test_transient_recv_timed_out() {
+        let e = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        assert!(is_transient_recv_error(&e));
+    }
+
+    #[test]
+    fn test_transient_recv_interrupted() {
+        let e = std::io::Error::new(ErrorKind::Interrupted, "interrupted");
+        assert!(is_transient_recv_error(&e));
+    }
+
+    #[test]
+    fn test_transient_recv_connection_reset() {
+        let e = std::io::Error::new(ErrorKind::ConnectionReset, "connection reset");
+        assert!(is_transient_recv_error(&e));
+    }
+
+    #[test]
+    fn test_transient_recv_permission_denied_not_transient() {
+        let e = std::io::Error::new(ErrorKind::PermissionDenied, "permission denied");
+        assert!(!is_transient_recv_error(&e));
+    }
+
+    #[test]
+    fn test_transient_recv_other_not_transient() {
+        let e = std::io::Error::new(ErrorKind::Other, "other");
+        assert!(!is_transient_recv_error(&e));
+    }
+
+    // ---- is_transient_send_error tests ----
+
+    #[test]
+    fn test_transient_send_would_block() {
+        let e = std::io::Error::new(ErrorKind::WouldBlock, "would block");
+        assert!(is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn test_transient_send_timed_out() {
+        let e = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        assert!(is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn test_transient_send_interrupted() {
+        let e = std::io::Error::new(ErrorKind::Interrupted, "interrupted");
+        assert!(is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn test_transient_send_connection_reset_not_transient() {
+        let e = std::io::Error::new(ErrorKind::ConnectionReset, "connection reset");
+        assert!(!is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn test_transient_send_other_not_transient() {
+        let e = std::io::Error::new(ErrorKind::Other, "other");
+        assert!(!is_transient_send_error(&e));
+    }
+
+    // ---- find_http_header_end tests ----
+
+    #[test]
+    fn test_find_http_header_end_found() {
+        let buf = b"GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(find_http_header_end(buf), Some(18));
+    }
+
+    #[test]
+    fn test_find_http_header_end_not_found() {
+        let buf = b"GET / HTTP/1.1\r\n";
+        assert_eq!(find_http_header_end(buf), None);
+    }
+
+    #[test]
+    fn test_find_http_header_end_empty() {
+        let buf: &[u8] = b"";
+        assert_eq!(find_http_header_end(buf), None);
+    }
+
+    #[test]
+    fn test_find_http_header_end_partial_crlf() {
+        let buf = b"GET /\r\n";
+        assert_eq!(find_http_header_end(buf), None);
+    }
+
+    // ---- escape_json tests ----
+
+    #[test]
+    fn test_escape_json_quote() {
+        assert_eq!(escape_json("he\"llo"), "he\\\"llo");
+    }
+
+    #[test]
+    fn test_escape_json_backslash() {
+        assert_eq!(escape_json("he\\llo"), "he\\\\llo");
+    }
+
+    #[test]
+    fn test_escape_json_newline() {
+        assert_eq!(escape_json("he\nllo"), "he\\nllo");
+    }
+
+    #[test]
+    fn test_escape_json_return() {
+        assert_eq!(escape_json("he\rllo"), "he\\rllo");
+    }
+
+    #[test]
+    fn test_escape_json_tab() {
+        assert_eq!(escape_json("he\tllo"), "he\\tllo");
+    }
+
+    #[test]
+    fn test_escape_json_normal_text() {
+        assert_eq!(escape_json("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_escape_json_empty() {
+        assert_eq!(escape_json(""), "");
+    }
+
+    // ---- derive_user_id tests ----
+
+    #[test]
+    fn test_derive_user_id_known_input() {
+        let session_id = [0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(derive_user_id(session_id), "session-0000000000000001");
+    }
+
+    #[test]
+    fn test_derive_user_id_all_zeros() {
+        let session_id = [0u8; SESSION_ID_LEN];
+        assert_eq!(derive_user_id(session_id), "session-0000000000000000");
+    }
+}
+
+#[cfg(test)]
+mod packet_construction_tests {
+    use super::*;
+
+    // ---- parse_ip_packet_full additional cases ----
+
+    #[test]
+    fn test_parse_ip_too_short() {
+        let packet = vec![0u8; 19]; // < 20 bytes
+        assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_wrong_version_v6() {
+        let mut packet = vec![0u8; 32];
+        // Version 6, IHL 5
+        packet[0] = 0x65;
+        packet[9] = 17;
+        assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_ihl_less_than_5() {
+        let mut packet = vec![0u8; 32];
+        // Version 4, IHL 4 (malformed: < minimum 5)
+        packet[0] = 0x44;
+        packet[9] = 17;
+        assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_ihl_with_options() {
+        // IHL=6 means 24-byte IP header (with 4 bytes of IP options)
+        // Need at least 24 (IP) + 8 (UDP) = 32 bytes
+        let mut packet = vec![0u8; 40];
+        // Version 4, IHL 6
+        packet[0] = 0x46;
+        packet[9] = 17; // UDP
+                        // Source IP
+        packet[12] = 192;
+        packet[13] = 168;
+        packet[14] = 1;
+        packet[15] = 1;
+        // Dest IP
+        packet[16] = 10;
+        packet[17] = 0;
+        packet[18] = 0;
+        packet[19] = 1;
+        // UDP header starts at byte 24 (IHL=6, 6*4=24)
+        // Source port = 5000
+        packet[24] = 0x13;
+        packet[25] = 0x88;
+        // Dest port = 6000
+        packet[26] = 0x17;
+        packet[27] = 0x70;
+        // Payload at byte 32
+        packet[32..40].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let result = parse_ip_packet_full(&packet);
+        assert!(result.is_some());
+        match result.unwrap() {
+            ParsedPacket::Udp {
+                game_addr: addr,
+                payload,
+                original_info: info,
+            } => {
+                assert_eq!(addr.ip().to_string(), "10.0.0.1");
+                assert_eq!(addr.port(), 6000);
+                assert_eq!(info.src_ip.to_string(), "192.168.1.1");
+                assert_eq!(info.src_port, 5000);
+                assert_eq!(payload, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            }
+            _ => panic!("Expected ParsedPacket::Udp"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_tcp_too_short_rejected() {
+        // 28 bytes total: 20 IP + 8 remaining, not enough for TCP min header (20)
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 6; // TCP
+        assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_tcp_valid() {
+        // 44 bytes = 20 IP + 20 TCP header + 4 payload
+        let mut packet = vec![0u8; 44];
+        packet[0] = 0x45;
+        packet[9] = 6; // TCP
+        packet[12] = 10;
+        packet[13] = 0;
+        packet[14] = 0;
+        packet[15] = 5;
+        packet[16] = 1;
+        packet[17] = 2;
+        packet[18] = 3;
+        packet[19] = 4;
+        // TCP src port = 54321 (0xD431)
+        packet[20] = 0xD4;
+        packet[21] = 0x31;
+        // TCP dst port = 80 (0x0050)
+        packet[22] = 0x00;
+        packet[23] = 0x50;
+        // Data offset = 5 (20 bytes) in upper nibble of byte 32
+        packet[32] = 0x50;
+
+        let result = parse_ip_packet_full(&packet);
+        assert!(result.is_some());
+        match result.unwrap() {
+            ParsedPacket::Tcp {
+                original_info: info,
+                raw_ip_packet,
+            } => {
+                assert_eq!(info.src_ip.to_string(), "10.0.0.5");
+                assert_eq!(info.src_port, 54321);
+                assert_eq!(info.dst_ip.to_string(), "1.2.3.4");
+                assert_eq!(info.dst_port, 80);
+                assert_eq!(raw_ip_packet.len(), 44);
+            }
+            _ => panic!("Expected ParsedPacket::Tcp"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_icmp_rejected() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 1; // ICMP
+        assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_too_short_for_udp_header() {
+        // Exactly 20 bytes = IP header only, no room for UDP header
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        assert!(parse_ip_packet_full(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_zero_length_udp_payload() {
+        // Exactly 28 bytes = 20 (IP) + 8 (UDP header), no payload
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[12] = 10;
+        packet[13] = 0;
+        packet[14] = 0;
+        packet[15] = 5;
+        packet[16] = 1;
+        packet[17] = 2;
+        packet[18] = 3;
+        packet[19] = 4;
+        packet[20] = 0x13;
+        packet[21] = 0x88; // src port 5000
+        packet[22] = 0x17;
+        packet[23] = 0x70; // dst port 6000
+
+        let result = parse_ip_packet_full(&packet);
+        assert!(result.is_some());
+        match result.unwrap() {
+            ParsedPacket::Udp {
+                game_addr: addr,
+                payload,
+                original_info: info,
+            } => {
+                assert_eq!(addr.port(), 6000);
+                assert!(payload.is_empty());
+                assert_eq!(info.src_port, 5000);
+                assert_eq!(info.dst_port, 6000);
+            }
+            _ => panic!("Expected ParsedPacket::Udp"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_full_payload_verification() {
+        let mut packet = vec![0u8; 36];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[12] = 172;
+        packet[13] = 16;
+        packet[14] = 0;
+        packet[15] = 1; // src 172.16.0.1
+        packet[16] = 8;
+        packet[17] = 8;
+        packet[18] = 8;
+        packet[19] = 8; // dst 8.8.8.8
+        packet[20] = 0x00;
+        packet[21] = 0x35; // src port 53
+        packet[22] = 0x1F;
+        packet[23] = 0x90; // dst port 8080
+                           // Payload bytes at 28..36
+        packet[28..36].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0x00, 0x42]);
+
+        let result = parse_ip_packet_full(&packet);
+        assert!(result.is_some());
+        match result.unwrap() {
+            ParsedPacket::Udp {
+                game_addr: addr,
+                payload,
+                original_info: info,
+            } => {
+                assert_eq!(addr.ip().to_string(), "8.8.8.8");
+                assert_eq!(addr.port(), 8080);
+                assert_eq!(info.src_ip.to_string(), "172.16.0.1");
+                assert_eq!(info.src_port, 53);
+                assert_eq!(info.dst_ip.to_string(), "8.8.8.8");
+                assert_eq!(info.dst_port, 8080);
+                assert_eq!(payload, &[0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0x00, 0x42]);
+            }
+            _ => panic!("Expected ParsedPacket::Udp"),
+        }
+    }
+
+    // ---- build_response_ip_packet additional cases ----
+
+    #[test]
+    fn test_build_response_zero_length_payload() {
+        let original = OriginalPacketInfo {
+            src_ip: "10.0.0.1".parse().unwrap(),
+            src_port: 1234,
+            dst_ip: "1.2.3.4".parse().unwrap(),
+            dst_port: 5678,
+        };
+        let packet = build_response_ip_packet(&[], original);
+        // IP (20) + UDP (8) + payload (0) = 28
+        assert_eq!(packet.len(), 28);
+        // Verify IP version
+        assert_eq!((packet[0] >> 4) & 0x0F, 4);
+        // Verify protocol UDP
+        assert_eq!(packet[9], 17);
+    }
+
+    #[test]
+    fn test_build_response_normal_payload_field_check() {
+        let payload = &[0xAA, 0xBB, 0xCC];
+        let original = OriginalPacketInfo {
+            src_ip: "192.168.1.100".parse().unwrap(),
+            src_port: 40000,
+            dst_ip: "93.184.216.34".parse().unwrap(),
+            dst_port: 443,
+        };
+        let packet = build_response_ip_packet(payload, original);
+
+        // Total length = 20 + 8 + 3 = 31
+        assert_eq!(packet.len(), 31);
+        let total_len_field = u16::from_be_bytes([packet[2], packet[3]]);
+        assert_eq!(total_len_field, 31);
+
+        // Source IP = original dst (game server)
+        assert_eq!(&packet[12..16], &[93, 184, 216, 34]);
+        // Dest IP = original src (client)
+        assert_eq!(&packet[16..20], &[192, 168, 1, 100]);
+
+        // Source port = original dst_port (443)
+        let src_port = u16::from_be_bytes([packet[20], packet[21]]);
+        assert_eq!(src_port, 443);
+        // Dest port = original src_port (40000)
+        let dst_port = u16::from_be_bytes([packet[22], packet[23]]);
+        assert_eq!(dst_port, 40000);
+
+        // UDP length field
+        let udp_len_field = u16::from_be_bytes([packet[24], packet[25]]);
+        assert_eq!(udp_len_field, 11); // 8 + 3
+
+        // Payload
+        assert_eq!(&packet[28..31], payload);
+    }
+
+    #[test]
+    fn test_build_response_ip_checksum_validity() {
+        let original = OriginalPacketInfo {
+            src_ip: "10.0.0.5".parse().unwrap(),
+            src_port: 54321,
+            dst_ip: "1.2.3.4".parse().unwrap(),
+            dst_port: 12345,
+        };
+        let packet = build_response_ip_packet(&[0x01, 0x02], original);
+
+        // Compute checksum over the IP header (which already includes the checksum).
+        // If the checksum was computed correctly, summing the full header should yield 0xFFFF
+        // (or equivalently the ones-complement sum is 0).
+        let mut sum: u32 = 0;
+        for i in (0..20).step_by(2) {
+            let word = ((packet[i] as u32) << 8) | (packet[i + 1] as u32);
+            sum = sum.wrapping_add(word);
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        // After folding, ones-complement sum should be 0xFFFF
+        assert_eq!(sum as u16, 0xFFFF);
+    }
+
+    #[test]
+    fn test_build_response_address_port_swapping() {
+        let original = OriginalPacketInfo {
+            src_ip: "10.0.0.5".parse().unwrap(),
+            src_port: 11111,
+            dst_ip: "20.30.40.50".parse().unwrap(),
+            dst_port: 22222,
+        };
+        let packet = build_response_ip_packet(&[0xFF], original);
+
+        // In response, source = original dst, dest = original src
+        assert_eq!(
+            std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]).to_string(),
+            "20.30.40.50"
+        );
+        assert_eq!(
+            std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]).to_string(),
+            "10.0.0.5"
+        );
+        assert_eq!(u16::from_be_bytes([packet[20], packet[21]]), 22222); // game port becomes src
+        assert_eq!(u16::from_be_bytes([packet[22], packet[23]]), 11111); // client port becomes dst
+    }
+
+    // ---- calculate_ip_checksum tests ----
+
+    #[test]
+    fn test_ip_checksum_all_zeros() {
+        let header = [0u8; 20];
+        let checksum = calculate_ip_checksum(&header);
+        // Ones complement of 0 is 0xFFFF
+        assert_eq!(checksum, 0xFFFF);
+    }
+
+    #[test]
+    fn test_ip_checksum_odd_length_header() {
+        // Odd-length slice (unusual but the function should handle it)
+        let header = [0x45, 0x00, 0x00, 0x1C, 0x00]; // 5 bytes
+        let checksum = calculate_ip_checksum(&header);
+        // Just verify it doesn't panic and produces a value
+        assert_ne!(checksum, 0); // non-trivial input should produce non-zero complement
+    }
+
+    #[test]
+    fn test_ip_checksum_self_check() {
+        // Build a valid IP header, compute checksum, insert it, then verify
+        let mut header = [
+            0x45, 0x00, 0x00, 0x1C, // version/IHL, DSCP/ECN, total length
+            0x00, 0x00, 0x40, 0x00, // ID, flags+fragment
+            0x40, 0x11, 0x00, 0x00, // TTL, protocol(UDP), checksum(placeholder)
+            0xC0, 0xA8, 0x01, 0x01, // src IP 192.168.1.1
+            0x0A, 0x00, 0x00, 0x01, // dst IP 10.0.0.1
+        ];
+        let checksum = calculate_ip_checksum(&header);
+        header[10] = (checksum >> 8) as u8;
+        header[11] = (checksum & 0xFF) as u8;
+
+        // Recompute over the full header including checksum
+        let verify = calculate_ip_checksum(&header);
+        // Should be 0 (or 0xFFFF depending on convention; RFC 1071 says
+        // the ones-complement sum of the header including checksum = 0)
+        // In our implementation !sum means the result is 0x0000 when header is valid
+        assert!(
+            verify == 0x0000 || verify == 0xFFFF,
+            "Self-check should yield 0x0000 or 0xFFFF, got {:#06x}",
+            verify
+        );
+    }
+
+    #[test]
+    fn test_ip_checksum_known_vector() {
+        // Use the same test vector from the existing tests
+        let header = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
+        let checksum = calculate_ip_checksum(&header);
+        assert_ne!(checksum, 0);
+        // Verify the self-check: insert checksum and recompute
+        let mut full_header = header;
+        full_header[10] = (checksum >> 8) as u8;
+        full_header[11] = (checksum & 0xFF) as u8;
+        let verify = calculate_ip_checksum(&full_header);
+        assert!(
+            verify == 0x0000 || verify == 0xFFFF,
+            "Self-check should yield 0x0000 or 0xFFFF, got {:#06x}",
+            verify
+        );
+    }
+
+    // ---- Roundtrip test ----
+
+    #[test]
+    fn test_roundtrip_build_then_parse() {
+        let original = OriginalPacketInfo {
+            src_ip: "10.0.0.5".parse().unwrap(),
+            src_port: 54321,
+            dst_ip: "1.2.3.4".parse().unwrap(),
+            dst_port: 12345,
+        };
+        let payload = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let response_packet = build_response_ip_packet(payload, original);
+
+        // Parse the built packet
+        let parsed = parse_ip_packet_full(&response_packet);
+        assert!(parsed.is_some());
+        match parsed.unwrap() {
+            ParsedPacket::Udp {
+                game_addr: addr,
+                payload: parsed_payload,
+                original_info: info,
+            } => {
+                // In the response, src/dst are swapped from original
+                // Source IP = original.dst_ip (game server)
+                assert_eq!(info.src_ip.to_string(), "1.2.3.4");
+                assert_eq!(info.src_port, 12345);
+                // Dest IP = original.src_ip (client)
+                assert_eq!(info.dst_ip.to_string(), "10.0.0.5");
+                assert_eq!(info.dst_port, 54321);
+                // SocketAddr should point to the packet's dest (the client)
+                assert_eq!(addr.ip().to_string(), "10.0.0.5");
+                assert_eq!(addr.port(), 54321);
+                // Payload should survive roundtrip
+                assert_eq!(parsed_payload, payload);
+            }
+            _ => panic!("Expected ParsedPacket::Udp"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_stats_http_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn make_stats_context() -> Arc<StatsApiContext> {
+        Arc::new(StatsApiContext {
+            sessions: Arc::new(DashMap::new()),
+            session_traffic: Arc::new(DashMap::new()),
+            stats: Arc::new(Stats::new()),
+            started_at: Instant::now(),
+        })
+    }
+
+    fn make_stats_context_with_sessions(
+        entries: Vec<(
+            [u8; SESSION_ID_LEN],
+            SessionEntry,
+            Option<Arc<SessionTraffic>>,
+        )>,
+    ) -> Arc<StatsApiContext> {
+        let sessions = Arc::new(DashMap::new());
+        let session_traffic = Arc::new(DashMap::new());
+        for (sid, entry, traffic) in entries {
+            sessions.insert(sid, entry);
+            if let Some(t) = traffic {
+                session_traffic.insert(sid, t);
+            }
+        }
+        Arc::new(StatsApiContext {
+            sessions,
+            session_traffic,
+            stats: Arc::new(Stats::new()),
+            started_at: Instant::now(),
+        })
+    }
+
+    // ---- render_stats_payload tests ----
+
+    #[test]
+    fn test_render_stats_empty_sessions() {
+        let ctx = make_stats_context();
+        let payload = render_stats_payload(&ctx);
+        assert!(payload.contains("\"active_users\":0"));
+        assert!(payload.contains("\"active_sessions\":0"));
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["active_users"], 0);
+        assert_eq!(parsed["active_sessions"], 0);
+    }
+
+    #[test]
+    fn test_render_stats_with_sessions_dedup_users() {
+        let now_unix = unix_timestamp_secs();
+        let sid1 = [0, 0, 0, 0, 0, 0, 0, 1];
+        let sid2 = [0, 0, 0, 0, 0, 0, 0, 2];
+        let sid3 = [0, 0, 0, 0, 0, 0, 0, 3];
+
+        let ctx = make_stats_context_with_sessions(vec![
+            (
+                sid1,
+                SessionEntry {
+                    user_id: "user-aaa".to_string(),
+                    auth_state: SessionAuthState::Authenticated,
+                    client_addr: "127.0.0.1:1000".parse().unwrap(),
+                    created_at_unix: now_unix,
+                    last_activity: Instant::now(),
+                    last_activity_unix: now_unix,
+                },
+                None,
+            ),
+            (
+                sid2,
+                SessionEntry {
+                    user_id: "user-aaa".to_string(), // same user
+                    auth_state: SessionAuthState::Authenticated,
+                    client_addr: "127.0.0.1:2000".parse().unwrap(),
+                    created_at_unix: now_unix,
+                    last_activity: Instant::now(),
+                    last_activity_unix: now_unix,
+                },
+                None,
+            ),
+            (
+                sid3,
+                SessionEntry {
+                    user_id: "user-bbb".to_string(), // different user
+                    auth_state: SessionAuthState::Legacy,
+                    client_addr: "127.0.0.1:3000".parse().unwrap(),
+                    created_at_unix: now_unix,
+                    last_activity: Instant::now(),
+                    last_activity_unix: now_unix,
+                },
+                None,
+            ),
+        ]);
+
+        let payload = render_stats_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        // 2 unique users (user-aaa, user-bbb)
+        assert_eq!(parsed["active_users"], 2);
+        // 3 sessions
+        assert_eq!(parsed["active_sessions"], 3);
+    }
+
+    // ---- render_connections_payload tests ----
+
+    #[test]
+    fn test_render_connections_empty() {
+        let ctx = make_stats_context();
+        let payload = render_connections_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(parsed["connections"].is_array());
+        assert_eq!(parsed["connections"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_render_connections_single() {
+        let now_unix = unix_timestamp_secs();
+        let sid = [0, 0, 0, 0, 0, 0, 0, 42];
+        let traffic = Arc::new(SessionTraffic::new(now_unix));
+        traffic.bytes_in.store(1000, Ordering::Relaxed);
+        traffic.bytes_out.store(2000, Ordering::Relaxed);
+
+        let ctx = make_stats_context_with_sessions(vec![(
+            sid,
+            SessionEntry {
+                user_id: "test-user".to_string(),
+                auth_state: SessionAuthState::Authenticated,
+                client_addr: "1.2.3.4:5678".parse().unwrap(),
+                created_at_unix: now_unix,
+                last_activity: Instant::now(),
+                last_activity_unix: now_unix,
+            },
+            Some(traffic),
+        )]);
+
+        let payload = render_connections_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let conns = parsed["connections"].as_array().unwrap();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0]["user_id"], "test-user");
+        assert_eq!(conns[0]["auth_state"], "authenticated");
+        assert_eq!(conns[0]["bytes_in"], 1000);
+        assert_eq!(conns[0]["bytes_out"], 2000);
+        assert_eq!(conns[0]["client_endpoint"], "1.2.3.4:5678");
+    }
+
+    #[test]
+    fn test_render_connections_sorted_by_last_activity_desc() {
+        let now_unix = unix_timestamp_secs();
+        let sid1 = [0, 0, 0, 0, 0, 0, 0, 1];
+        let sid2 = [0, 0, 0, 0, 0, 0, 0, 2];
+
+        let ctx = make_stats_context_with_sessions(vec![
+            (
+                sid1,
+                SessionEntry {
+                    user_id: "older".to_string(),
+                    auth_state: SessionAuthState::Legacy,
+                    client_addr: "1.1.1.1:1000".parse().unwrap(),
+                    created_at_unix: now_unix - 100,
+                    last_activity: Instant::now(),
+                    last_activity_unix: now_unix - 100,
+                },
+                None,
+            ),
+            (
+                sid2,
+                SessionEntry {
+                    user_id: "newer".to_string(),
+                    auth_state: SessionAuthState::Legacy,
+                    client_addr: "2.2.2.2:2000".parse().unwrap(),
+                    created_at_unix: now_unix,
+                    last_activity: Instant::now(),
+                    last_activity_unix: now_unix,
+                },
+                None,
+            ),
+        ]);
+
+        let payload = render_connections_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let conns = parsed["connections"].as_array().unwrap();
+        assert_eq!(conns.len(), 2);
+        // "newer" should come first (sorted by last_activity desc)
+        assert_eq!(conns[0]["user_id"], "newer");
+        assert_eq!(conns[1]["user_id"], "older");
+    }
+
+    #[test]
+    fn test_render_connections_json_escaping() {
+        let now_unix = unix_timestamp_secs();
+        let sid = [0, 0, 0, 0, 0, 0, 0, 1];
+
+        let ctx = make_stats_context_with_sessions(vec![(
+            sid,
+            SessionEntry {
+                user_id: "user\"with\\special\nchars".to_string(),
+                auth_state: SessionAuthState::Legacy,
+                client_addr: "1.1.1.1:1000".parse().unwrap(),
+                created_at_unix: now_unix,
+                last_activity: Instant::now(),
+                last_activity_unix: now_unix,
+            },
+            None,
+        )]);
+
+        let payload = render_connections_payload(&ctx);
+        // The raw JSON string should have escaped characters
+        assert!(payload.contains("user\\\"with\\\\special\\nchars"));
+        // And it should be parseable as valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let conns = parsed["connections"].as_array().unwrap();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(
+            conns[0]["user_id"].as_str().unwrap(),
+            "user\"with\\special\nchars"
+        );
+    }
+
+    // ---- handle_stats_http_client tests ----
+
+    async fn send_http_request(
+        token: &str,
+        context: Arc<StatsApiContext>,
+        request: &str,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_owned = request.to_string();
+        let token_owned = token.to_string();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request_owned.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _ = handle_stats_http_client(server_stream, &token_owned, context).await;
+        client_task.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_http_get_stats_with_correct_token() {
+        let ctx = make_stats_context();
+        let response = send_http_request(
+            "test-token",
+            ctx,
+            "GET /v1/stats HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("active_users"));
+        assert!(response.contains("active_sessions"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_connections_with_correct_token() {
+        let ctx = make_stats_context();
+        let response = send_http_request(
+            "test-token",
+            ctx,
+            "GET /v1/connections HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("connections"));
+    }
+
+    #[tokio::test]
+    async fn test_http_no_auth_header() {
+        let ctx = make_stats_context();
+        let response = send_http_request("test-token", ctx, "GET /v1/stats HTTP/1.1\r\n\r\n").await;
+        assert!(response.contains("HTTP/1.1 401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_http_wrong_token() {
+        let ctx = make_stats_context();
+        let response = send_http_request(
+            "test-token",
+            ctx,
+            "GET /v1/stats HTTP/1.1\r\nAuthorization: Bearer wrong-token\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("HTTP/1.1 401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_http_post_method_not_allowed() {
+        let ctx = make_stats_context();
+        let response = send_http_request(
+            "test-token",
+            ctx,
+            "POST /v1/stats HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("HTTP/1.1 405 Method Not Allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_http_unknown_path() {
+        let ctx = make_stats_context();
+        let response = send_http_request(
+            "test-token",
+            ctx,
+            "GET /v1/unknown HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n",
+        )
+        .await;
+        assert!(response.contains("HTTP/1.1 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn test_http_empty_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ctx = make_stats_context();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Send nothing, just close
+            stream.shutdown().await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _ = handle_stats_http_client(server_stream, "test-token", ctx).await;
+        let response = client_task.await.unwrap();
+        // Empty request should result in connection close with no response or a 400
+        // Based on the code, total_read == 0 returns Ok(()) with no response written
+        assert!(response.is_empty() || response.contains("400"));
+    }
+
+    #[tokio::test]
+    async fn test_http_oversized_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ctx = make_stats_context();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Send a request larger than MAX_HTTP_REQUEST_SIZE (8192)
+            // Use a huge header to exceed the limit.
+            let mut request = String::from("GET /v1/stats HTTP/1.1\r\n");
+            // Add a header that pushes us past MAX_HTTP_REQUEST_SIZE without \r\n\r\n terminator
+            request.push_str(&format!("X-Padding: {}\r\n", "A".repeat(8200)));
+            // The server may close the connection before we finish writing,
+            // so ignore write/shutdown errors.
+            let _ = stream.write_all(request.as_bytes()).await;
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            // read_to_end may also get ConnectionReset on some platforms
+            let _ = stream.read_to_end(&mut response).await;
+            String::from_utf8_lossy(&response).to_string()
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _ = handle_stats_http_client(server_stream, "test-token", ctx).await;
+        let response = client_task.await.unwrap();
+        assert!(response.contains("431"));
     }
 }

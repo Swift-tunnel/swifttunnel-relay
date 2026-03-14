@@ -1,5 +1,5 @@
 [Unit]
-Description=SwiftTunnel V3 UDP Relay Server
+Description=SwiftTunnel V3 Relay Server (UDP + TCP)
 Documentation=https://github.com/Swift-tunnel/swifttunnel-app
 After=network.target
 Wants=network-online.target
@@ -11,12 +11,17 @@ ExecStart=/usr/local/bin/swifttunnel-relay
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
+Environment=RELAY_TCP_ENABLED=false
+Environment=RELAY_TUN_UDP=false
 
 # Security hardening
 NoNewPrivileges=true
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
+DeviceAllow=/dev/net/tun rw
+# CAP_NET_ADMIN is redundant under User=root but kept for future privilege-drop migration.
+AmbientCapabilities=CAP_NET_ADMIN
 
 # Resource limits
 LimitNOFILE=65536
