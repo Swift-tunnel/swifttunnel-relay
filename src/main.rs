@@ -78,6 +78,10 @@ const MAX_AUTH_TOKEN_LEN: usize = 4096;
 const AUTH_CLOCK_SKEW_SECS: u64 = 30;
 const PING_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8;
 const PONG_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8 + 8;
+/// Client-reported RTT (optional, backward-compatible).
+const RTT_REPORT_FRAME_TYPE: u8 = 0xA5;
+/// [session_id:8][0xA5][rtt_us_be_u32] = 13 bytes
+const RTT_REPORT_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayAuthMode {
@@ -436,6 +440,10 @@ struct SessionTraffic {
     connected_at_unix: u64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    packets_in: AtomicU64,
+    packets_out: AtomicU64,
+    /// Last client-reported RTT in microseconds (via 0xA5 frame)
+    last_rtt_us: AtomicU64,
 }
 
 impl SessionTraffic {
@@ -444,6 +452,9 @@ impl SessionTraffic {
             connected_at_unix,
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
+            packets_in: AtomicU64::new(0),
+            packets_out: AtomicU64::new(0),
+            last_rtt_us: AtomicU64::new(0),
         }
     }
 }
@@ -699,6 +710,10 @@ async fn main() -> Result<()> {
                         .value()
                         .bytes_out
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    entry
+                        .value()
+                        .packets_out
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -879,6 +894,10 @@ async fn main() -> Result<()> {
             .value()
             .bytes_in
             .fetch_add(len as u64, Ordering::Relaxed);
+        session_bytes
+            .value()
+            .packets_in
+            .fetch_add(1, Ordering::Relaxed);
 
         // Auth hello control frame:
         // [session_id:8][0xA1][token_len_be_u16][token_utf8]
@@ -964,6 +983,10 @@ async fn main() -> Result<()> {
                         .value()
                         .bytes_out
                         .fetch_add(response.len() as u64, Ordering::Relaxed);
+                    entry
+                        .value()
+                        .packets_out
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -972,6 +995,20 @@ async fn main() -> Result<()> {
 
         // Ignore unexpected pong frames from clients (defensive).
         if len == PONG_FRAME_LEN && buf[SESSION_ID_LEN] == PONG_FRAME_TYPE {
+            continue;
+        }
+
+        // Client-reported RTT: [session_id:8][0xA5][rtt_us_be_u32]
+        if len == RTT_REPORT_FRAME_LEN && buf[SESSION_ID_LEN] == RTT_REPORT_FRAME_TYPE {
+            let rtt_us = u32::from_be_bytes([
+                buf[SESSION_ID_LEN + 1],
+                buf[SESSION_ID_LEN + 2],
+                buf[SESSION_ID_LEN + 3],
+                buf[SESSION_ID_LEN + 4],
+            ]);
+            if let Some(entry) = session_traffic.get(&session_id) {
+                entry.value().last_rtt_us.store(rtt_us as u64, Ordering::Relaxed);
+            }
             continue;
         }
 
@@ -1542,19 +1579,25 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
         bytes_in: u64,
         bytes_out: u64,
         client_endpoint: String,
+        packets_in: u64,
+        packets_out: u64,
+        rtt_us: u64,
     }
 
     let mut snapshots = Vec::<ConnectionSnapshot>::new();
     for entry in context.sessions.iter() {
         let session_id = *entry.key();
         let session_hex = format!("{:016x}", u64::from_be_bytes(session_id));
-        let (bytes_in, bytes_out, connected_at) = match context.session_traffic.get(&session_id) {
+        let (bytes_in, bytes_out, connected_at, packets_in, packets_out, rtt_us) = match context.session_traffic.get(&session_id) {
             Some(traffic) => (
                 traffic.bytes_in.load(Ordering::Relaxed),
                 traffic.bytes_out.load(Ordering::Relaxed),
                 traffic.connected_at_unix,
+                traffic.packets_in.load(Ordering::Relaxed),
+                traffic.packets_out.load(Ordering::Relaxed),
+                traffic.last_rtt_us.load(Ordering::Relaxed),
             ),
-            None => (0, 0, entry.created_at_unix),
+            None => (0, 0, entry.created_at_unix, 0, 0, 0),
         };
 
         snapshots.push(ConnectionSnapshot {
@@ -1566,6 +1609,9 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
             bytes_in,
             bytes_out,
             client_endpoint: entry.client_addr.to_string(),
+            packets_in,
+            packets_out,
+            rtt_us,
         });
     }
 
@@ -1580,7 +1626,7 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
             body.push(',');
         }
         body.push_str(&format!(
-            "{{\"user_id\":\"{}\",\"session_id\":\"{}\",\"auth_state\":\"{}\",\"connected_at\":{},\"last_activity_at\":{},\"bytes_in\":{},\"bytes_out\":{},\"client_endpoint\":\"{}\"}}",
+            "{{\"user_id\":\"{}\",\"session_id\":\"{}\",\"auth_state\":\"{}\",\"connected_at\":{},\"last_activity_at\":{},\"bytes_in\":{},\"bytes_out\":{},\"client_endpoint\":\"{}\",\"packets_in\":{},\"packets_out\":{},\"rtt_us\":{}}}",
             escape_json(&conn.user_id),
             escape_json(&conn.session_id),
             escape_json(&conn.auth_state),
@@ -1589,6 +1635,9 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
             conn.bytes_in,
             conn.bytes_out,
             escape_json(&conn.client_endpoint),
+            conn.packets_in,
+            conn.packets_out,
+            conn.rtt_us,
         ));
     }
     body.push_str("]}");

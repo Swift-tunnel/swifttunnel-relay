@@ -984,6 +984,10 @@ pub(super) async fn run_datapath_v2(
                     .value()
                     .bytes_in
                     .fetch_add(len as u64, Ordering::Relaxed);
+                session_bytes
+                    .value()
+                    .packets_in
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Auth hello:
                 if len >= super::SESSION_ID_LEN + 3
@@ -1110,6 +1114,22 @@ pub(super) async fn run_datapath_v2(
                 if len == super::PONG_FRAME_LEN
                     && buf[super::SESSION_ID_LEN] == super::PONG_FRAME_TYPE
                 {
+                    continue;
+                }
+
+                // Client-reported RTT: [session_id:8][0xA5][rtt_us_be_u32]
+                if len == super::RTT_REPORT_FRAME_LEN
+                    && buf[super::SESSION_ID_LEN] == super::RTT_REPORT_FRAME_TYPE
+                {
+                    let rtt_us = u32::from_be_bytes([
+                        buf[super::SESSION_ID_LEN + 1],
+                        buf[super::SESSION_ID_LEN + 2],
+                        buf[super::SESSION_ID_LEN + 3],
+                        buf[super::SESSION_ID_LEN + 4],
+                    ]);
+                    if let Some(entry) = session_traffic_rx.get(&session_id) {
+                        entry.value().last_rtt_us.store(rtt_us as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
 
@@ -1292,6 +1312,10 @@ fn send_tx_packet(
                 .value()
                 .bytes_out
                 .fetch_add(packet.len as u64, Ordering::Relaxed);
+            entry
+                .value()
+                .packets_out
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pool.release(packet.buf_idx);
