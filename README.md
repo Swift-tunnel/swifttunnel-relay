@@ -1,6 +1,6 @@
 # SwiftTunnel Relay
 
-High-performance UDP relay server for low-latency game traffic. Inspired by ExitLag/WTFast architecture.
+High-performance game traffic relay server (UDP + optional TUN offload for UDP/TCP). Inspired by ExitLag/WTFast architecture.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -23,6 +23,8 @@ Relay → Client:  [session_id:8][0xA2][status]
 Relay → Client:  [session_id:8][0xA4][seq:4][client_ts_mono_ms:8][server_rx_ts_mono_ms:8]
 ```
 
+The `Relay → Game` / `Game → Relay` lines above describe the default user-space UDP datapath. When `RELAY_TUN_UDP=true`, the client-facing framing stays the same, but the relay forwards the full inner IPv4 packet through the Linux TUN device instead of extracting bare UDP payloads.
+
 The relay:
 1. Receives packets prefixed with an 8-byte session ID
 2. Parses the IP packet to extract destination address
@@ -42,6 +44,7 @@ The relay:
 - **Bounded channels** - Backpressure prevents OOM (games handle packet loss)
 - **Soft-delete with grace period** - Late packets can revive sessions
 - **RTT/jitter ping (optional)** - ping/pong control frames for benchmarking/telemetry
+- **TUN-backed IP forwarding (optional)** - Routes TCP and, optionally, UDP packets through a Linux TUN device (`RELAY_TCP_ENABLED=true`, `RELAY_TUN_UDP=true`)
 - **Authenticated localhost telemetry API** - `/v1/stats` and `/v1/connections`
 
 ## Installation
@@ -104,6 +107,8 @@ RUST_LOG=debug ./swifttunnel-relay
 | `RELAY_FLOW_RCVBUF_BYTES` | `2097152` | `v2` per-flow socket SO_RCVBUF size |
 | `RELAY_FLOW_SNDBUF_BYTES` | `2097152` | `v2` per-flow socket SO_SNDBUF size |
 | `RELAY_FLOW_CHANNEL_CAPACITY` | `256` | `v1` only: bounded channel size per flow (clamped to 8..4096) |
+| `RELAY_TCP_ENABLED` | `false` | Enable TCP tunneling via TUN device (Linux only, requires `setup-tun.sh`) |
+| `RELAY_TUN_UDP` | `false` | Forward UDP IPv4 packets through the Linux TUN device instead of per-flow sockets (Linux only, requires `setup-tun.sh`) |
 | `RUST_LOG` | `info` | Log level (trace, debug, info, warn, error) |
 
 ### systemd Service
@@ -125,6 +130,7 @@ Environment=RELAY_STATS_TOKEN=replace-with-long-random-token
 Environment=RELAY_AUTH_MODE=optional
 Environment=RELAY_AUTH_PUBLIC_KEY_B64=replace-with-ed25519-public-key
 Environment=RELAY_SERVER_ID=us-east-nj
+Environment=RELAY_TUN_UDP=false
 Restart=always
 RestartSec=5
 
@@ -193,6 +199,61 @@ sudo systemctl start swifttunnel-relay
                 │  to clients   │
                 └───────────────┘
 ```
+
+### TUN-backed UDP offload (optional)
+
+When `RELAY_TUN_UDP=true`, the relay creates a TUN device (`swifttun0`) and forwards full UDP IPv4 packets through the Linux kernel instead of maintaining per-flow UDP sockets in user-space. The client framing stays the same (`[session_id][ip packet]`), but the relay rewrites the inner source IP to a per-session TUN IP and lets the kernel handle routing/NAT on the server side.
+
+This removes the relay's hottest user-space work:
+- per-flow socket creation and mio registration
+- UDP payload extraction
+- reconstructed response IP packet building
+- repeated checksum rebuilds on the user-space return path
+
+**Setup (run once per server):**
+```bash
+sudo ./setup-tun.sh
+```
+
+This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds the FORWARD rules needed for return traffic.
+
+**Enable:**
+```bash
+# Via systemd drop-in
+sudo mkdir -p /etc/systemd/system/v3-relay.service.d
+echo -e '[Service]\nEnvironment=RELAY_TUN_UDP=true' | sudo tee /etc/systemd/system/v3-relay.service.d/20-tun-udp.conf
+sudo systemctl daemon-reload
+sudo systemctl restart v3-relay
+```
+
+### TUN-based TCP forwarding (optional)
+
+When `RELAY_TCP_ENABLED=true`, the relay uses the same TUN device (`swifttun0`) to route TCP packets from clients through the Linux kernel's TCP stack. This allows game API calls (HTTPS) to be tunneled alongside UDP gameplay traffic when needed.
+
+**Setup (run once per server):**
+```bash
+sudo ./setup-tun.sh
+```
+
+This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping.
+
+**Enable:**
+```bash
+# Via systemd drop-in
+sudo mkdir -p /etc/systemd/system/v3-relay.service.d
+echo -e '[Service]\nEnvironment=RELAY_TCP_ENABLED=true' | sudo tee /etc/systemd/system/v3-relay.service.d/20-tcp.conf
+sudo systemctl daemon-reload
+sudo systemctl restart v3-relay
+```
+
+**How it works:**
+1. Client sends `[session_id:8][TCP IPv4 packet]` (same framing as UDP)
+2. Relay assigns each session a unique IP in `10.200.0.0/16`
+3. Rewrites source IP and writes raw packet to TUN device
+4. Linux kernel handles TCP handshake, retransmission, etc.
+5. Response packets read from TUN, source IP restored, sent back to client
+
+**Requirements:** Linux, `/dev/net/tun`, `CAP_NET_ADMIN`
 
 ## Client Implementation
 
