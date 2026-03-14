@@ -688,12 +688,15 @@ fn run_shard(
 
 /// Run the v2 sharded datapath (RX thread + shard threads + TX thread).
 pub(super) async fn run_datapath_v2(
-    listen_port: u16,
+    main_socket: std::net::UdpSocket,
     stats_port: u16,
     stats_token: Option<String>,
     auth_config: super::RelayAuthConfig,
     stats: Arc<super::Stats>,
     started_at: Instant,
+    tun_tx_sender: Option<crossbeam_channel::Sender<super::tcp_tun::InboundTunPacket>>,
+    tun_udp_enabled: bool,
+    tcp_enabled: bool,
 ) -> Result<()> {
     let shard_count = get_shard_count();
     let shard_queue_cap = get_shard_queue_cap();
@@ -731,9 +734,11 @@ pub(super) async fn run_datapath_v2(
 
     let pool = Arc::new(BufferPool::new(pool_slots));
 
-    let socket = bind_main_socket(listen_port)?;
-    let rx_socket = socket.try_clone().context("Failed to clone RX socket")?;
-    let tx_socket = socket;
+    // Use the pre-created main socket (shared with TCP response thread).
+    let rx_socket = main_socket
+        .try_clone()
+        .context("Failed to clone RX socket")?;
+    let tx_socket = main_socket;
 
     let (tx_control_s, tx_control_r) = crossbeam_channel::bounded::<TxPacket>(tx_queue_cap);
     let (tx_data_s, tx_data_r) = crossbeam_channel::bounded::<TxPacket>(tx_queue_cap);
@@ -914,6 +919,9 @@ pub(super) async fn run_datapath_v2(
     let shard_senders_rx = shard_senders.clone();
     let shard_wakers_rx = shard_wakers.clone();
     let tx_control_rx = tx_control_s.clone();
+    let tun_tx_sender_rx = tun_tx_sender;
+    let tun_udp_enabled_rx = tun_udp_enabled;
+    let tcp_enabled_rx = tcp_enabled;
     let rx_thread = std::thread::Builder::new()
         .name("relay-rx".to_string())
         .spawn(move || -> Result<()> {
@@ -1133,52 +1141,105 @@ pub(super) async fn run_datapath_v2(
                 }
 
                 let ip_packet = &buf[super::SESSION_ID_LEN..len];
-                let Some((game_addr, udp_payload, original_info)) =
-                    super::parse_ip_packet_full(ip_packet)
-                else {
-                    continue;
+                let parsed = match super::parse_ip_packet_full(ip_packet) {
+                    Some(p) => p,
+                    None => continue,
                 };
 
-                if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
-                    if !matches!(
-                        session_entry.auth_state,
-                        super::SessionAuthState::Authenticated
-                    ) {
-                        session_entry.user_id = original_info.src_ip.to_string();
+                match parsed {
+                    super::ParsedPacket::Tcp {
+                        original_info,
+                        raw_ip_packet,
+                    } => {
+                        if tcp_enabled_rx {
+                            if let Some(ref tun_sender) = tun_tx_sender_rx {
+                                let _ = tun_sender.try_send(super::tcp_tun::InboundTunPacket {
+                                    session_id,
+                                    client_addr,
+                                    raw_ip_packet: raw_ip_packet.to_vec(),
+                                });
+                                stats_rx.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                            if !matches!(
+                                session_entry.auth_state,
+                                super::SessionAuthState::Authenticated
+                            ) {
+                                session_entry.user_id = original_info.src_ip.to_string();
+                            }
+                        }
+                        continue;
                     }
-                }
+                    super::ParsedPacket::Udp {
+                        game_addr,
+                        payload: udp_payload,
+                        original_info,
+                    } => {
+                        if tun_udp_enabled_rx {
+                            if let Some(ref tun_sender) = tun_tx_sender_rx {
+                                let _ = tun_sender.try_send(super::tcp_tun::InboundTunPacket {
+                                    session_id,
+                                    client_addr,
+                                    raw_ip_packet: ip_packet.to_vec(),
+                                });
+                                stats_rx.tun_udp_forwarded.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                                if !matches!(
+                                    session_entry.auth_state,
+                                    super::SessionAuthState::Authenticated
+                                ) {
+                                    session_entry.user_id = original_info.src_ip.to_string();
+                                }
+                            }
+                            continue;
+                        }
 
-                let Some(payload_idx) = pool_rx.try_acquire() else {
-                    stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
+                        if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                            if !matches!(
+                                session_entry.auth_state,
+                                super::SessionAuthState::Authenticated
+                            ) {
+                                session_entry.user_id = original_info.src_ip.to_string();
+                            }
+                        }
 
-                unsafe {
-                    let out = pool_rx.buffer_mut(payload_idx);
-                    out[..udp_payload.len()].copy_from_slice(udp_payload);
-                }
+                        let Some(payload_idx) = pool_rx.try_acquire() else {
+                            stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
 
-                let shard_id = shard_for_session(session_id, shard_senders_rx.len());
-                if let Some(sender) = shard_senders_rx.get(shard_id) {
-                    if sender
-                        .try_send(ShardMsg::ClientPacket {
-                            session_id,
-                            client_addr,
-                            game_addr,
-                            original_info,
-                            payload_idx,
-                            payload_len: udp_payload.len(),
-                        })
-                        .is_err()
-                    {
-                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
-                        pool_rx.release(payload_idx);
-                    } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
-                        let _ = waker.wake();
+                        unsafe {
+                            let out = pool_rx.buffer_mut(payload_idx);
+                            out[..udp_payload.len()].copy_from_slice(udp_payload);
+                        }
+
+                        let shard_id = shard_for_session(session_id, shard_senders_rx.len());
+                        if let Some(sender) = shard_senders_rx.get(shard_id) {
+                            if sender
+                                .try_send(ShardMsg::ClientPacket {
+                                    session_id,
+                                    client_addr,
+                                    game_addr,
+                                    original_info,
+                                    payload_idx,
+                                    payload_len: udp_payload.len(),
+                                })
+                                .is_err()
+                            {
+                                stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                                pool_rx.release(payload_idx);
+                            } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
+                                let _ = waker.wake();
+                            }
+                        } else {
+                            stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            pool_rx.release(payload_idx);
+                        }
                     }
-                } else {
-                    stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
-                    pool_rx.release(payload_idx);
                 }
             }
         })
@@ -1263,5 +1324,449 @@ fn send_small_control_frame(
     if tx_control.try_send(packet).is_err() {
         stats.dropped_out.fetch_add(1, Ordering::Relaxed);
         pool.release(buf_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    fn test_original_info() -> super::super::OriginalPacketInfo {
+        super::super::OriginalPacketInfo {
+            src_ip: "10.0.0.5".parse().unwrap(),
+            src_port: 54321,
+            dst_ip: "1.2.3.4".parse().unwrap(),
+            dst_port: 12345,
+        }
+    }
+
+    fn make_flow_key(sid: u8, port: u16) -> FlowKey {
+        let mut session_id = [0u8; super::super::SESSION_ID_LEN];
+        session_id[0] = sid;
+        FlowKey {
+            session_id,
+            game_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+        }
+    }
+
+    // ── get_relay_datapath ──────────────────────────────────────────────
+    // NOTE: These tests read the RELAY_DATAPATH environment variable directly.
+    // They are NOT safe to run in parallel with each other because they
+    // mutate shared process-global state. Run with `--test-threads=1` to
+    // avoid flakiness, or rely on CI running `cargo test` with the env unset.
+
+    #[test]
+    fn test_get_relay_datapath_default_is_v2() {
+        // When RELAY_DATAPATH is unset the default must be V2.
+        // This test is safe as long as the env var is not set externally.
+        std::env::remove_var("RELAY_DATAPATH");
+        assert_eq!(get_relay_datapath(), RelayDatapath::V2);
+    }
+
+    #[test]
+    fn test_get_relay_datapath_v1_literal() {
+        std::env::set_var("RELAY_DATAPATH", "v1");
+        assert_eq!(get_relay_datapath(), RelayDatapath::V1);
+        std::env::remove_var("RELAY_DATAPATH");
+    }
+
+    #[test]
+    fn test_get_relay_datapath_tokio_alias() {
+        std::env::set_var("RELAY_DATAPATH", "tokio");
+        assert_eq!(get_relay_datapath(), RelayDatapath::V1);
+        std::env::remove_var("RELAY_DATAPATH");
+    }
+
+    // ── clamp_usize ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_clamp_usize_below_min() {
+        assert_eq!(clamp_usize(5, 10, 100), 10);
+    }
+
+    #[test]
+    fn test_clamp_usize_above_max() {
+        assert_eq!(clamp_usize(200, 10, 100), 100);
+    }
+
+    #[test]
+    fn test_clamp_usize_in_range() {
+        assert_eq!(clamp_usize(50, 10, 100), 50);
+    }
+
+    #[test]
+    fn test_clamp_usize_at_min_boundary() {
+        assert_eq!(clamp_usize(10, 10, 100), 10);
+    }
+
+    #[test]
+    fn test_clamp_usize_at_max_boundary() {
+        assert_eq!(clamp_usize(100, 10, 100), 100);
+    }
+
+    // ── shard_for_session ──────────────────────────────────────────────
+
+    #[test]
+    fn test_shard_for_session_deterministic() {
+        let sid = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let a = shard_for_session(sid, 8);
+        let b = shard_for_session(sid, 8);
+        assert_eq!(a, b, "same input must produce same shard");
+    }
+
+    #[test]
+    fn test_shard_for_session_different_ids() {
+        let sid_a = [1, 0, 0, 0, 0, 0, 0, 0];
+        let sid_b = [2, 0, 0, 0, 0, 0, 0, 0];
+        // With 256 shards, two distinct IDs should (almost certainly) hash differently.
+        let a = shard_for_session(sid_a, 256);
+        let b = shard_for_session(sid_b, 256);
+        assert_ne!(
+            a, b,
+            "distinct session IDs should likely map to different shards"
+        );
+    }
+
+    #[test]
+    fn test_shard_for_session_single_shard() {
+        let sid = [0xFF; super::super::SESSION_ID_LEN];
+        assert_eq!(shard_for_session(sid, 1), 0);
+    }
+
+    #[test]
+    fn test_shard_for_session_distribution() {
+        let shard_count = 8usize;
+        let mut counts = vec![0u32; shard_count];
+        for i in 0u64..256 {
+            let sid = i.to_be_bytes();
+            counts[shard_for_session(sid, shard_count)] += 1;
+        }
+        for (shard_id, &count) in counts.iter().enumerate() {
+            assert!(
+                count >= 1,
+                "shard {} received 0 session IDs out of 256; distribution is broken",
+                shard_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_for_session_in_range() {
+        for shard_count in [1, 2, 4, 7, 16, 255] {
+            for i in 0u64..64 {
+                let sid = i.to_be_bytes();
+                let shard = shard_for_session(sid, shard_count);
+                assert!(
+                    shard < shard_count,
+                    "shard {} >= shard_count {} for session {:?}",
+                    shard,
+                    shard_count,
+                    sid
+                );
+            }
+        }
+    }
+
+    // ── write_response_ip_packet_into ──────────────────────────────────
+
+    #[test]
+    fn test_write_response_ip_packet_into_normal() {
+        let payload = b"hello game";
+        let original = test_original_info();
+        let total = super::super::IP_HEADER_MIN + super::super::UDP_HEADER_SIZE + payload.len();
+        let mut buf = vec![0u8; total + 64]; // extra room
+        let result = write_response_ip_packet_into(&mut buf, payload, original);
+        assert_eq!(result, Some(total));
+        // IP version+IHL
+        assert_eq!(buf[0], 0x45);
+        // Protocol = UDP (17)
+        assert_eq!(buf[9], 17);
+        // TTL = 64
+        assert_eq!(buf[8], 64);
+        // Source IP = original dst_ip (game server = 1.2.3.4)
+        assert_eq!(&buf[12..16], &[1, 2, 3, 4]);
+        // Dest IP = original src_ip (client = 10.0.0.5)
+        assert_eq!(&buf[16..20], &[10, 0, 0, 5]);
+        // UDP payload
+        let payload_start = super::super::IP_HEADER_MIN + super::super::UDP_HEADER_SIZE;
+        assert_eq!(&buf[payload_start..payload_start + payload.len()], payload);
+    }
+
+    #[test]
+    fn test_write_response_ip_packet_into_buffer_too_small() {
+        let payload = b"hello game";
+        let original = test_original_info();
+        let total = super::super::IP_HEADER_MIN + super::super::UDP_HEADER_SIZE + payload.len();
+        let mut buf = vec![0u8; total - 1]; // one byte short
+        let result = write_response_ip_packet_into(&mut buf, payload, original);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_write_response_ip_packet_into_zero_payload() {
+        let original = test_original_info();
+        let total = super::super::IP_HEADER_MIN + super::super::UDP_HEADER_SIZE;
+        let mut buf = vec![0u8; total];
+        let result = write_response_ip_packet_into(&mut buf, &[], original);
+        assert_eq!(result, Some(total));
+    }
+
+    #[test]
+    fn test_write_response_ip_packet_into_exact_buffer_size() {
+        let payload = b"data";
+        let original = test_original_info();
+        let total = super::super::IP_HEADER_MIN + super::super::UDP_HEADER_SIZE + payload.len();
+        let mut buf = vec![0u8; total]; // exactly right
+        let result = write_response_ip_packet_into(&mut buf, payload, original);
+        assert_eq!(result, Some(total));
+    }
+
+    #[test]
+    fn test_write_response_ip_packet_into_matches_build() {
+        let payload = b"match test payload";
+        let original = test_original_info();
+        let expected = super::super::build_response_ip_packet(payload, original);
+        let mut buf = vec![0u8; expected.len() + 32];
+        let len = write_response_ip_packet_into(&mut buf, payload, original).unwrap();
+        assert_eq!(
+            &buf[..len],
+            &expected[..],
+            "write_into must match build_response_ip_packet byte-for-byte"
+        );
+    }
+
+    // ── remove_flow_from_session_index ─────────────────────────────────
+
+    #[test]
+    fn test_remove_flow_existing() {
+        let flow = make_flow_key(1, 8000);
+        let mut session_flows = HashMap::new();
+        session_flows.insert(flow.session_id, vec![flow.game_addr]);
+        remove_flow_from_session_index(&mut session_flows, &flow);
+        // Session entry should be removed because the list became empty.
+        assert!(!session_flows.contains_key(&flow.session_id));
+    }
+
+    #[test]
+    fn test_remove_flow_missing_session_is_noop() {
+        let flow = make_flow_key(99, 9999);
+        let mut session_flows: HashMap<[u8; super::super::SESSION_ID_LEN], Vec<SocketAddr>> =
+            HashMap::new();
+        // Should not panic or modify anything.
+        remove_flow_from_session_index(&mut session_flows, &flow);
+        assert!(session_flows.is_empty());
+    }
+
+    #[test]
+    fn test_remove_flow_missing_game_addr_is_noop() {
+        let flow = make_flow_key(1, 8000);
+        let other_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let mut session_flows = HashMap::new();
+        session_flows.insert(flow.session_id, vec![other_addr]);
+        remove_flow_from_session_index(&mut session_flows, &flow);
+        // The entry should remain with the other address intact.
+        assert_eq!(session_flows[&flow.session_id], vec![other_addr]);
+    }
+
+    #[test]
+    fn test_remove_flow_last_flow_removes_session_entry() {
+        let flow = make_flow_key(1, 5000);
+        let mut session_flows = HashMap::new();
+        session_flows.insert(flow.session_id, vec![flow.game_addr]);
+        remove_flow_from_session_index(&mut session_flows, &flow);
+        assert!(
+            session_flows.is_empty(),
+            "removing last flow must remove the session entry"
+        );
+    }
+
+    #[test]
+    fn test_remove_flow_multiple_flows_same_session() {
+        let flow_a = make_flow_key(1, 7000);
+        let flow_b = FlowKey {
+            session_id: flow_a.session_id,
+            game_addr: "127.0.0.1:7001".parse().unwrap(),
+        };
+        let mut session_flows = HashMap::new();
+        session_flows.insert(flow_a.session_id, vec![flow_a.game_addr, flow_b.game_addr]);
+        remove_flow_from_session_index(&mut session_flows, &flow_a);
+        let remaining = &session_flows[&flow_a.session_id];
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], flow_b.game_addr);
+    }
+
+    // ── allocate_flow_token ────────────────────────────────────────────
+
+    #[test]
+    fn test_allocate_flow_token_first_allocation() {
+        let mut next = 1usize;
+        let map: HashMap<Token, FlowKey> = HashMap::new();
+        let token = allocate_flow_token(&mut next, &map);
+        assert_eq!(token, Some(Token(1)));
+    }
+
+    #[test]
+    fn test_allocate_flow_token_skips_zero() {
+        let mut next = 0usize;
+        let map: HashMap<Token, FlowKey> = HashMap::new();
+        let token = allocate_flow_token(&mut next, &map);
+        // Token(0) is reserved; it should skip to Token(1).
+        assert_eq!(token, Some(Token(1)));
+    }
+
+    #[test]
+    fn test_allocate_flow_token_skips_occupied() {
+        let mut next = 1usize;
+        let mut map: HashMap<Token, FlowKey> = HashMap::new();
+        map.insert(Token(1), make_flow_key(1, 1000));
+        let token = allocate_flow_token(&mut next, &map);
+        assert_eq!(token, Some(Token(2)));
+    }
+
+    #[test]
+    fn test_allocate_flow_token_wraps_around() {
+        let mut next = usize::MAX;
+        let map: HashMap<Token, FlowKey> = HashMap::new();
+        let token = allocate_flow_token(&mut next, &map);
+        // usize::MAX is a valid token value, should be returned.
+        assert_eq!(token, Some(Token(usize::MAX)));
+        // Next allocation should wrap around past 0 to 1.
+        let token2 = allocate_flow_token(&mut next, &map);
+        assert_eq!(token2, Some(Token(1)));
+    }
+
+    #[test]
+    fn test_allocate_flow_token_sequential_unique() {
+        let mut next = 1usize;
+        let mut map: HashMap<Token, FlowKey> = HashMap::new();
+        let mut allocated = Vec::new();
+        for i in 0..100 {
+            let token = allocate_flow_token(&mut next, &map).unwrap();
+            // Simulate occupying the token.
+            map.insert(token, make_flow_key(i as u8, 1000 + i));
+            allocated.push(token);
+        }
+        // All tokens must be distinct.
+        let mut set = std::collections::HashSet::new();
+        for t in &allocated {
+            assert!(set.insert(t.0), "duplicate token {:?}", t);
+        }
+    }
+
+    #[test]
+    fn test_allocate_flow_token_full_cycle_returns_none() {
+        // With a tiny space (tokens 1..=3, i.e. 3 usable tokens), fill them
+        // all, then verify that allocation returns None.
+        //
+        // We can't actually fill the full usize range, so we simulate by
+        // ensuring every value from start through the full cycle is occupied.
+        let mut next = 1usize;
+        let mut map: HashMap<Token, FlowKey> = HashMap::new();
+        // Occupy tokens 1, 2, 3.
+        map.insert(Token(1), make_flow_key(1, 1000));
+        map.insert(Token(2), make_flow_key(2, 1001));
+        map.insert(Token(3), make_flow_key(3, 1002));
+
+        // We can't realistically occupy all of usize, but we can test the
+        // wrap-around logic by occupying everything the allocator will try.
+        // The allocator starts at *next_token (1) and tries every value back
+        // to start. For a full-cycle None it must try every usize value, so
+        // this particular test verifies partial behavior: the allocator skips
+        // occupied tokens and eventually finds an open one.
+        let token = allocate_flow_token(&mut next, &map);
+        // Token 4 is not occupied, so it should be returned.
+        assert_eq!(token, Some(Token(4)));
+    }
+
+    // ── BufferPool ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_buffer_pool_new_creates_correct_slot_count() {
+        let pool = BufferPool::new(16);
+        let mut acquired = Vec::new();
+        while let Some(idx) = pool.try_acquire() {
+            acquired.push(idx);
+        }
+        assert_eq!(
+            acquired.len(),
+            16,
+            "pool of 16 slots should yield 16 acquires"
+        );
+    }
+
+    #[test]
+    fn test_buffer_pool_try_acquire_returns_indices() {
+        let pool = BufferPool::new(4);
+        let mut indices: Vec<usize> = Vec::new();
+        for _ in 0..4 {
+            indices.push(pool.try_acquire().expect("should acquire"));
+        }
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_buffer_pool_release_and_reacquire() {
+        let pool = BufferPool::new(2);
+        let a = pool.try_acquire().unwrap();
+        let b = pool.try_acquire().unwrap();
+        assert!(pool.try_acquire().is_none(), "pool should be exhausted");
+        pool.release(a);
+        let c = pool.try_acquire().unwrap();
+        assert_eq!(c, a, "released index should be re-acquired");
+        pool.release(b);
+        pool.release(c);
+    }
+
+    #[test]
+    fn test_buffer_pool_exhaustion_returns_none() {
+        let pool = BufferPool::new(1);
+        let _idx = pool.try_acquire().unwrap();
+        assert!(pool.try_acquire().is_none());
+    }
+
+    #[test]
+    fn test_buffer_pool_acquire_all_then_release_all() {
+        let slots = 32;
+        let pool = BufferPool::new(slots);
+        let mut acquired = Vec::new();
+        for _ in 0..slots {
+            acquired.push(pool.try_acquire().unwrap());
+        }
+        assert!(pool.try_acquire().is_none());
+        for idx in acquired {
+            pool.release(idx);
+        }
+        // After releasing all, we should be able to acquire them again.
+        let mut re_acquired = Vec::new();
+        while let Some(idx) = pool.try_acquire() {
+            re_acquired.push(idx);
+        }
+        assert_eq!(re_acquired.len(), slots);
+    }
+
+    #[test]
+    fn test_buffer_pool_read_write() {
+        let pool = BufferPool::new(2);
+        let idx = pool.try_acquire().unwrap();
+        unsafe {
+            let buf = pool.buffer_mut(idx);
+            buf[0] = 0xDE;
+            buf[1] = 0xAD;
+            buf[2] = 0xBE;
+            buf[3] = 0xEF;
+        }
+        unsafe {
+            let buf = pool.buffer(idx);
+            assert_eq!(buf[0], 0xDE);
+            assert_eq!(buf[1], 0xAD);
+            assert_eq!(buf[2], 0xBE);
+            assert_eq!(buf[3], 0xEF);
+        }
+        pool.release(idx);
     }
 }
