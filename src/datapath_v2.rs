@@ -244,7 +244,7 @@ fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize
 }
 
 /// Bind the relay's main UDP socket (client-facing) with tuned buffer sizes.
-fn bind_main_socket(listen_port: u16) -> Result<UdpSocket> {
+pub(super) fn bind_main_socket(listen_port: u16) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("Failed to create UDP socket")?;
     socket
@@ -695,6 +695,7 @@ pub(super) async fn run_datapath_v2(
     stats: Arc<super::Stats>,
     started_at: Instant,
     tun_tx_sender: Option<crossbeam_channel::Sender<super::tcp_tun::InboundTunPacket>>,
+    tun_session_cleanup: Option<super::tcp_tun::TunSessionCleanup>,
     tun_udp_enabled: bool,
     tcp_enabled: bool,
 ) -> Result<()> {
@@ -830,6 +831,7 @@ pub(super) async fn run_datapath_v2(
     let stats_cleanup = Arc::clone(&stats);
     let shard_senders_cleanup = shard_senders.clone();
     let shard_wakers_cleanup = shard_wakers.clone();
+    let tun_cleanup = tun_session_cleanup;
     tokio::spawn(async move {
         let mut cleanup_timer = tokio::time::interval(super::CLEANUP_INTERVAL);
         loop {
@@ -857,6 +859,10 @@ pub(super) async fn run_datapath_v2(
                 }
                 true
             });
+
+            if let Some(ref tun) = tun_cleanup {
+                tun.remove_expired(|sid| sessions_cleanup.contains_key(sid));
+            }
 
             // Update stats counters.
             stats_cleanup

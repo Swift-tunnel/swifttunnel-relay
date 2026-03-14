@@ -522,28 +522,10 @@ async fn main() -> Result<()> {
     log::info!("║     Low Latency Game Packet Forwarding     ║");
     log::info!("╚════════════════════════════════════════════╝");
 
-    // Bind the main UDP socket early so the TCP response thread can share it.
-    // This ensures TCP responses are sent from port 51821 (not an ephemeral port),
-    // which is critical for NAT traversal — clients only have a NAT mapping for
-    // relay_ip:listen_port, so responses from other ports get dropped.
-    let main_std_socket = {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-            .context("Failed to create main UDP socket")?;
-        sock.set_reuse_address(true)
-            .context("Failed to set SO_REUSEADDR")?;
-        sock.set_recv_buffer_size(4 * 1024 * 1024)
-            .context("Failed to set SO_RCVBUF")?;
-        sock.set_send_buffer_size(4 * 1024 * 1024)
-            .context("Failed to set SO_SNDBUF")?;
-        sock.set_nonblocking(false)
-            .context("Failed to set blocking mode")?;
-        let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, listen_port);
-        sock.bind(&addr.into())
-            .context(format!("Failed to bind to port {}", listen_port))?;
-        let std_sock: std::net::UdpSocket = sock.into();
-        std_sock
-    };
+    // Bind the main UDP socket early so the TUN response thread can share it.
+    // Reuse the existing datapath-v2 helper so RELAY_SOCKET_RCVBUF_BYTES /
+    // RELAY_SOCKET_SNDBUF_BYTES tuning still applies.
+    let main_std_socket = datapath_v2::bind_main_socket(listen_port)?;
     log::info!("Listening on 0.0.0.0:{}", listen_port);
 
     // TUN-backed forwarding (opt-in).
@@ -639,6 +621,7 @@ async fn main() -> Result<()> {
             stats,
             started_at,
             tun_tx_sender,
+            tun_session_cleanup,
             tun_udp_enabled,
             tcp_enabled,
         )

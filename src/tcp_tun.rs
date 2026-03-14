@@ -453,12 +453,15 @@ pub use platform::TunHandler;
 ///
 /// Primary choice: `10.200.{session_id[0]}.{session_id[1]}`.
 /// On collision, fall back to successive byte pairs (2,3), (4,5), (6,7).
-/// If all collide (astronomically unlikely with 8-byte random IDs), the last
-/// pair wins and overwrites.
+/// If all valid candidates collide (astronomically unlikely with 8-byte random
+/// IDs), the last valid pair wins and overwrites. If every pair is reserved
+/// (`0.0` or `255.255`), fall back to `10.200.0.1`.
 fn assign_session_ip(
     session_id: &[u8; 8],
     ip_to_session: &DashMap<Ipv4Addr, SessionMapping>,
 ) -> Ipv4Addr {
+    let mut fallback = None;
+
     // Byte-pair candidates: (0,1), (2,3), (4,5), (6,7).
     for pair_idx in 0..4 {
         let a = session_id[pair_idx * 2];
@@ -470,6 +473,7 @@ fn assign_session_ip(
         }
 
         let candidate = Ipv4Addr::new(10, 200, a, b);
+        fallback = Some(candidate);
 
         // O(1) collision check via the reverse map instead of scanning session_to_ip.
         let collision = ip_to_session
@@ -481,8 +485,7 @@ fn assign_session_ip(
         }
     }
 
-    // Extremely unlikely fallback: use first pair anyway (overwrites).
-    Ipv4Addr::new(10, 200, session_id[0], session_id[1])
+    fallback.unwrap_or(Ipv4Addr::new(10, 200, 0, 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +934,14 @@ mod tests {
         let ip = assign_session_ip(&sid, &map);
         // First pair (0,0) is skipped, should use (0xAA, 0xBB).
         assert_eq!(ip, Ipv4Addr::new(10, 200, 0xAA, 0xBB));
+    }
+
+    #[test]
+    fn test_assign_session_ip_reserved_pairs_fallback() {
+        let map: DashMap<Ipv4Addr, SessionMapping> = DashMap::new();
+        let sid = [0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF];
+        let ip = assign_session_ip(&sid, &map);
+        assert_eq!(ip, Ipv4Addr::new(10, 200, 0, 1));
     }
 
     #[test]
