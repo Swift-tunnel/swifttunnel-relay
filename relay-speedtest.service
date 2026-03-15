@@ -1,0 +1,13 @@
+[Unit]
+Description=SwiftTunnel UDP Relay Speedtest Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/swifttunnel
+ExecStart=/usr/bin/python3 /opt/swifttunnel/relay-speedtest.py server --bind 0.0.0.0 --port 9000
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

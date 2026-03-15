@@ -203,17 +203,20 @@ deploy_to_server() {
         # Ensure env + token for localhost stats exists (needed by status/observability)
         $sudo_prefix mkdir -p /etc/swifttunnel
         $sudo_prefix mkdir -p /etc/systemd/system/v3-relay.service.d
-        if [ ! -f /etc/swifttunnel/relay.env ] || ! grep -q '^RELAY_STATS_TOKEN=' /etc/swifttunnel/relay.env; then
-            token=\$(openssl rand -hex 24 2>/dev/null || (head -c 24 /dev/urandom | base64 | tr -d '=+/\\n' | head -c 48))
-            {
-              echo 'RELAY_STATS_PORT=51822'
-              echo \"RELAY_STATS_TOKEN=\$token\"
-              echo 'RELAY_FLOW_CHANNEL_CAPACITY=256'
-            } | $sudo_prefix tee /etc/swifttunnel/relay.env >/dev/null
-        else
-            # Ensure capacity is present even on older env files.
-            grep -q '^RELAY_FLOW_CHANNEL_CAPACITY=' /etc/swifttunnel/relay.env || echo 'RELAY_FLOW_CHANNEL_CAPACITY=256' | $sudo_prefix tee -a /etc/swifttunnel/relay.env >/dev/null
+        if [ ! -f /etc/swifttunnel/relay.env ]; then
+            $sudo_prefix touch /etc/swifttunnel/relay.env
         fi
+        existing_token=\$(grep -E '^RELAY_STATS_TOKEN=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || true)
+        if [ -z \"\$existing_token\" ]; then
+            token=\$(openssl rand -hex 24 2>/dev/null || (head -c 24 /dev/urandom | base64 | tr -d '=+/\\n' | head -c 48))
+            if grep -q '^RELAY_STATS_TOKEN=' /etc/swifttunnel/relay.env; then
+                $sudo_prefix sed -i \"s|^RELAY_STATS_TOKEN=.*|RELAY_STATS_TOKEN=\$token|\" /etc/swifttunnel/relay.env
+            else
+                echo \"RELAY_STATS_TOKEN=\$token\" | $sudo_prefix tee -a /etc/swifttunnel/relay.env >/dev/null
+            fi
+        fi
+        grep -q '^RELAY_STATS_PORT=' /etc/swifttunnel/relay.env || echo 'RELAY_STATS_PORT=51822' | $sudo_prefix tee -a /etc/swifttunnel/relay.env >/dev/null
+        grep -q '^RELAY_FLOW_CHANNEL_CAPACITY=' /etc/swifttunnel/relay.env || echo 'RELAY_FLOW_CHANNEL_CAPACITY=256' | $sudo_prefix tee -a /etc/swifttunnel/relay.env >/dev/null
         cat > /tmp/10-env.conf <<'EOF'
 [Service]
 EnvironmentFile=/etc/swifttunnel/relay.env

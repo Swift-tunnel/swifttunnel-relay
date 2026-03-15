@@ -39,6 +39,7 @@ From `/Users/Evelyn/Swifttunnel/swifttunnel-relay`:
 git status
 git log --oneline -n 5
 cargo test
+python3 probe-relay.py --icmp 45.32.115.254
 ```
 
 If tests fail, stop and fix before any deployment.
@@ -94,6 +95,8 @@ sudo systemctl daemon-reload
 sudo systemctl restart v3-relay
 ```
 
+`setup-tun.sh` only needs to install the NAT/FORWARD prerequisites. The relay itself now re-applies `swifttun0` link-up state and `10.200.0.1/16` on every start, so a plain service restart should not leave the TUN device down/unaddressed anymore.
+
 ## Canary Verification Checklist
 
 Run on the canary server:
@@ -104,14 +107,28 @@ curl -sS -H "Authorization: Bearer __RELAY_STATS_TOKEN__" http://127.0.0.1:51822
 curl -sS -H "Authorization: Bearer __RELAY_STATS_TOKEN__" http://127.0.0.1:51822/v1/connections
 ```
 
+Run from your local machine against the canary:
+
+```bash
+python3 probe-relay.py --icmp <canary_ip>
+python3 probe-relay.py --icmp --repeat 10 <canary_ip>
+python3 relay-speedtest.py client --relay-host <canary_ip> --target-host 104.64.209.241 --target-port 9000 --payload-bytes 1200 --upload-packets 4000 --download-packets 4000 --upload-gap-us 50 --download-gap-us 50 --timeout-ms 5000
+```
+
 Expected:
 
 1. `v3-relay` is active.
-2. `/v1/stats` returns JSON.
-3. `/v1/connections` returns JSON (may be empty when idle).
+2. `/v1/stats` returns JSON quickly; it is intentionally card-safe and should keep responding even if detailed connection scans are degraded.
+   Traffic rates are rolling `client -> relay` / `relay -> client` bytes-per-second, not lifetime averages.
+3. `/v1/connections` returns JSON (may be empty when idle). It is served from a cached per-second snapshot so repeated admin polling does not walk the live session map on every request.
 4. No crash loop or auth config errors in logs.
 5. During a live app connection to this canary, connection rows should show `auth_state: "authenticated"` for updated app clients.
 6. If `RELAY_TUN_UDP=true`, confirm `swifttun0` exists and has `10.200.0.1/16` assigned.
+7. `probe-relay.py` returns pong RTT/loss numbers instead of timing out.
+8. `ss -tanp | grep 51822` should show short-lived `TIME-WAIT` sockets, not growing `CLOSE-WAIT` piles on the relay stats port.
+9. `relay-speedtest.py client ...` completes an upload/download run against the destination host and reports non-zero throughput instead of timing out.
+   For larger sweeps, keep the pacing flags in the command above so the harness
+   does not manufacture burst loss on its own.
 
 If any check fails, stop rollout and rollback that server.
 
@@ -124,6 +141,13 @@ After canaries are healthy:
 3. Restart and verify each server (`systemctl is-active`, quick `/v1/stats` check).
 
 You may use `deploy.sh` only as a binary distribution helper, but still apply per-server auth env overrides manually because `RELAY_SERVER_ID` differs per host.
+
+Operational note:
+- Treat `RELAY_STATS_TOKEN=` with an empty value as broken config, not as "already set". The current `deploy.sh` and `manual-deploy-host.sh` helpers regenerate empty tokens and keep `RELAY_STATS_PORT=51822` plus `RELAY_FLOW_CHANNEL_CAPACITY=256` present in `/etc/swifttunnel/relay.env`.
+- Preserve the lock order `sessions -> session_traffic` in relay code. If RX
+  keeps a `session_traffic` `DashMap` guard alive while later mutating
+  `sessions`, the cleanup/snapshot tasks can deadlock the datapath and the main
+  UDP socket will stop draining.
 
 ## Rollback
 

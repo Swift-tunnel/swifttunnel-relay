@@ -33,6 +33,12 @@ The relay:
 5. Returns responses prefixed with the session ID
 6. Optionally verifies signed relay tickets and binds authenticated `user_id`
 
+Concurrency note:
+- Keep the live-map lock order `sessions -> session_traffic`. RX accounting must
+  drop any `session_traffic` `DashMap` guard before mutating `sessions`, or the
+  cleanup/snapshot tasks can deadlock the datapath and stop draining the main
+  UDP socket.
+
 ## Features
 
 - **Ultra-low latency** - No encryption overhead
@@ -45,7 +51,7 @@ The relay:
 - **Soft-delete with grace period** - Late packets can revive sessions
 - **RTT/jitter ping (optional)** - ping/pong control frames for benchmarking/telemetry
 - **TUN-backed IP forwarding (optional)** - Routes TCP and, optionally, UDP packets through a Linux TUN device (`RELAY_TCP_ENABLED=true`, `RELAY_TUN_UDP=true`)
-- **Authenticated localhost telemetry API** - `/v1/stats` and `/v1/connections`
+- **Authenticated localhost telemetry API** - `/v1/stats` and `/v1/connections`, served from a dedicated localhost listener so relay telemetry does not depend on the Tokio worker pool
 
 ## Installation
 
@@ -86,6 +92,70 @@ RELAY_STATS_TOKEN=change-me RELAY_STATS_PORT=51822 ./swifttunnel-relay
 # With debug logging
 RUST_LOG=debug ./swifttunnel-relay
 ```
+
+### Local Latency Probe
+
+Use the bundled control-plane probe to measure relay RTT, jitter, and loss from your machine without tunneling gameplay traffic:
+
+```bash
+# Single relay
+python3 probe-relay.py 45.32.115.254
+
+# Include ICMP baseline and run 10 repeats
+python3 probe-relay.py --icmp --repeat 10 45.32.115.254
+
+# Compare multiple relays side by side
+python3 probe-relay.py --icmp 45.32.115.254 54.255.205.216 45.32.253.124
+
+# Auth-required relay
+python3 probe-relay.py --ticket-file /path/to/relay-ticket.txt 45.32.115.254
+```
+
+This uses the relay's `0xA3`/`0xA4` ping/pong frames, so it measures client-to-relay control-plane RTT and loss. It does not send tunneled DNS/game packets.
+
+### Relay Datapath Speedtest
+
+Use the bundled relay datapath speedtest when you want to validate real tunneled
+UDP forwarding instead of just relay ping/pong frames.
+
+Run the public UDP server on the destination host:
+
+```bash
+python3 relay-speedtest.py server --bind 0.0.0.0 --port 9000
+```
+
+Or install the provided systemd unit:
+
+```bash
+sudo install -d /opt/swifttunnel
+sudo install -m 0755 relay-speedtest.py /opt/swifttunnel/relay-speedtest.py
+sudo install -m 0644 relay-speedtest.service /etc/systemd/system/relay-speedtest.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now relay-speedtest
+```
+
+Run the client from a machine that can already receive UDP replies from the
+relay, for example `Mac -> singapore-03 relay -> singapore-06 speedtest`:
+
+```bash
+python3 relay-speedtest.py client \
+  --relay-host 45.32.115.254 \
+  --target-host 104.64.209.241 \
+  --target-port 9000 \
+  --payload-bytes 1200 \
+  --upload-packets 4000 \
+  --download-packets 4000 \
+  --upload-gap-us 50 \
+  --download-gap-us 50 \
+  --timeout-ms 5000
+```
+
+For auth-required relays, also pass `--ticket` or `--ticket-file`.
+
+This script sends real `[session_id][IPv4 packet]` frames through the relay and
+reports upload/download payload throughput plus packet loss for the actual relay
+datapath. For larger WAN runs, add small pacing gaps plus a wider timeout so
+the harness does not create its own burst loss and falsely implicate the relay.
 
 ### Environment Variables
 
@@ -204,6 +274,12 @@ sudo systemctl start swifttunnel-relay
 
 When `RELAY_TUN_UDP=true`, the relay creates a TUN device (`swifttun0`) and forwards full UDP IPv4 packets through the Linux kernel instead of maintaining per-flow UDP sockets in user-space. The client framing stays the same (`[session_id][ip packet]`), but the relay rewrites the inner source IP to a per-session TUN IP and lets the kernel handle routing/NAT on the server side.
 
+Fragmented IPv4 packets stay fragment-safe on this path: after the relay rewrites
+the inner source/destination IP, it refreshes the IPv4 header checksum on every
+fragment, updates the transport checksum pseudo-header only on fragment `0`, and
+leaves later fragment payload bytes untouched until the far endpoint reassembles
+the full datagram.
+
 This removes the relay's hottest user-space work:
 - per-flow socket creation and mio registration
 - UDP payload extraction
@@ -215,7 +291,7 @@ This removes the relay's hottest user-space work:
 sudo ./setup-tun.sh
 ```
 
-This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds the FORWARD rules needed for return traffic.
+This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds the FORWARD rules needed for return traffic. The relay now brings `swifttun0` up and reapplies `10.200.0.1/16` on every start, so you no longer need a separate manual `ip addr add ... && ip link set ... up` step after restarts.
 
 **Enable:**
 ```bash
@@ -235,7 +311,7 @@ When `RELAY_TCP_ENABLED=true`, the relay uses the same TUN device (`swifttun0`) 
 sudo ./setup-tun.sh
 ```
 
-This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping.
+This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping. The relay handles the runtime `swifttun0` address/link setup itself on each start.
 
 **Enable:**
 ```bash
@@ -289,7 +365,7 @@ See the [SwiftTunnel App](https://github.com/Swift-tunnel/swifttunnel-app) for a
 # Open the relay port
 sudo ufw allow 51821/udp
 
-# Or with custom port
+# Speedtest server port
 sudo ufw allow 9000/udp
 ```
 
@@ -306,6 +382,11 @@ View logs:
 journalctl -u swifttunnel-relay -f
 ```
 
+Quick local probe:
+```bash
+python3 probe-relay.py --icmp 45.32.115.254
+```
+
 ### Localhost Telemetry API
 
 When `RELAY_STATS_TOKEN` is configured, relay exposes authenticated HTTP telemetry endpoints on:
@@ -317,7 +398,7 @@ Authentication header (required):
 `Authorization: Bearer ${RELAY_STATS_TOKEN}`
 
 Available endpoints:
-- `GET /v1/stats` - relay-level counters and rates
+- `GET /v1/stats` - relay-level counters and rates (card-safe, does not scan live session maps)
 - `GET /v1/connections` - live session rows (`user_id`, `session_id`, `auth_state`, activity, bytes, endpoint)
 
 Current `user_id` behavior:
@@ -338,14 +419,16 @@ curl -s \
 `/v1/stats` response fields:
 - `version`
 - `timestamp`
-- `active_users`
+- `active_users` - card-safe approximation that mirrors active session count
 - `active_sessions`
 - `throttled_users`
-- `inbound_bps`
-- `outbound_bps`
+- `inbound_bps` - rolling `client -> relay` bytes/sec sampled from recent traffic
+- `outbound_bps` - rolling `relay -> client` bytes/sec sampled from recent traffic
 - `dropped_in`
 - `dropped_out`
 - `dropped_pps`
+
+Use `/v1/connections` when you need exact per-session identity details. The stats endpoint intentionally avoids walking the live session map so heartbeat/admin counters stay responsive under load even if detailed connection scans get stuck. `/v1/connections` itself is served from a cached snapshot refreshed once per second, and the localhost HTTP listener now runs on dedicated blocking threads so local observability polling cannot pile up on the Tokio runtime.
 
 ## Performance Tuning
 

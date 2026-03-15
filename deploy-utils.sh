@@ -9,6 +9,6 @@ get_generic_pass() {
   if [ -z "${PASS_MD:-}" ] || [ ! -f "$PASS_MD" ]; then
     return 1
   fi
-  sed -n 's/.*`root \\/ \\([^`]*\\)`.*/\\1/p' "$PASS_MD" | head -n1
+  sed -n 's/.*`root \/ \([^`]*\)`.*/\1/p' "$PASS_MD" | head -n1
 }
 
