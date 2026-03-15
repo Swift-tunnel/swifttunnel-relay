@@ -40,15 +40,15 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::env;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Shutdown};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::interval;
@@ -61,6 +61,9 @@ const DEFAULT_PORT: u16 = 51821;
 const DEFAULT_STATS_PORT: u16 = 51822;
 const MAX_HTTP_REQUEST_SIZE: usize = 8192;
 const STATS_HTTP_READ_TIMEOUT_SECS: u64 = 5;
+const STATS_HTTP_WRITE_TIMEOUT_SECS: u64 = 5;
+const STATS_RATE_SAMPLE_MIN_MS: u64 = 1000;
+const CONNECTION_SNAPSHOT_INTERVAL_MS: u64 = 1000;
 const RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
 const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
@@ -442,6 +445,7 @@ struct SessionTraffic {
     bytes_out: AtomicU64,
     packets_in: AtomicU64,
     packets_out: AtomicU64,
+    last_activity_unix: AtomicU64,
     /// Last client-reported RTT in microseconds (via 0xA5 frame)
     last_rtt_us: AtomicU64,
 }
@@ -454,9 +458,38 @@ impl SessionTraffic {
             bytes_out: AtomicU64::new(0),
             packets_in: AtomicU64::new(0),
             packets_out: AtomicU64::new(0),
+            last_activity_unix: AtomicU64::new(connected_at_unix),
             last_rtt_us: AtomicU64::new(0),
         }
     }
+}
+
+/// Update per-session traffic counters without keeping a `DashMap` guard alive.
+///
+/// The relay must never hold a `session_traffic` shard lock while touching the
+/// live `sessions` map. Cleanup and snapshot tasks lock those maps in the
+/// opposite order, so retaining a traffic entry guard across later session-map
+/// work can wedge the datapath.
+fn record_session_ingress(
+    session_traffic: &DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>,
+    session_id: [u8; SESSION_ID_LEN],
+    connected_at_unix: u64,
+    packet_len: usize,
+) {
+    let traffic = {
+        let entry = session_traffic
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(SessionTraffic::new(connected_at_unix)));
+        Arc::clone(entry.value())
+    };
+
+    traffic
+        .bytes_in
+        .fetch_add(packet_len as u64, Ordering::Relaxed);
+    traffic.packets_in.fetch_add(1, Ordering::Relaxed);
+    traffic
+        .last_activity_unix
+        .store(connected_at_unix, Ordering::Relaxed);
 }
 
 /// Flow entry in the flow map
@@ -475,6 +508,28 @@ struct StatsApiContext {
     session_traffic: Arc<DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>>,
     stats: Arc<Stats>,
     started_at: Instant,
+    rate_window: Mutex<StatsRateWindow>,
+    connections_snapshot: RwLock<String>,
+}
+
+struct StatsRateWindow {
+    last_sample_at: Option<Instant>,
+    last_bytes_in: u64,
+    last_bytes_out: u64,
+    inbound_bps: u64,
+    outbound_bps: u64,
+}
+
+impl StatsRateWindow {
+    fn new() -> Self {
+        Self {
+            last_sample_at: None,
+            last_bytes_in: 0,
+            last_bytes_out: 0,
+            inbound_bps: 0,
+            outbound_bps: 0,
+        }
+    }
 }
 
 /// Global statistics
@@ -527,6 +582,8 @@ async fn main() -> Result<()> {
 
     let stats = Arc::new(Stats::new());
     let started_at = Instant::now();
+    let session_traffic: Arc<DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>> =
+        Arc::new(DashMap::new());
 
     log::info!("╔════════════════════════════════════════════╗");
     log::info!("║     SwiftTunnel V3 UDP Relay v{}        ║", RELAY_VERSION);
@@ -576,6 +633,7 @@ async fn main() -> Result<()> {
                     // Spawn a thread that drains TUN response packets and sends
                     // them back to clients via the main relay socket.
                     let stats_tun_resp = Arc::clone(&stats);
+                    let session_traffic_tun_resp = Arc::clone(&session_traffic);
                     std::thread::Builder::new()
                         .name("relay-tun-resp".into())
                         .spawn(move || {
@@ -592,10 +650,15 @@ async fn main() -> Result<()> {
                                         e
                                     );
                                 } else {
+                                    let len = frame.len() as u64;
                                     stats_tun_resp.packets_out.fetch_add(1, Ordering::Relaxed);
-                                    stats_tun_resp
-                                        .bytes_out
-                                        .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                    stats_tun_resp.bytes_out.fetch_add(len, Ordering::Relaxed);
+                                    if let Some(entry) =
+                                        session_traffic_tun_resp.get(&tx_pkt.session_id)
+                                    {
+                                        entry.value().bytes_out.fetch_add(len, Ordering::Relaxed);
+                                        entry.value().packets_out.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         })
@@ -635,6 +698,7 @@ async fn main() -> Result<()> {
             tun_session_cleanup,
             tun_udp_enabled,
             tcp_enabled,
+            session_traffic,
         )
         .await;
     }
@@ -667,8 +731,6 @@ async fn main() -> Result<()> {
 
     // Session tracking
     let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
-    let session_traffic: Arc<DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>> =
-        Arc::new(DashMap::new());
 
     // Flow tracking: "session_hex:game_addr" -> FlowEntry
     let flows: Arc<DashMap<String, FlowEntry>> = Arc::new(DashMap::new());
@@ -679,8 +741,11 @@ async fn main() -> Result<()> {
             session_traffic: Arc::clone(&session_traffic),
             stats: Arc::clone(&stats),
             started_at,
+            rate_window: Mutex::new(StatsRateWindow::new()),
+            connections_snapshot: RwLock::new(empty_connections_payload()),
         });
 
+        spawn_connections_snapshot_updater(Arc::clone(&ctx));
         tokio::spawn(async move {
             if let Err(e) = run_stats_http_server(stats_port, token, ctx).await {
                 log::error!("Stats API server error: {}", e);
@@ -710,10 +775,11 @@ async fn main() -> Result<()> {
                         .value()
                         .bytes_out
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    entry.value().packets_out.fetch_add(1, Ordering::Relaxed);
                     entry
                         .value()
-                        .packets_out
-                        .fetch_add(1, Ordering::Relaxed);
+                        .last_activity_unix
+                        .store(unix_timestamp_secs(), Ordering::Relaxed);
                 }
             }
         }
@@ -775,6 +841,9 @@ async fn main() -> Result<()> {
                 if now.duration_since(session.last_activity) >= session_idle_limit {
                     session_traffic_cleanup.remove(session_id);
                     sessions_removed += 1;
+                    stats_cleanup
+                        .active_sessions
+                        .fetch_sub(1, Ordering::Relaxed);
                     return false;
                 }
                 true
@@ -789,9 +858,6 @@ async fn main() -> Result<()> {
             stats_cleanup
                 .active_flows
                 .store(flows_cleanup.len() as u64, Ordering::Relaxed);
-            stats_cleanup
-                .active_sessions
-                .store(sessions_cleanup.len() as u64, Ordering::Relaxed);
 
             if removed_count > 0 || marked_count > 0 || revived_count > 0 || sessions_removed > 0 {
                 log::info!(
@@ -884,20 +950,11 @@ async fn main() -> Result<()> {
                     last_activity: now,
                     last_activity_unix: now_unix,
                 });
+                stats.active_sessions.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let session_bytes = session_traffic
-            .entry(session_id)
-            .or_insert_with(|| Arc::new(SessionTraffic::new(now_unix)));
-        session_bytes
-            .value()
-            .bytes_in
-            .fetch_add(len as u64, Ordering::Relaxed);
-        session_bytes
-            .value()
-            .packets_in
-            .fetch_add(1, Ordering::Relaxed);
+        record_session_ingress(&session_traffic, session_id, now_unix, len);
 
         // Auth hello control frame:
         // [session_id:8][0xA1][token_len_be_u16][token_utf8]
@@ -983,10 +1040,7 @@ async fn main() -> Result<()> {
                         .value()
                         .bytes_out
                         .fetch_add(response.len() as u64, Ordering::Relaxed);
-                    entry
-                        .value()
-                        .packets_out
-                        .fetch_add(1, Ordering::Relaxed);
+                    entry.value().packets_out.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -1011,7 +1065,10 @@ async fn main() -> Result<()> {
                 buf[SESSION_ID_LEN + 4],
             ]);
             if let Some(entry) = session_traffic.get(&session_id) {
-                entry.value().last_rtt_us.store(rtt_us as u64, Ordering::Relaxed);
+                entry
+                    .value()
+                    .last_rtt_us
+                    .store(rtt_us as u64, Ordering::Relaxed);
             }
             continue;
         }
@@ -1343,26 +1400,194 @@ async fn run_stats_http_server(
     token: String,
     context: Arc<StatsApiContext>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
+    std::thread::Builder::new()
+        .name(format!("stats-http-{}", port))
+        .spawn(move || {
+            if let Err(e) = run_stats_http_server_blocking(port, token, context) {
+                log::error!("Stats API server error: {}", e);
+            }
+        })
+        .context("Failed to spawn stats API server thread")?;
+
+    Ok(())
+}
+
+fn run_stats_http_server_blocking(
+    port: u16,
+    token: String,
+    context: Arc<StatsApiContext>,
+) -> Result<()> {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .context("Failed to bind stats API listener")?;
+    listener
+        .set_nonblocking(false)
+        .context("Failed to set stats API listener blocking mode")?;
 
     log::info!("Stats API listening on 127.0.0.1:{}", port);
 
     loop {
         let (stream, addr) = listener
             .accept()
-            .await
             .context("Failed to accept stats API client")?;
         let token = token.clone();
         let context = Arc::clone(&context);
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_stats_http_client(stream, &token, context).await {
-                log::debug!("Stats API client {} error: {}", addr, e);
-            }
-        });
+        std::thread::Builder::new()
+            .name("stats-http-client".into())
+            .spawn(move || {
+                if let Err(e) = handle_stats_http_client_blocking(stream, &token, context) {
+                    log::debug!("Stats API client {} error: {}", addr, e);
+                }
+            })
+            .context("Failed to spawn stats API client thread")?;
     }
+}
+
+fn handle_stats_http_client_blocking(
+    mut stream: std::net::TcpStream,
+    token: &str,
+    context: Arc<StatsApiContext>,
+) -> Result<()> {
+    let result = (|| -> Result<()> {
+        stream
+            .set_nonblocking(false)
+            .context("Failed to set stats API stream blocking mode")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(STATS_HTTP_READ_TIMEOUT_SECS)))
+            .context("Failed to set stats API read timeout")?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(STATS_HTTP_WRITE_TIMEOUT_SECS)))
+            .context("Failed to set stats API write timeout")?;
+
+        let mut request_buf = [0u8; MAX_HTTP_REQUEST_SIZE];
+        let mut total_read = 0usize;
+        let mut header_complete = false;
+
+        loop {
+            if total_read >= MAX_HTTP_REQUEST_SIZE {
+                write_http_response_blocking(
+                    &mut stream,
+                    431,
+                    "Request Header Fields Too Large",
+                    "{\"error\":\"request_too_large\"}",
+                )?;
+                return Ok(());
+            }
+
+            let read_len = match stream.read(&mut request_buf[total_read..]) {
+                Ok(0) => break,
+                Ok(read_len) => read_len,
+                Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                    write_http_response_blocking(
+                        &mut stream,
+                        408,
+                        "Request Timeout",
+                        "{\"error\":\"request_timeout\"}",
+                    )?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(e).context("Failed to read stats API request");
+                }
+            };
+
+            total_read += read_len;
+
+            if find_http_header_end(&request_buf[..total_read]).is_some() {
+                header_complete = true;
+                break;
+            }
+        }
+
+        if total_read == 0 {
+            return Ok(());
+        }
+
+        if !header_complete {
+            write_http_response_blocking(
+                &mut stream,
+                400,
+                "Bad Request",
+                "{\"error\":\"incomplete_request_headers\"}",
+            )?;
+            return Ok(());
+        }
+
+        let header_end = find_http_header_end(&request_buf[..total_read]).unwrap_or(total_read);
+        let request = String::from_utf8_lossy(&request_buf[..header_end]);
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().unwrap_or("");
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or("");
+        let path = request_parts.next().unwrap_or("");
+
+        if method.is_empty() || path.is_empty() {
+            write_http_response_blocking(
+                &mut stream,
+                400,
+                "Bad Request",
+                "{\"error\":\"bad_request_line\"}",
+            )?;
+            return Ok(());
+        }
+
+        let mut auth_header: Option<String> = None;
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("authorization") {
+                    auth_header = Some(value.trim().to_string());
+                }
+            }
+        }
+
+        if method != "GET" {
+            write_http_response_blocking(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "{\"error\":\"method_not_allowed\"}",
+            )?;
+            return Ok(());
+        }
+
+        let expected_auth = format!("Bearer {}", token);
+        if auth_header.as_deref() != Some(expected_auth.as_str()) {
+            write_http_response_blocking(
+                &mut stream,
+                401,
+                "Unauthorized",
+                "{\"error\":\"unauthorized\"}",
+            )?;
+            return Ok(());
+        }
+
+        match path {
+            "/v1/stats" => {
+                let body = render_stats_payload(&context);
+                write_http_response_blocking(&mut stream, 200, "OK", &body)?;
+            }
+            "/v1/connections" => {
+                let body = render_connections_snapshot_payload(&context);
+                write_http_response_blocking(&mut stream, 200, "OK", &body)?;
+            }
+            _ => {
+                write_http_response_blocking(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "{\"error\":\"not_found\"}",
+                )?;
+            }
+        }
+
+        Ok(())
+    })();
+
+    let _ = stream.shutdown(Shutdown::Both);
+    result
 }
 
 async fn handle_stats_http_client(
@@ -1523,39 +1748,53 @@ async fn write_http_response(
     Ok(())
 }
 
+fn write_http_response_blocking(
+    stream: &mut std::net::TcpStream,
+    status_code: u16,
+    status_text: &str,
+    body: &str,
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code,
+        status_text,
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .context("Failed to write blocking stats API response")?;
+    stream
+        .flush()
+        .context("Failed to flush stats API response")?;
+    Ok(())
+}
+
 fn render_stats_payload(context: &StatsApiContext) -> String {
-    let elapsed_secs = context.started_at.elapsed().as_secs();
     let bytes_in = context.stats.bytes_in.load(Ordering::Relaxed);
     let bytes_out = context.stats.bytes_out.load(Ordering::Relaxed);
     let dropped_in = context.stats.dropped_in.load(Ordering::Relaxed);
     let dropped_out = context.stats.dropped_out.load(Ordering::Relaxed);
-    let inbound_bps = if elapsed_secs > 0 {
-        bytes_in / elapsed_secs
-    } else {
-        0
-    };
-    let outbound_bps = if elapsed_secs > 0 {
-        bytes_out / elapsed_secs
-    } else {
-        0
-    };
+    let elapsed_secs = context.started_at.elapsed().as_secs();
+    let (inbound_bps, outbound_bps) =
+        sample_stats_rates(context, bytes_in, bytes_out, Instant::now());
     let dropped_pps = if elapsed_secs > 0 {
         (dropped_in + dropped_out) / elapsed_secs
     } else {
         0
     };
 
-    let mut active_user_ids = HashSet::<String>::new();
-    for entry in context.sessions.iter() {
-        active_user_ids.insert(entry.user_id.clone());
-    }
+    let active_sessions = context.stats.active_sessions.load(Ordering::Relaxed);
+    // Keep /v1/stats independent from live DashMap iteration so the card-level
+    // telemetry path stays responsive even when detailed session scans wedge.
+    let active_users = active_sessions;
 
     format!(
         "{{\"version\":\"{}\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{},\"dropped_in\":{},\"dropped_out\":{},\"dropped_pps\":{},\"tcp_forwarded\":{},\"tun_udp_forwarded\":{}}}",
         RELAY_VERSION,
         unix_timestamp_secs(),
-        active_user_ids.len(),
-        context.sessions.len(),
+        active_users,
+        active_sessions,
         context.stats.throttled_users.load(Ordering::Relaxed),
         inbound_bps,
         outbound_bps,
@@ -1565,6 +1804,75 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
         context.stats.tcp_forwarded.load(Ordering::Relaxed),
         context.stats.tun_udp_forwarded.load(Ordering::Relaxed)
     )
+}
+
+fn sample_stats_rates(
+    context: &StatsApiContext,
+    bytes_in: u64,
+    bytes_out: u64,
+    now: Instant,
+) -> (u64, u64) {
+    let mut window = context
+        .rate_window
+        .lock()
+        .expect("stats rate window mutex poisoned");
+
+    match window.last_sample_at {
+        None => {
+            window.last_sample_at = Some(now);
+            window.last_bytes_in = bytes_in;
+            window.last_bytes_out = bytes_out;
+        }
+        Some(last_sample_at) => {
+            let elapsed = now.saturating_duration_since(last_sample_at);
+            if elapsed >= Duration::from_millis(STATS_RATE_SAMPLE_MIN_MS) {
+                let elapsed_secs = elapsed.as_secs_f64();
+                let delta_in = bytes_in.saturating_sub(window.last_bytes_in);
+                let delta_out = bytes_out.saturating_sub(window.last_bytes_out);
+
+                window.inbound_bps = (delta_in as f64 / elapsed_secs).round() as u64;
+                window.outbound_bps = (delta_out as f64 / elapsed_secs).round() as u64;
+                window.last_sample_at = Some(now);
+                window.last_bytes_in = bytes_in;
+                window.last_bytes_out = bytes_out;
+            }
+        }
+    }
+
+    (window.inbound_bps, window.outbound_bps)
+}
+
+pub(crate) fn empty_connections_payload() -> String {
+    format!(
+        "{{\"timestamp\":{},\"connections\":[]}}",
+        unix_timestamp_secs()
+    )
+}
+
+fn render_connections_snapshot_payload(context: &StatsApiContext) -> String {
+    match context.connections_snapshot.read() {
+        Ok(snapshot) => snapshot.clone(),
+        Err(_) => empty_connections_payload(),
+    }
+}
+
+pub(crate) fn spawn_connections_snapshot_updater(context: Arc<StatsApiContext>) {
+    std::thread::Builder::new()
+        .name("stats-snapshot".into())
+        .spawn(move || loop {
+            let payload = render_connections_payload(&context);
+            match context.connections_snapshot.write() {
+                Ok(mut snapshot) => {
+                    *snapshot = payload;
+                }
+                Err(_) => {
+                    log::warn!("Connections snapshot cache poisoned; stopping updater thread");
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(CONNECTION_SNAPSHOT_INTERVAL_MS));
+        })
+        .expect("failed to spawn stats-snapshot thread");
 }
 
 fn find_http_header_end(buf: &[u8]) -> Option<usize> {
@@ -1588,34 +1896,77 @@ fn render_connections_payload(context: &StatsApiContext) -> String {
         rtt_us: u64,
     }
 
-    let mut snapshots = Vec::<ConnectionSnapshot>::new();
+    #[derive(Clone)]
+    struct SessionSnapshotMeta {
+        user_id: String,
+        auth_state: String,
+        client_endpoint: String,
+        connected_at: u64,
+        last_activity_at: u64,
+    }
+
+    // Clone the live session metadata up front so the snapshot thread never
+    // holds a session_traffic shard lock while trying to lock sessions. The RX
+    // path updates these maps in the opposite order, so nested locking here can
+    // wedge the datapath under load.
+    let mut session_meta =
+        std::collections::HashMap::<[u8; SESSION_ID_LEN], SessionSnapshotMeta>::new();
     for entry in context.sessions.iter() {
+        session_meta.insert(
+            *entry.key(),
+            SessionSnapshotMeta {
+                user_id: entry.user_id.clone(),
+                auth_state: entry.auth_state.as_str().to_string(),
+                client_endpoint: entry.client_addr.to_string(),
+                connected_at: entry.created_at_unix,
+                last_activity_at: entry.last_activity_unix,
+            },
+        );
+    }
+
+    let mut seen_sessions = std::collections::HashSet::<[u8; SESSION_ID_LEN]>::new();
+    let mut snapshots = Vec::<ConnectionSnapshot>::new();
+    for entry in context.session_traffic.iter() {
         let session_id = *entry.key();
-        let session_hex = format!("{:016x}", u64::from_be_bytes(session_id));
-        let (bytes_in, bytes_out, connected_at, packets_in, packets_out, rtt_us) = match context.session_traffic.get(&session_id) {
-            Some(traffic) => (
-                traffic.bytes_in.load(Ordering::Relaxed),
-                traffic.bytes_out.load(Ordering::Relaxed),
-                traffic.connected_at_unix,
-                traffic.packets_in.load(Ordering::Relaxed),
-                traffic.packets_out.load(Ordering::Relaxed),
-                traffic.last_rtt_us.load(Ordering::Relaxed),
-            ),
-            None => (0, 0, entry.created_at_unix, 0, 0, 0),
+        let traffic = entry.value();
+        let Some(session) = session_meta.get(&session_id) else {
+            continue;
         };
+        seen_sessions.insert(session_id);
+        let session_hex = format!("{:016x}", u64::from_be_bytes(session_id));
+
+        snapshots.push(ConnectionSnapshot {
+            user_id: session.user_id.clone(),
+            session_id: session_hex,
+            auth_state: session.auth_state.clone(),
+            connected_at: traffic.connected_at_unix.max(session.connected_at),
+            last_activity_at: traffic.last_activity_unix.load(Ordering::Relaxed),
+            bytes_in: traffic.bytes_in.load(Ordering::Relaxed),
+            bytes_out: traffic.bytes_out.load(Ordering::Relaxed),
+            client_endpoint: session.client_endpoint.clone(),
+            packets_in: traffic.packets_in.load(Ordering::Relaxed),
+            packets_out: traffic.packets_out.load(Ordering::Relaxed),
+            rtt_us: traffic.last_rtt_us.load(Ordering::Relaxed),
+        });
+    }
+
+    for (session_id, entry) in session_meta {
+        if seen_sessions.contains(&session_id) {
+            continue;
+        }
 
         snapshots.push(ConnectionSnapshot {
             user_id: entry.user_id.clone(),
-            session_id: session_hex,
-            auth_state: entry.auth_state.as_str().to_string(),
-            connected_at,
-            last_activity_at: entry.last_activity_unix,
-            bytes_in,
-            bytes_out,
-            client_endpoint: entry.client_addr.to_string(),
-            packets_in,
-            packets_out,
-            rtt_us,
+            session_id: format!("{:016x}", u64::from_be_bytes(session_id)),
+            auth_state: entry.auth_state,
+            connected_at: entry.connected_at,
+            last_activity_at: entry.last_activity_at,
+            bytes_in: 0,
+            bytes_out: 0,
+            client_endpoint: entry.client_endpoint,
+            packets_in: 0,
+            packets_out: 0,
+            rtt_us: 0,
         });
     }
 
@@ -3215,6 +3566,8 @@ mod async_stats_http_tests {
             session_traffic: Arc::new(DashMap::new()),
             stats: Arc::new(Stats::new()),
             started_at: Instant::now(),
+            rate_window: Mutex::new(StatsRateWindow::new()),
+            connections_snapshot: RwLock::new(empty_connections_payload()),
         })
     }
 
@@ -3227,17 +3580,23 @@ mod async_stats_http_tests {
     ) -> Arc<StatsApiContext> {
         let sessions = Arc::new(DashMap::new());
         let session_traffic = Arc::new(DashMap::new());
+        let stats = Arc::new(Stats::new());
         for (sid, entry, traffic) in entries {
             sessions.insert(sid, entry);
             if let Some(t) = traffic {
                 session_traffic.insert(sid, t);
             }
         }
+        stats
+            .active_sessions
+            .store(sessions.len() as u64, Ordering::Relaxed);
         Arc::new(StatsApiContext {
             sessions,
             session_traffic,
-            stats: Arc::new(Stats::new()),
+            stats,
             started_at: Instant::now(),
+            rate_window: Mutex::new(StatsRateWindow::new()),
+            connections_snapshot: RwLock::new(empty_connections_payload()),
         })
     }
 
@@ -3256,7 +3615,7 @@ mod async_stats_http_tests {
     }
 
     #[test]
-    fn test_render_stats_with_sessions_dedup_users() {
+    fn test_render_stats_with_sessions_uses_atomic_counts() {
         let now_unix = unix_timestamp_secs();
         let sid1 = [0, 0, 0, 0, 0, 0, 0, 1];
         let sid2 = [0, 0, 0, 0, 0, 0, 0, 2];
@@ -3303,10 +3662,33 @@ mod async_stats_http_tests {
 
         let payload = render_stats_payload(&ctx);
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        // 2 unique users (user-aaa, user-bbb)
-        assert_eq!(parsed["active_users"], 2);
+        // /v1/stats intentionally uses the atomic session count instead of
+        // scanning live session maps, so `active_users` mirrors sessions here.
+        assert_eq!(parsed["active_users"], 3);
         // 3 sessions
         assert_eq!(parsed["active_sessions"], 3);
+    }
+
+    #[test]
+    fn test_render_stats_uses_rolling_rate_window() {
+        let ctx = make_stats_context();
+        ctx.stats.bytes_in.store(5_000, Ordering::Relaxed);
+        ctx.stats.bytes_out.store(8_000, Ordering::Relaxed);
+
+        {
+            let mut window = ctx.rate_window.lock().unwrap();
+            window.last_sample_at = Some(Instant::now() - Duration::from_secs(2));
+            window.last_bytes_in = 1_000;
+            window.last_bytes_out = 2_000;
+        }
+
+        let payload = render_stats_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let inbound_bps = parsed["inbound_bps"].as_u64().unwrap();
+        let outbound_bps = parsed["outbound_bps"].as_u64().unwrap();
+
+        assert!(inbound_bps >= 1_900 && inbound_bps <= 2_000);
+        assert!(outbound_bps >= 2_900 && outbound_bps <= 3_000);
     }
 
     // ---- render_connections_payload tests ----

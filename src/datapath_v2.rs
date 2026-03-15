@@ -698,6 +698,7 @@ pub(super) async fn run_datapath_v2(
     tun_session_cleanup: Option<super::tcp_tun::TunSessionCleanup>,
     tun_udp_enabled: bool,
     tcp_enabled: bool,
+    session_traffic: Arc<DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>>,
 ) -> Result<()> {
     let shard_count = get_shard_count();
     let shard_queue_cap = get_shard_queue_cap();
@@ -715,8 +716,6 @@ pub(super) async fn run_datapath_v2(
 
     let sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>> =
         Arc::new(DashMap::new());
-    let session_traffic: Arc<DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>> =
-        Arc::new(DashMap::new());
 
     if let Some(token) = stats_token {
         let ctx = Arc::new(super::StatsApiContext {
@@ -724,8 +723,11 @@ pub(super) async fn run_datapath_v2(
             session_traffic: Arc::clone(&session_traffic),
             stats: Arc::clone(&stats),
             started_at,
+            rate_window: std::sync::Mutex::new(super::StatsRateWindow::new()),
+            connections_snapshot: std::sync::RwLock::new(super::empty_connections_payload()),
         });
 
+        super::spawn_connections_snapshot_updater(Arc::clone(&ctx));
         tokio::spawn(async move {
             if let Err(e) = super::run_stats_http_server(stats_port, token, ctx).await {
                 log::error!("Stats API server error: {}", e);
@@ -844,6 +846,9 @@ pub(super) async fn run_datapath_v2(
                 if now.duration_since(session.last_activity) >= session_idle_limit {
                     session_traffic_cleanup.remove(session_id);
                     sessions_removed += 1;
+                    stats_cleanup
+                        .active_sessions
+                        .fetch_sub(1, Ordering::Relaxed);
 
                     let shard_id = shard_for_session(*session_id, shard_senders_cleanup.len());
                     if let Some(sender) = shard_senders_cleanup.get(shard_id) {
@@ -865,10 +870,6 @@ pub(super) async fn run_datapath_v2(
             }
 
             // Update stats counters.
-            stats_cleanup
-                .active_sessions
-                .store(sessions_cleanup.len() as u64, Ordering::Relaxed);
-
             if sessions_removed > 0 {
                 log::info!(
                     "V2 cleanup: sessions_removed={}, sessions={}",
@@ -974,20 +975,11 @@ pub(super) async fn run_datapath_v2(
                             last_activity: now,
                             last_activity_unix: now_unix,
                         });
+                        stats_rx.active_sessions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
-                let session_bytes = session_traffic_rx
-                    .entry(session_id)
-                    .or_insert_with(|| Arc::new(super::SessionTraffic::new(now_unix)));
-                session_bytes
-                    .value()
-                    .bytes_in
-                    .fetch_add(len as u64, Ordering::Relaxed);
-                session_bytes
-                    .value()
-                    .packets_in
-                    .fetch_add(1, Ordering::Relaxed);
+                super::record_session_ingress(&session_traffic_rx, session_id, now_unix, len);
 
                 // Auth hello:
                 if len >= super::SESSION_ID_LEN + 3
@@ -1132,7 +1124,10 @@ pub(super) async fn run_datapath_v2(
                         buf[super::SESSION_ID_LEN + 4],
                     ]);
                     if let Some(entry) = session_traffic_rx.get(&session_id) {
-                        entry.value().last_rtt_us.store(rtt_us as u64, Ordering::Relaxed);
+                        entry
+                            .value()
+                            .last_rtt_us
+                            .store(rtt_us as u64, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -1316,10 +1311,11 @@ fn send_tx_packet(
                 .value()
                 .bytes_out
                 .fetch_add(packet.len as u64, Ordering::Relaxed);
+            entry.value().packets_out.fetch_add(1, Ordering::Relaxed);
             entry
                 .value()
-                .packets_out
-                .fetch_add(1, Ordering::Relaxed);
+                .last_activity_unix
+                .store(super::unix_timestamp_secs(), Ordering::Relaxed);
         }
     }
     pool.release(packet.buf_idx);

@@ -20,6 +20,8 @@ use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(target_os = "linux")]
+use std::process::Command;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 /// Maximum packet size for TUN reads (matches MAX_PACKET_SIZE in main.rs).
@@ -32,6 +34,10 @@ use super::IP_HEADER_MIN as MIN_IPV4_HEADER_LEN;
 const IPPROTO_TCP: u8 = 6;
 /// IPv4 protocol number for UDP.
 const IPPROTO_UDP: u8 = 17;
+#[cfg(target_os = "linux")]
+const TUN_DEVICE_NAME: &str = "swifttun0";
+#[cfg(target_os = "linux")]
+const TUN_INTERFACE_CIDR: &str = "10.200.0.1/16";
 
 /// Packet to transmit back to a client via the relay's UDP socket.
 pub struct TxPacket {
@@ -152,6 +158,36 @@ mod platform {
     }
 
     impl TunHandler {
+        fn run_ip_command(args: &[&str]) -> Result<(), std::io::Error> {
+            let status = Command::new("ip").args(args).status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("ip {} failed with {}", args.join(" "), status),
+                ))
+            }
+        }
+
+        /// TUN MTU sized to avoid IP fragmentation after relay encapsulation.
+        ///
+        /// Relay frame adds 8 bytes (session_id) and the outer UDP/IP adds 28
+        /// bytes, totalling 36 bytes of overhead.  1500 − 36 = 1464, but we
+        /// use 1400 for extra headroom against tunnelled-in-tunnel or
+        /// non-standard path-MTU scenarios.
+        const TUN_MTU: &str = "1400";
+
+        fn configure_tun_interface(name: &str) -> Result<(), std::io::Error> {
+            // The relay recreates swifttun0 on every restart, so the address,
+            // MTU, and link state need to be re-applied every time instead of
+            // relying on a one-time server bootstrap step.
+            Self::run_ip_command(&["link", "set", "dev", name, "mtu", Self::TUN_MTU])?;
+            Self::run_ip_command(&["link", "set", "dev", name, "up"])?;
+            Self::run_ip_command(&["addr", "replace", TUN_INTERFACE_CIDR, "dev", name])?;
+            Ok(())
+        }
+
         /// Create a new TunHandler.
         ///
         /// Opens a TUN device named "swifttun0" and returns the handler, a
@@ -160,7 +196,8 @@ mod platform {
         pub fn new(
             tx_sender: Sender<TxPacket>,
         ) -> Result<(Self, Sender<InboundTunPacket>, TunSessionCleanup), std::io::Error> {
-            let tun_fd = create_tun_device("swifttun0")?;
+            let tun_fd = create_tun_device(TUN_DEVICE_NAME)?;
+            Self::configure_tun_interface(TUN_DEVICE_NAME)?;
 
             // Bounded to apply backpressure — tunneled packets are dropped when full,
             // same as the UDP datapath's bounded channel design.
@@ -499,12 +536,34 @@ const IP_DST_OFFSET: usize = 16;
 
 /// Rewrite an IPv4 address field at the given byte offset and fix checksums.
 fn rewrite_ip_field(packet: &mut [u8], offset: usize, new_ip: Ipv4Addr) {
-    if packet.len() < MIN_IPV4_HEADER_LEN {
+    if packet.len() < MIN_IPV4_HEADER_LEN || packet.len() < offset + 4 {
         return;
     }
+    let old_ip = Ipv4Addr::new(
+        packet[offset],
+        packet[offset + 1],
+        packet[offset + 2],
+        packet[offset + 3],
+    );
     packet[offset..offset + 4].copy_from_slice(&new_ip.octets());
 
     recalculate_ip_checksum(packet);
+
+    // Fragmented IPv4 packets do not carry a complete transport segment in
+    // every fragment. Recomputing UDP/TCP checksums over partial fragments
+    // corrupts payload bytes and breaks reassembly on the far side. Only
+    // fragment 0 carries the transport checksum field, so update the
+    // pseudo-header there incrementally and leave later fragments untouched.
+    if ipv4_is_fragment(packet) {
+        if ipv4_fragment_offset(packet) == Some(0) {
+            match packet[9] {
+                IPPROTO_TCP => update_fragment_tcp_checksum(packet, old_ip, new_ip),
+                IPPROTO_UDP => update_fragment_udp_checksum(packet, old_ip, new_ip),
+                _ => {}
+            }
+        }
+        return;
+    }
 
     match packet[9] {
         // TCP/UDP checksums both include the IPv4 pseudo-header.
@@ -522,6 +581,78 @@ fn rewrite_src_ip(packet: &mut [u8], new_src: Ipv4Addr) {
 /// Rewrite the destination IP address (bytes 16-19) in an IPv4 packet and fix checksums.
 fn rewrite_dst_ip(packet: &mut [u8], new_dst: Ipv4Addr) {
     rewrite_ip_field(packet, IP_DST_OFFSET, new_dst);
+}
+
+fn ipv4_is_fragment(packet: &[u8]) -> bool {
+    ipv4_fragment_offset(packet).is_some_and(|offset| {
+        let fragment_bits = u16::from_be_bytes([packet[6], packet[7]]);
+        (fragment_bits & 0x2000) != 0 || offset != 0
+    })
+}
+
+fn ipv4_fragment_offset(packet: &[u8]) -> Option<u16> {
+    if packet.len() < MIN_IPV4_HEADER_LEN {
+        return None;
+    }
+
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < MIN_IPV4_HEADER_LEN || packet.len() < ihl {
+        return None;
+    }
+
+    let fragment_bits = u16::from_be_bytes([packet[6], packet[7]]);
+    Some(fragment_bits & 0x1FFF)
+}
+
+fn update_fragment_tcp_checksum(packet: &mut [u8], old_ip: Ipv4Addr, new_ip: Ipv4Addr) {
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < MIN_IPV4_HEADER_LEN || packet.len() < ihl + 18 {
+        return;
+    }
+
+    let checksum_offset = ihl + 16;
+    let checksum = u16::from_be_bytes([packet[checksum_offset], packet[checksum_offset + 1]]);
+    let adjusted = adjust_checksum_for_ipv4_addr_change(checksum, old_ip, new_ip);
+    packet[checksum_offset..checksum_offset + 2].copy_from_slice(&adjusted.to_be_bytes());
+}
+
+fn update_fragment_udp_checksum(packet: &mut [u8], old_ip: Ipv4Addr, new_ip: Ipv4Addr) {
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < MIN_IPV4_HEADER_LEN || packet.len() < ihl + 8 {
+        return;
+    }
+
+    let checksum_offset = ihl + 6;
+    let checksum = u16::from_be_bytes([packet[checksum_offset], packet[checksum_offset + 1]]);
+    if checksum == 0 {
+        return;
+    }
+
+    let adjusted = adjust_checksum_for_ipv4_addr_change(checksum, old_ip, new_ip);
+    let adjusted = if adjusted == 0 { 0xFFFF } else { adjusted };
+    packet[checksum_offset..checksum_offset + 2].copy_from_slice(&adjusted.to_be_bytes());
+}
+
+fn adjust_checksum_for_ipv4_addr_change(checksum: u16, old_ip: Ipv4Addr, new_ip: Ipv4Addr) -> u16 {
+    let old = old_ip.octets();
+    let new = new_ip.octets();
+
+    let old_hi = u16::from_be_bytes([old[0], old[1]]);
+    let old_lo = u16::from_be_bytes([old[2], old[3]]);
+    let new_hi = u16::from_be_bytes([new[0], new[1]]);
+    let new_lo = u16::from_be_bytes([new[2], new[3]]);
+
+    let mut sum = (!checksum as u32)
+        + (!old_hi as u32 & 0xFFFF)
+        + new_hi as u32
+        + (!old_lo as u32 & 0xFFFF)
+        + new_lo as u32;
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    !(sum as u16)
 }
 
 /// Recalculate the IPv4 header checksum (RFC 1071).
@@ -771,6 +902,59 @@ mod tests {
         pkt
     }
 
+    fn make_udp_fragment_pair(src: Ipv4Addr, dst: Ipv4Addr) -> (Vec<u8>, Vec<u8>) {
+        let payload = b"fragmented-udp-checksum-path".to_vec();
+        let udp_len = 8 + payload.len();
+
+        let mut udp_datagram = Vec::with_capacity(udp_len);
+        udp_datagram.extend_from_slice(&0x3039u16.to_be_bytes());
+        udp_datagram.extend_from_slice(&0x0035u16.to_be_bytes());
+        udp_datagram.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        udp_datagram.extend_from_slice(&0u16.to_be_bytes());
+        udp_datagram.extend_from_slice(&payload);
+
+        let mut pseudo = [0u8; 12];
+        pseudo[0..4].copy_from_slice(&src.octets());
+        pseudo[4..8].copy_from_slice(&dst.octets());
+        pseudo[8] = 0;
+        pseudo[9] = IPPROTO_UDP;
+        pseudo[10..12].copy_from_slice(&(udp_len as u16).to_be_bytes());
+
+        let mut checksum_input = pseudo.to_vec();
+        checksum_input.extend_from_slice(&udp_datagram);
+        let checksum = super::super::calculate_ip_checksum(&checksum_input);
+        let checksum = if checksum == 0 { 0xFFFF } else { checksum };
+        udp_datagram[6..8].copy_from_slice(&checksum.to_be_bytes());
+
+        let first_payload = udp_datagram[..24].to_vec();
+        let second_payload = udp_datagram[24..].to_vec();
+
+        let build_fragment = |payload: &[u8], fragment_offset_blocks: u16, more_fragments: bool| {
+            let total_len: u16 = (20 + payload.len()) as u16;
+            let mut pkt = vec![0u8; total_len as usize];
+            pkt[0] = 0x45;
+            pkt[2] = (total_len >> 8) as u8;
+            pkt[3] = (total_len & 0xFF) as u8;
+            pkt[4] = 0x12;
+            pkt[5] = 0x34;
+            let fragment_bits =
+                (fragment_offset_blocks & 0x1FFF) | if more_fragments { 0x2000 } else { 0 };
+            pkt[6..8].copy_from_slice(&fragment_bits.to_be_bytes());
+            pkt[8] = 64;
+            pkt[9] = IPPROTO_UDP;
+            pkt[12..16].copy_from_slice(&src.octets());
+            pkt[16..20].copy_from_slice(&dst.octets());
+            pkt[20..].copy_from_slice(payload);
+            recalculate_ip_checksum(&mut pkt);
+            pkt
+        };
+
+        (
+            build_fragment(&first_payload, 0, true),
+            build_fragment(&second_payload, 3, false),
+        )
+    }
+
     /// Verify that the IP checksum validates to zero when checked.
     fn verify_ip_checksum(packet: &[u8]) -> bool {
         let ihl = ((packet[0] & 0x0F) as usize) * 4;
@@ -795,6 +979,16 @@ mod tests {
         let mut clone = packet.to_vec();
         recalculate_udp_checksum(&mut clone);
         clone[ihl + 6] == packet[ihl + 6] && clone[ihl + 7] == packet[ihl + 7]
+    }
+
+    fn reassemble_udp_fragments(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut packet = first.to_vec();
+        packet[2..4]
+            .copy_from_slice(&((20 + first.len() + second.len() - 40) as u16).to_be_bytes());
+        packet[6..8].copy_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&second[20..]);
+        recalculate_ip_checksum(&mut packet);
+        packet
     }
 
     #[test]
@@ -891,6 +1085,75 @@ mod tests {
         let ihl = ((pkt[0] & 0x0F) as usize) * 4;
         assert_eq!(u16::from_be_bytes([pkt[ihl + 6], pkt[ihl + 7]]), 0);
         assert!(verify_ip_checksum(&pkt));
+    }
+
+    #[test]
+    fn test_ipv4_fragment_detection() {
+        let (first, tail) =
+            make_udp_fragment_pair(Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(8, 8, 8, 8));
+
+        assert!(ipv4_is_fragment(&first));
+        assert!(ipv4_is_fragment(&tail));
+        assert!(!ipv4_is_fragment(&make_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(8, 8, 8, 8),
+            0x1234,
+        )));
+    }
+
+    #[test]
+    fn test_rewrite_src_preserves_udp_fragment_payload_bytes() {
+        let (mut pkt, _) =
+            make_udp_fragment_pair(Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(1, 1, 1, 1));
+        let before_transport = pkt[20..].to_vec();
+
+        rewrite_src_ip(&mut pkt, Ipv4Addr::new(10, 200, 42, 7));
+
+        assert_eq!(&pkt[20..26], &before_transport[20 - 20..26 - 20]);
+        assert_eq!(&pkt[28..], &before_transport[8..]);
+        assert!(verify_ip_checksum(&pkt));
+    }
+
+    #[test]
+    fn test_rewrite_dst_preserves_non_initial_udp_fragment_payload_bytes() {
+        let (_, mut pkt) =
+            make_udp_fragment_pair(Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(1, 1, 1, 1));
+        let before_transport = pkt[20..].to_vec();
+
+        rewrite_dst_ip(&mut pkt, Ipv4Addr::new(10, 200, 42, 7));
+
+        assert_eq!(pkt[20..], before_transport);
+        assert!(verify_ip_checksum(&pkt));
+    }
+
+    #[test]
+    fn test_rewrite_src_keeps_fragmented_udp_checksum_valid_after_reassembly() {
+        let new_src = Ipv4Addr::new(10, 200, 42, 7);
+        let (mut first, mut second) =
+            make_udp_fragment_pair(Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(1, 1, 1, 1));
+
+        rewrite_src_ip(&mut first, new_src);
+        rewrite_src_ip(&mut second, new_src);
+
+        let reassembled = reassemble_udp_fragments(&first, &second);
+        assert_eq!(&reassembled[12..16], &new_src.octets());
+        assert!(verify_ip_checksum(&reassembled));
+        assert!(verify_udp_checksum(&reassembled));
+    }
+
+    #[test]
+    fn test_rewrite_dst_keeps_fragmented_udp_checksum_valid_after_reassembly() {
+        let new_dst = Ipv4Addr::new(10, 0, 0, 1);
+        let (mut first, mut second) =
+            make_udp_fragment_pair(Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(1, 1, 1, 1));
+
+        rewrite_dst_ip(&mut first, new_dst);
+        rewrite_dst_ip(&mut second, new_dst);
+
+        let reassembled = reassemble_udp_fragments(&first, &second);
+        assert_eq!(&reassembled[16..20], &new_dst.octets());
+        assert!(verify_ip_checksum(&reassembled));
+        assert!(verify_udp_checksum(&reassembled));
     }
 
     /// Helper to create a SessionMapping for tests.
