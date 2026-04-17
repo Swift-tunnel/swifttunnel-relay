@@ -550,6 +550,10 @@ struct Stats {
     tcp_forwarded: AtomicU64,
     /// UDP IPv4 packets forwarded to the TUN handler
     tun_udp_forwarded: AtomicU64,
+    /// Datapath v2 buffer pool acquire failures (pool under-sized).
+    /// Each event also contributes to `dropped_in`/`dropped_out` so operators
+    /// can tell the difference between "queue full" and "pool empty".
+    pool_exhausted: AtomicU64,
 }
 
 impl Stats {
@@ -566,6 +570,7 @@ impl Stats {
             throttled_users: AtomicU64::new(0),
             tcp_forwarded: AtomicU64::new(0),
             tun_udp_forwarded: AtomicU64::new(0),
+            pool_exhausted: AtomicU64::new(0),
         }
     }
 }
@@ -887,9 +892,10 @@ async fn main() -> Result<()> {
             let bytes_out = stats_log.bytes_out.load(Ordering::Relaxed);
             let dropped_in = stats_log.dropped_in.load(Ordering::Relaxed);
             let dropped_out = stats_log.dropped_out.load(Ordering::Relaxed);
+            let pool_exhausted = stats_log.pool_exhausted.load(Ordering::Relaxed);
 
             log::info!(
-                "Stats: in={} out={} ({:.1}/{:.1} MB), {:.0} pkt/s, sessions={}, flows={}, dropped={}+{}",
+                "Stats: in={} out={} ({:.1}/{:.1} MB), {:.0} pkt/s, sessions={}, flows={}, dropped={}+{}, pool_exhausted={}",
                 pkts_in,
                 pkts_out,
                 bytes_in as f64 / 1_000_000.0,
@@ -899,6 +905,7 @@ async fn main() -> Result<()> {
                 stats_log.active_flows.load(Ordering::Relaxed),
                 dropped_in,
                 dropped_out,
+                pool_exhausted,
             );
         }
     });
@@ -932,14 +939,20 @@ async fn main() -> Result<()> {
 
         // Update session
         let mut session_authenticated = false;
+        let auth_required = auth_config.mode.requires_auth();
         match sessions.entry(session_id) {
             Entry::Occupied(mut entry) => {
                 let session = entry.get_mut();
-                session.client_addr = client_addr;
-                session.last_activity = now;
-                session.last_activity_unix = now_unix;
                 session_authenticated =
                     matches!(session.auth_state, SessionAuthState::Authenticated);
+                // Only trust client_addr updates from authenticated traffic when auth is
+                // required; otherwise an unauthenticated attacker with a known session_id
+                // can rewrite the session's observed client endpoint.
+                if !auth_required || session_authenticated {
+                    session.client_addr = client_addr;
+                    session.last_activity = now;
+                    session.last_activity_unix = now_unix;
+                }
             }
             Entry::Vacant(entry) => {
                 entry.insert(SessionEntry {
@@ -1075,6 +1088,11 @@ async fn main() -> Result<()> {
 
         // Keepalive packet (just session ID, no payload)
         if len == SESSION_ID_LEN {
+            if auth_config.mode.requires_auth() && !session_authenticated {
+                stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             log::trace!("Keepalive from {:016x}", u64::from_be_bytes(session_id));
 
             // IMPORTANT: Update activity time for ALL flows belonging to this session
@@ -1790,7 +1808,7 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
     let active_users = active_sessions;
 
     format!(
-        "{{\"version\":\"{}\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{},\"dropped_in\":{},\"dropped_out\":{},\"dropped_pps\":{},\"tcp_forwarded\":{},\"tun_udp_forwarded\":{}}}",
+        "{{\"version\":\"{}\",\"timestamp\":{},\"active_users\":{},\"active_sessions\":{},\"throttled_users\":{},\"inbound_bps\":{},\"outbound_bps\":{},\"dropped_in\":{},\"dropped_out\":{},\"dropped_pps\":{},\"pool_exhausted\":{},\"tcp_forwarded\":{},\"tun_udp_forwarded\":{}}}",
         RELAY_VERSION,
         unix_timestamp_secs(),
         active_users,
@@ -1801,6 +1819,7 @@ fn render_stats_payload(context: &StatsApiContext) -> String {
         dropped_in,
         dropped_out,
         dropped_pps,
+        context.stats.pool_exhausted.load(Ordering::Relaxed),
         context.stats.tcp_forwarded.load(Ordering::Relaxed),
         context.stats.tun_udp_forwarded.load(Ordering::Relaxed)
     )
@@ -1812,10 +1831,12 @@ fn sample_stats_rates(
     bytes_out: u64,
     now: Instant,
 ) -> (u64, u64) {
-    let mut window = context
-        .rate_window
-        .lock()
-        .expect("stats rate window mutex poisoned");
+    // Recover from poisoning: if an earlier caller panicked mid-sample, we still
+    // want /v1/stats to return the last-known rates rather than propagate the panic.
+    let mut window = match context.rate_window.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
 
     match window.last_sample_at {
         None => {
@@ -1827,14 +1848,19 @@ fn sample_stats_rates(
             let elapsed = now.saturating_duration_since(last_sample_at);
             if elapsed >= Duration::from_millis(STATS_RATE_SAMPLE_MIN_MS) {
                 let elapsed_secs = elapsed.as_secs_f64();
-                let delta_in = bytes_in.saturating_sub(window.last_bytes_in);
-                let delta_out = bytes_out.saturating_sub(window.last_bytes_out);
+                // The outer `if elapsed >= 1000ms` guarantees elapsed_secs >= 1.0, but
+                // guard against a future interval change (or a pathologically short
+                // Instant delta on suspend/resume) producing NaN or +Inf from division.
+                if elapsed_secs > 0.0 {
+                    let delta_in = bytes_in.saturating_sub(window.last_bytes_in);
+                    let delta_out = bytes_out.saturating_sub(window.last_bytes_out);
 
-                window.inbound_bps = (delta_in as f64 / elapsed_secs).round() as u64;
-                window.outbound_bps = (delta_out as f64 / elapsed_secs).round() as u64;
-                window.last_sample_at = Some(now);
-                window.last_bytes_in = bytes_in;
-                window.last_bytes_out = bytes_out;
+                    window.inbound_bps = (delta_in as f64 / elapsed_secs).round() as u64;
+                    window.outbound_bps = (delta_out as f64 / elapsed_secs).round() as u64;
+                    window.last_sample_at = Some(now);
+                    window.last_bytes_in = bytes_in;
+                    window.last_bytes_out = bytes_out;
+                }
             }
         }
     }
@@ -1850,10 +1876,25 @@ pub(crate) fn empty_connections_payload() -> String {
 }
 
 fn render_connections_snapshot_payload(context: &StatsApiContext) -> String {
-    match context.connections_snapshot.read() {
-        Ok(snapshot) => snapshot.clone(),
-        Err(_) => empty_connections_payload(),
-    }
+    // Recover from a poisoned RwLock so a panic in the updater thread does not
+    // permanently downgrade /v1/connections to empty payloads.
+    let snapshot = context
+        .connections_snapshot
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshot.clone()
+}
+
+/// Write the latest connections payload into the shared snapshot cache,
+/// recovering from mutex poisoning so a panicked writer cannot disable
+/// future updates. Returns `true` once the value is stored.
+fn store_connections_snapshot(context: &StatsApiContext, payload: String) -> bool {
+    let mut snapshot = context
+        .connections_snapshot
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *snapshot = payload;
+    true
 }
 
 pub(crate) fn spawn_connections_snapshot_updater(context: Arc<StatsApiContext>) {
@@ -1861,15 +1902,7 @@ pub(crate) fn spawn_connections_snapshot_updater(context: Arc<StatsApiContext>) 
         .name("stats-snapshot".into())
         .spawn(move || loop {
             let payload = render_connections_payload(&context);
-            match context.connections_snapshot.write() {
-                Ok(mut snapshot) => {
-                    *snapshot = payload;
-                }
-                Err(_) => {
-                    log::warn!("Connections snapshot cache poisoned; stopping updater thread");
-                    break;
-                }
-            }
+            store_connections_snapshot(&context, payload);
             std::thread::sleep(Duration::from_millis(CONNECTION_SNAPSHOT_INTERVAL_MS));
         })
         .expect("failed to spawn stats-snapshot thread");
@@ -3953,5 +3986,107 @@ mod async_stats_http_tests {
         let _ = handle_stats_http_client(server_stream, "test-token", ctx).await;
         let response = client_task.await.unwrap();
         assert!(response.contains("431"));
+    }
+
+    // ---- pool exhaustion counter ----
+
+    #[test]
+    fn test_render_stats_includes_pool_exhausted_counter() {
+        let ctx = make_stats_context();
+        let payload = render_stats_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed["pool_exhausted"], 0,
+            "fresh context should report zero pool exhaustion events"
+        );
+    }
+
+    #[test]
+    fn test_render_stats_pool_exhausted_reflects_counter_value() {
+        let ctx = make_stats_context();
+        ctx.stats.pool_exhausted.store(17, Ordering::Relaxed);
+        let payload = render_stats_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["pool_exhausted"], 17);
+    }
+
+    // ---- poisoned lock recovery ----
+
+    #[test]
+    fn test_sample_stats_rates_recovers_from_poisoned_mutex() {
+        let ctx = make_stats_context();
+        // Poison the rate_window mutex by panicking inside a held guard.
+        let ctx_for_poisoner = Arc::clone(&ctx);
+        let _ = std::thread::spawn(move || {
+            let _guard = ctx_for_poisoner.rate_window.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(ctx.rate_window.is_poisoned(), "precondition: mutex poisoned");
+
+        // Should not panic even though the mutex is poisoned.
+        let (inbound_bps, outbound_bps) = sample_stats_rates(&ctx, 0, 0, Instant::now());
+        assert_eq!(inbound_bps, 0);
+        assert_eq!(outbound_bps, 0);
+    }
+
+    #[test]
+    fn test_render_stats_payload_does_not_panic_on_poisoned_mutex() {
+        let ctx = make_stats_context();
+        let ctx_for_poisoner = Arc::clone(&ctx);
+        let _ = std::thread::spawn(move || {
+            let _guard = ctx_for_poisoner.rate_window.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(ctx.rate_window.is_poisoned());
+
+        let payload = render_stats_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["inbound_bps"], 0);
+        assert_eq!(parsed["outbound_bps"], 0);
+    }
+
+    #[test]
+    fn test_store_connections_snapshot_recovers_from_poisoned_rwlock() {
+        let ctx = make_stats_context();
+        let ctx_for_poisoner = Arc::clone(&ctx);
+        let _ = std::thread::spawn(move || {
+            let _guard = ctx_for_poisoner.connections_snapshot.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            ctx.connections_snapshot.is_poisoned(),
+            "precondition: rwlock poisoned"
+        );
+
+        // Storing should succeed even when poisoned.
+        let payload = "{\"timestamp\":1,\"connections\":[]}".to_string();
+        let stored = store_connections_snapshot(&ctx, payload.clone());
+        assert!(stored, "store must succeed despite poisoned RwLock");
+
+        // And the stored value is retrievable.
+        let readback = render_connections_snapshot_payload(&ctx);
+        assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn test_render_connections_snapshot_payload_recovers_from_poisoned_rwlock() {
+        let ctx = make_stats_context();
+        // Poison via write guard (Rust only marks RwLocks poisoned when the
+        // writer thread panics) with a pre-seeded payload value.
+        let ctx_for_poisoner = Arc::clone(&ctx);
+        let _ = std::thread::spawn(move || {
+            let mut snapshot = ctx_for_poisoner.connections_snapshot.write().unwrap();
+            *snapshot = "{\"timestamp\":9,\"connections\":[\"seeded\"]}".to_string();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(ctx.connections_snapshot.is_poisoned());
+
+        let payload = render_connections_snapshot_payload(&ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["timestamp"], 9);
     }
 }

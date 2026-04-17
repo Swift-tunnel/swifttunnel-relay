@@ -74,6 +74,25 @@ $SSH_CMD "$SERVER" "
     $SUDO mv -f /usr/local/bin/swifttunnel-relay.new /usr/local/bin/swifttunnel-relay
     $SUDO cp v3-relay.service /etc/systemd/system/
 
+    # Ensure env + forced UDP-TUN rollback override exist
+    $SUDO mkdir -p /etc/swifttunnel
+    $SUDO mkdir -p /etc/systemd/system/v3-relay.service.d
+    if [ ! -f /etc/swifttunnel/relay.env ]; then
+        $SUDO touch /etc/swifttunnel/relay.env
+    fi
+    grep -q '^RELAY_STATS_PORT=' /etc/swifttunnel/relay.env || echo 'RELAY_STATS_PORT=51822' | $SUDO tee -a /etc/swifttunnel/relay.env >/dev/null
+    grep -q '^RELAY_FLOW_CHANNEL_CAPACITY=' /etc/swifttunnel/relay.env || echo 'RELAY_FLOW_CHANNEL_CAPACITY=256' | $SUDO tee -a /etc/swifttunnel/relay.env >/dev/null
+    cat > /tmp/10-env.conf <<EOF
+[Service]
+EnvironmentFile=/etc/swifttunnel/relay.env
+EOF
+    $SUDO mv -f /tmp/10-env.conf /etc/systemd/system/v3-relay.service.d/10-env.conf
+    cat > /tmp/90-disable-tun-udp.conf <<EOF
+[Service]
+Environment=RELAY_TUN_UDP=false
+EOF
+    $SUDO mv -f /tmp/90-disable-tun-udp.conf /etc/systemd/system/v3-relay.service.d/90-disable-tun-udp.conf
+
     # Enable and start
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable v3-relay

@@ -274,6 +274,10 @@ sudo systemctl start swifttunnel-relay
 
 When `RELAY_TUN_UDP=true`, the relay creates a TUN device (`swifttun0`) and forwards full UDP IPv4 packets through the Linux kernel instead of maintaining per-flow UDP sockets in user-space. The client framing stays the same (`[session_id][ip packet]`), but the relay rewrites the inner source IP to a per-session TUN IP and lets the kernel handle routing/NAT on the server side.
 
+This path is currently not recommended for production rollout. Keep
+`RELAY_TUN_UDP=false` unless you are doing a short-lived canary while actively
+measuring latency and jitter.
+
 Fragmented IPv4 packets stay fragment-safe on this path: after the relay rewrites
 the inner source/destination IP, it refreshes the IPv4 header checksum on every
 fragment, updates the transport checksum pseudo-header only on fragment `0`, and
@@ -293,11 +297,19 @@ sudo ./setup-tun.sh
 
 This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds the FORWARD rules needed for return traffic. The relay now brings `swifttun0` up and reapplies `10.200.0.1/16` on every start, so you no longer need a separate manual `ip addr add ... && ip link set ... up` step after restarts.
 
-**Enable:**
+**Experimental enablement only:**
 ```bash
 # Via systemd drop-in
 sudo mkdir -p /etc/systemd/system/v3-relay.service.d
 echo -e '[Service]\nEnvironment=RELAY_TUN_UDP=true' | sudo tee /etc/systemd/system/v3-relay.service.d/20-tun-udp.conf
+sudo systemctl daemon-reload
+sudo systemctl restart v3-relay
+```
+
+**Rollback / production override:**
+```bash
+sudo mkdir -p /etc/systemd/system/v3-relay.service.d
+echo -e '[Service]\nEnvironment=RELAY_TUN_UDP=false' | sudo tee /etc/systemd/system/v3-relay.service.d/90-disable-tun-udp.conf
 sudo systemctl daemon-reload
 sudo systemctl restart v3-relay
 ```
@@ -427,6 +439,12 @@ curl -s \
 - `dropped_in`
 - `dropped_out`
 - `dropped_pps`
+- `pool_exhausted` - datapath v2 buffer-pool acquire failures; a non-zero rate
+  means `RELAY_V2_POOL_SLOTS` needs to be raised. Also contributes to
+  `dropped_out`, so the two counters together let you split "queue full" from
+  "pool empty" drops.
+- `tcp_forwarded`
+- `tun_udp_forwarded`
 
 Use `/v1/connections` when you need exact per-session identity details. The stats endpoint intentionally avoids walking the live session map so heartbeat/admin counters stay responsive under load even if detailed connection scans get stuck. `/v1/connections` itself is served from a cached snapshot refreshed once per second, and the localhost HTTP listener now runs on dedicated blocking threads so local observability polling cannot pile up on the Tokio runtime.
 

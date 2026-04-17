@@ -95,6 +95,20 @@ sudo systemctl daemon-reload
 sudo systemctl restart v3-relay
 ```
 
+For production rollback or to force UDP back onto the direct relay path, pin a
+high-precedence override instead of trusting earlier drop-ins to be removed:
+
+```bash
+sudo mkdir -p /etc/systemd/system/v3-relay.service.d
+sudo tee /etc/systemd/system/v3-relay.service.d/90-disable-tun-udp.conf >/dev/null <<'EOF'
+[Service]
+Environment=RELAY_TUN_UDP=false
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart v3-relay
+```
+
 `setup-tun.sh` only needs to install the NAT/FORWARD prerequisites. The relay itself now re-applies `swifttun0` link-up state and `10.200.0.1/16` on every start, so a plain service restart should not leave the TUN device down/unaddressed anymore.
 
 ## Canary Verification Checklist
@@ -129,6 +143,10 @@ Expected:
 9. `relay-speedtest.py client ...` completes an upload/download run against the destination host and reports non-zero throughput instead of timing out.
    For larger sweeps, keep the pacing flags in the command above so the harness
    does not manufacture burst loss on its own.
+10. `/v1/stats` `pool_exhausted` counter should stay flat during normal load. If
+    it grows steadily on a canary, raise `RELAY_V2_POOL_SLOTS` before widening
+    the rollout — a rising `pool_exhausted` rate means datapath v2 is dropping
+    response packets because the buffer pool is under-sized for this host.
 
 If any check fails, stop rollout and rollback that server.
 

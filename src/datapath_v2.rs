@@ -454,6 +454,7 @@ fn run_shard(
 
                         let Some(buf_idx) = pool.try_acquire() else {
                             stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+                            stats.pool_exhausted.fetch_add(1, Ordering::Relaxed);
                             break;
                         };
 
@@ -895,6 +896,7 @@ pub(super) async fn run_datapath_v2(
             let bytes_out = stats_log.bytes_out.load(Ordering::Relaxed);
             let dropped_in = stats_log.dropped_in.load(Ordering::Relaxed);
             let dropped_out = stats_log.dropped_out.load(Ordering::Relaxed);
+            let pool_exhausted = stats_log.pool_exhausted.load(Ordering::Relaxed);
 
             let flows: u64 = flow_counts_log
                 .iter()
@@ -903,7 +905,7 @@ pub(super) async fn run_datapath_v2(
             stats_log.active_flows.store(flows, Ordering::Relaxed);
 
             log::info!(
-                "Stats: in={} out={} ({:.1}/{:.1} MB), {:.0} pkt/s, sessions={}, flows={}, dropped={}+{}",
+                "Stats: in={} out={} ({:.1}/{:.1} MB), {:.0} pkt/s, sessions={}, flows={}, dropped={}+{}, pool_exhausted={}",
                 pkts_in,
                 pkts_out,
                 bytes_in as f64 / 1_000_000.0,
@@ -913,6 +915,7 @@ pub(super) async fn run_datapath_v2(
                 flows,
                 dropped_in,
                 dropped_out,
+                pool_exhausted,
             );
         }
     });
@@ -957,14 +960,20 @@ pub(super) async fn run_datapath_v2(
                 let now_unix = super::unix_timestamp_secs();
 
                 let mut session_authenticated = false;
+                let auth_required = auth_config_rx.mode.requires_auth();
                 match sessions_rx.entry(session_id) {
                     dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                         let session = entry.get_mut();
-                        session.client_addr = client_addr;
-                        session.last_activity = now;
-                        session.last_activity_unix = now_unix;
                         session_authenticated =
                             matches!(session.auth_state, super::SessionAuthState::Authenticated);
+                        // Only trust client_addr updates from authenticated traffic when auth is
+                        // required; otherwise an unauthenticated attacker with a known session_id
+                        // can rewrite the session's observed client endpoint.
+                        if !auth_required || session_authenticated {
+                            session.client_addr = client_addr;
+                            session.last_activity = now;
+                            session.last_activity_unix = now_unix;
+                        }
                     }
                     dashmap::mapref::entry::Entry::Vacant(entry) => {
                         entry.insert(super::SessionEntry {
@@ -1333,6 +1342,7 @@ fn send_small_control_frame(
 ) {
     let Some(buf_idx) = pool.try_acquire() else {
         stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+        stats.pool_exhausted.fetch_add(1, Ordering::Relaxed);
         return;
     };
 

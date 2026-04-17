@@ -118,6 +118,10 @@ cat > /etc/systemd/system/v3-relay.service.d/10-env.conf <<EOF
 [Service]
 EnvironmentFile=/etc/swifttunnel/relay.env
 EOF
+cat > /etc/systemd/system/v3-relay.service.d/90-disable-tun-udp.conf <<EOF
+[Service]
+Environment=RELAY_TUN_UDP=false
+EOF
 
 systemctl daemon-reload
 systemctl enable v3-relay >/dev/null 2>&1 || true

@@ -22,6 +22,7 @@ source "$SCRIPT_DIR/deploy-utils.sh"
 
 SSH_PASS="${SWIFTTUNNEL_SSH_PASS:-}"
 DO_SSH_PASS="${SWIFTTUNNEL_DO_SSH_PASS:-}"
+ROLLBACK_TUN_UDP_ONLY="${ROLLBACK_TUN_UDP_ONLY:-0}"
 
 if [ -z "$SSH_PASS" ]; then
     SSH_PASS="$(get_generic_pass || true)"
@@ -110,41 +111,45 @@ scp_pass() {
     SSHPASS="$SSH_PASS" sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 "$@"
 }
 
-# Step 1: Build on remote server
-echo "📦 Step 1: Building on $BUILD_SERVER..."
-echo
+if [ "$ROLLBACK_TUN_UDP_ONLY" = "1" ]; then
+    echo "⚠️  Rollback-only mode: skipping build and binary copy"
+else
+    # Step 1: Build on remote server
+    echo "📦 Step 1: Building on $BUILD_SERVER..."
+    echo
 
-# Copy source to build server
-ssh_pass "$BUILD_SERVER" "rm -rf $BUILD_DIR && mkdir -p $BUILD_DIR/src"
-scp_pass "$SCRIPT_DIR/Cargo.lock" "$BUILD_SERVER:$BUILD_DIR/" 2>/dev/null || true
-scp_pass "$SCRIPT_DIR/Cargo.toml" "$BUILD_SERVER:$BUILD_DIR/"
-scp_pass "$SCRIPT_DIR/src/main.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
-scp_pass "$SCRIPT_DIR/src/datapath_v2.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
-scp_pass "$SCRIPT_DIR/src/tcp_tun.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
+    # Copy source to build server
+    ssh_pass "$BUILD_SERVER" "rm -rf $BUILD_DIR && mkdir -p $BUILD_DIR/src"
+    scp_pass "$SCRIPT_DIR/Cargo.lock" "$BUILD_SERVER:$BUILD_DIR/" 2>/dev/null || true
+    scp_pass "$SCRIPT_DIR/Cargo.toml" "$BUILD_SERVER:$BUILD_DIR/"
+    scp_pass "$SCRIPT_DIR/src/main.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
+    scp_pass "$SCRIPT_DIR/src/datapath_v2.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
+    scp_pass "$SCRIPT_DIR/src/tcp_tun.rs" "$BUILD_SERVER:$BUILD_DIR/src/"
 
-# Install Rust if needed and build
-ssh_pass "$BUILD_SERVER" "
-    # Install Rust if not present
-    if ! command -v cargo &> /dev/null; then
-        echo 'Installing Rust...'
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source ~/.cargo/env
-    fi
+    # Install Rust if needed and build
+    ssh_pass "$BUILD_SERVER" "
+        # Install Rust if not present
+        if ! command -v cargo &> /dev/null; then
+            echo 'Installing Rust...'
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source ~/.cargo/env
+        fi
 
-    # Build release
-    cd $BUILD_DIR
-    source ~/.cargo/env 2>/dev/null || true
-    cargo build --release
+        # Build release
+        cd $BUILD_DIR
+        source ~/.cargo/env 2>/dev/null || true
+        cargo build --release
 
-    # Copy binary to known location
-    cp target/release/$BINARY_NAME /tmp/$BINARY_NAME
-    chmod +x /tmp/$BINARY_NAME
-    echo 'Build complete!'
-"
+        # Copy binary to known location
+        cp target/release/$BINARY_NAME /tmp/$BINARY_NAME
+        chmod +x /tmp/$BINARY_NAME
+        echo 'Build complete!'
+    "
 
-# Download the built binary
-echo "📥 Downloading binary from build server..."
-scp_pass "$BUILD_SERVER:/tmp/$BINARY_NAME" "/tmp/$BINARY_NAME"
+    # Download the built binary
+    echo "📥 Downloading binary from build server..."
+    scp_pass "$BUILD_SERVER:/tmp/$BINARY_NAME" "/tmp/$BINARY_NAME"
+fi
 
 # Step 2: Deploy to all servers
 echo
@@ -176,29 +181,35 @@ deploy_to_server() {
         export SSHPASS="$password"
     fi
 
-    # Copy binary
-    if ! $scp_cmd "/tmp/$BINARY_NAME" "$server:/tmp/$BINARY_NAME" 2>/dev/null; then
-        echo "❌ Failed to copy binary"
-        unset SSHPASS 2>/dev/null
-        return 1
-    fi
+    if [ "$ROLLBACK_TUN_UDP_ONLY" != "1" ]; then
+        # Copy binary
+        if ! $scp_cmd "/tmp/$BINARY_NAME" "$server:/tmp/$BINARY_NAME" 2>/dev/null; then
+            echo "❌ Failed to copy binary"
+            unset SSHPASS 2>/dev/null
+            return 1
+        fi
 
-    # Copy service file
-    if ! $scp_cmd "$SCRIPT_DIR/$SERVICE_FILE" "$server:/tmp/$SERVICE_FILE" 2>/dev/null; then
-        echo "❌ Failed to copy service file"
-        unset SSHPASS 2>/dev/null
-        return 1
+        # Copy service file
+        if ! $scp_cmd "$SCRIPT_DIR/$SERVICE_FILE" "$server:/tmp/$SERVICE_FILE" 2>/dev/null; then
+            echo "❌ Failed to copy service file"
+            unset SSHPASS 2>/dev/null
+            return 1
+        fi
     fi
 
     # Install, configure env, and start service
     if ! $ssh_cmd "$server" "
-        # Stop first; atomic replace avoids ETXTBSY and cross-fs mv weirdness
-        $sudo_prefix systemctl stop v3-relay >/dev/null 2>&1 || true
-        $sudo_prefix mkdir -p /usr/local/bin
-        $sudo_prefix mv /tmp/$BINARY_NAME ${REMOTE_BIN}.new
-        $sudo_prefix chmod +x ${REMOTE_BIN}.new
-        $sudo_prefix mv -f ${REMOTE_BIN}.new $REMOTE_BIN
-        $sudo_prefix mv /tmp/$SERVICE_FILE $REMOTE_SERVICE
+        set -e
+
+        if [ \"$ROLLBACK_TUN_UDP_ONLY\" != '1' ]; then
+            # Stop first; atomic replace avoids ETXTBSY and cross-fs mv weirdness
+            $sudo_prefix systemctl stop v3-relay >/dev/null 2>&1 || true
+            $sudo_prefix mkdir -p /usr/local/bin
+            $sudo_prefix mv /tmp/$BINARY_NAME ${REMOTE_BIN}.new
+            $sudo_prefix chmod +x ${REMOTE_BIN}.new
+            $sudo_prefix mv -f ${REMOTE_BIN}.new $REMOTE_BIN
+            $sudo_prefix mv /tmp/$SERVICE_FILE $REMOTE_SERVICE
+        fi
 
         # Ensure env + token for localhost stats exists (needed by status/observability)
         $sudo_prefix mkdir -p /etc/swifttunnel
@@ -222,9 +233,18 @@ deploy_to_server() {
 EnvironmentFile=/etc/swifttunnel/relay.env
 EOF
         $sudo_prefix mv -f /tmp/10-env.conf /etc/systemd/system/v3-relay.service.d/10-env.conf
+        cat > /tmp/90-disable-tun-udp.conf <<'EOF'
+[Service]
+Environment=RELAY_TUN_UDP=false
+EOF
+        $sudo_prefix mv -f /tmp/90-disable-tun-udp.conf /etc/systemd/system/v3-relay.service.d/90-disable-tun-udp.conf
         $sudo_prefix systemctl daemon-reload
-        $sudo_prefix systemctl enable v3-relay
-        $sudo_prefix systemctl start v3-relay
+        $sudo_prefix systemctl enable v3-relay >/dev/null 2>&1 || true
+        if [ \"$ROLLBACK_TUN_UDP_ONLY\" = '1' ]; then
+            $sudo_prefix systemctl restart v3-relay
+        else
+            $sudo_prefix systemctl start v3-relay
+        fi
 
         # Open firewall port
         if command -v ufw &> /dev/null; then
@@ -339,6 +359,8 @@ echo "  ❌ Failed:  $FAILED servers"
 echo "════════════════════════════════════════════"
 
 # Cleanup
-rm -f "/tmp/$BINARY_NAME"
+if [ "$ROLLBACK_TUN_UDP_ONLY" != "1" ]; then
+    rm -f "/tmp/$BINARY_NAME"
+fi
 
 exit 0
