@@ -62,9 +62,6 @@ SERVERS=(
     # OVH servers (password auth)
     "root@51.79.128.67"     # singapore-02
     "root@148.113.44.43"    # mumbai-02
-
-    # Kamatera
-    "root@103.125.219.188"  # tokyo-05
 )
 
 # Vultr US servers (SSH key auth)
