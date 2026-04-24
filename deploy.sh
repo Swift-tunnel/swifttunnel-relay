@@ -23,6 +23,7 @@ source "$SCRIPT_DIR/deploy-utils.sh"
 SSH_PASS="${SWIFTTUNNEL_SSH_PASS:-}"
 DO_SSH_PASS="${SWIFTTUNNEL_DO_SSH_PASS:-}"
 ROLLBACK_TUN_UDP_ONLY="${ROLLBACK_TUN_UDP_ONLY:-0}"
+SG02_DEPLOY_HOST="${SWIFTTUNNEL_SG02_DEPLOY_HOST:-}"
 
 if [ -z "$SSH_PASS" ]; then
     SSH_PASS="$(get_generic_pass || true)"
@@ -60,9 +61,18 @@ SERVERS=(
     "root@216.238.121.139"  # brazil-03 (vultr)
 
     # OVH servers (password auth)
-    "root@51.79.128.67"     # singapore-02
     "root@148.113.44.43"    # mumbai-02
 )
+
+if [ -n "$SG02_DEPLOY_HOST" ]; then
+    if [[ "$SG02_DEPLOY_HOST" == *@* ]]; then
+        SERVERS+=("$SG02_DEPLOY_HOST") # singapore-02
+    else
+        SERVERS+=("root@$SG02_DEPLOY_HOST") # singapore-02
+    fi
+else
+    echo "Skipping singapore-02 deploy target; set SWIFTTUNNEL_SG02_DEPLOY_HOST to include it."
+fi
 
 # Vultr US servers (SSH key auth)
 VULTR_US_KEY_FILE="$HOME/.ssh/swifttunnel-vultr-us"

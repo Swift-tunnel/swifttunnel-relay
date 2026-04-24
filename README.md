@@ -51,7 +51,7 @@ Concurrency note:
 - **Soft-delete with grace period** - Late packets can revive sessions
 - **RTT/jitter ping (optional)** - ping/pong control frames for benchmarking/telemetry
 - **TUN-backed IP forwarding (optional)** - Routes TCP and, optionally, UDP packets through a Linux TUN device (`RELAY_TCP_ENABLED=true`, `RELAY_TUN_UDP=true`)
-- **Authenticated localhost telemetry API** - `/v1/stats` and `/v1/connections`, served from a dedicated localhost listener so relay telemetry does not depend on the Tokio worker pool
+- **Authenticated localhost telemetry API** - `/v1/stats`, `/v1/config`, and `/v1/connections`, served from a dedicated localhost listener so relay telemetry does not depend on the Tokio worker pool
 
 ## Installation
 
@@ -99,16 +99,16 @@ Use the bundled control-plane probe to measure relay RTT, jitter, and loss from 
 
 ```bash
 # Single relay
-python3 probe-relay.py 45.32.115.254
+python3 probe-relay.py <relay-host>
 
 # Include ICMP baseline and run 10 repeats
-python3 probe-relay.py --icmp --repeat 10 45.32.115.254
+python3 probe-relay.py --icmp --repeat 10 <relay-host>
 
 # Compare multiple relays side by side
-python3 probe-relay.py --icmp 45.32.115.254 54.255.205.216 45.32.253.124
+python3 probe-relay.py --icmp <relay-host-a> <relay-host-b> <relay-host-c>
 
 # Auth-required relay
-python3 probe-relay.py --ticket-file /path/to/relay-ticket.txt 45.32.115.254
+python3 probe-relay.py --ticket-file /path/to/relay-ticket.txt <relay-host>
 ```
 
 This uses the relay's `0xA3`/`0xA4` ping/pong frames, so it measures client-to-relay control-plane RTT and loss. It does not send tunneled DNS/game packets.
@@ -139,8 +139,8 @@ relay, for example `Mac -> singapore-03 relay -> singapore-06 speedtest`:
 
 ```bash
 python3 relay-speedtest.py client \
-  --relay-host 45.32.115.254 \
-  --target-host 104.64.209.241 \
+  --relay-host <relay-host> \
+  --target-host <target-host> \
   --target-port 9000 \
   --payload-bytes 1200 \
   --upload-packets 4000 \
@@ -180,6 +180,16 @@ the harness does not create its own burst loss and falsely implicate the relay.
 | `RELAY_TCP_ENABLED` | `false` | Enable TCP tunneling via TUN device (Linux only, requires `setup-tun.sh`) |
 | `RELAY_TUN_UDP` | `false` | Forward UDP IPv4 packets through the Linux TUN device instead of per-flow sockets (Linux only, requires `setup-tun.sh`) |
 | `RUST_LOG` | `info` | Log level (trace, debug, info, warn, error) |
+
+### Telemetry Payloads
+
+When `RELAY_STATS_TOKEN` is set, the localhost stats API exposes:
+
+- `GET /v1/stats`: traffic counters, pool exhaustion, drop-reason counters, and runtime config.
+- `GET /v1/config`: relay version, datapath, auth mode, server ID, TUN flags, queue sizes, and requested/effective socket buffers.
+- `GET /v1/connections`: session-level connection snapshot.
+
+Drop reasons currently include auth, parse, fragment, pool, shard queue, TX queue, TUN queue, flow queue, flow create, flow send, and socket send failures.
 
 ### systemd Service
 
@@ -396,7 +406,7 @@ journalctl -u swifttunnel-relay -f
 
 Quick local probe:
 ```bash
-python3 probe-relay.py --icmp 45.32.115.254
+python3 probe-relay.py --icmp <relay-host>
 ```
 
 ### Localhost Telemetry API
@@ -411,6 +421,7 @@ Authentication header (required):
 
 Available endpoints:
 - `GET /v1/stats` - relay-level counters and rates (card-safe, does not scan live session maps)
+- `GET /v1/config` - runtime datapath/auth/server/socket-buffer configuration
 - `GET /v1/connections` - live session rows (`user_id`, `session_id`, `auth_state`, activity, bytes, endpoint)
 
 Current `user_id` behavior:
@@ -422,6 +433,10 @@ Example:
 curl -s \
   -H "Authorization: Bearer $RELAY_STATS_TOKEN" \
   http://127.0.0.1:51822/v1/stats
+
+curl -s \
+  -H "Authorization: Bearer $RELAY_STATS_TOKEN" \
+  http://127.0.0.1:51822/v1/config
 
 curl -s \
   -H "Authorization: Bearer $RELAY_STATS_TOKEN" \
@@ -443,6 +458,9 @@ curl -s \
   means `RELAY_V2_POOL_SLOTS` needs to be raised. Also contributes to
   `dropped_out`, so the two counters together let you split "queue full" from
   "pool empty" drops.
+- `drops` - per-reason drop counters for auth, parse, queue, pool, TUN, flow,
+  and socket-send failure paths.
+- `config` - same runtime configuration object returned by `/v1/config`.
 - `tcp_forwarded`
 - `tun_udp_forwarded`
 
