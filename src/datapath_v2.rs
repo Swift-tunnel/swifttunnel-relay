@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::env;
@@ -28,6 +28,28 @@ const DEFAULT_SOCKET_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
 
 const DEFAULT_FLOW_SOCKET_RCVBUF_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_FLOW_SOCKET_SNDBUF_BYTES: usize = 2 * 1024 * 1024;
+const MAX_FLOW_RECV_BURST: usize = 64;
+const MAX_INBOX_DRAIN_BURST: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RelayV2Tuning {
+    pub shard_count: usize,
+    pub pool_slots: usize,
+    pub shard_queue_cap: usize,
+    pub tx_queue_cap: usize,
+    pub socket_rcvbuf_bytes: usize,
+    pub socket_sndbuf_bytes: usize,
+    pub flow_rcvbuf_bytes: usize,
+    pub flow_sndbuf_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SocketBufferSizes {
+    pub requested_rcvbuf_bytes: usize,
+    pub requested_sndbuf_bytes: usize,
+    pub effective_rcvbuf_bytes: usize,
+    pub effective_sndbuf_bytes: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Selectable relay datapath implementation.
@@ -134,6 +156,19 @@ fn get_flow_socket_sndbuf_bytes() -> usize {
     )
 }
 
+pub(super) fn relay_v2_tuning() -> RelayV2Tuning {
+    RelayV2Tuning {
+        shard_count: get_shard_count(),
+        pool_slots: get_pool_slots(),
+        shard_queue_cap: get_shard_queue_cap(),
+        tx_queue_cap: get_tx_queue_cap(),
+        socket_rcvbuf_bytes: get_socket_rcvbuf_bytes(),
+        socket_sndbuf_bytes: get_socket_sndbuf_bytes(),
+        flow_rcvbuf_bytes: get_flow_socket_rcvbuf_bytes(),
+        flow_sndbuf_bytes: get_flow_socket_sndbuf_bytes(),
+    }
+}
+
 /// Fixed-size pool of packet buffers shared across RX/TX/shards.
 struct BufferPool {
     buffers: Vec<UnsafeCell<[u8; super::MAX_PACKET_SIZE]>>,
@@ -179,6 +214,7 @@ impl BufferPool {
     }
 
     /// Get a mutable reference to the buffer for `idx`.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn buffer_mut(&self, idx: usize) -> &mut [u8; super::MAX_PACKET_SIZE] {
         &mut *self.buffers[idx].get()
     }
@@ -230,6 +266,31 @@ struct TxPacket {
     len: usize,
 }
 
+fn supervise_critical_thread(
+    name: String,
+    handle: std::thread::JoinHandle<Result<()>>,
+) -> Result<()> {
+    let supervisor_name = format!("{}-supervisor", name);
+    std::thread::Builder::new()
+        .name(supervisor_name)
+        .spawn(move || {
+            match handle.join() {
+                Ok(Ok(())) => {
+                    log::error!("{} thread exited unexpectedly", name);
+                }
+                Ok(Err(e)) => {
+                    log::error!("{} thread exited with error: {}", name, e);
+                }
+                Err(panic) => {
+                    log::error!("{} thread panicked: {:?}", name, panic);
+                }
+            }
+            std::process::exit(70);
+        })
+        .context("Failed to spawn critical thread supervisor")?;
+    Ok(())
+}
+
 /// Select a shard index for a given session ID.
 fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize) -> usize {
     // Mix the raw session_id to avoid shard hotspots if session IDs aren't uniformly random.
@@ -244,23 +305,36 @@ fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize
 }
 
 /// Bind the relay's main UDP socket (client-facing) with tuned buffer sizes.
-pub(super) fn bind_main_socket(listen_port: u16) -> Result<UdpSocket> {
+pub(super) fn bind_main_socket(listen_port: u16) -> Result<(UdpSocket, SocketBufferSizes)> {
+    let tuning = relay_v2_tuning();
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("Failed to create UDP socket")?;
     socket
         .set_reuse_address(true)
         .context("Failed to set SO_REUSEADDR")?;
     socket
-        .set_recv_buffer_size(get_socket_rcvbuf_bytes())
+        .set_recv_buffer_size(tuning.socket_rcvbuf_bytes)
         .context("Failed to set SO_RCVBUF")?;
     socket
-        .set_send_buffer_size(get_socket_sndbuf_bytes())
+        .set_send_buffer_size(tuning.socket_sndbuf_bytes)
         .context("Failed to set SO_SNDBUF")?;
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port);
     socket
         .bind(&addr.into())
         .context("Failed to bind UDP socket")?;
-    Ok(socket.into())
+    let std_socket: UdpSocket = socket.into();
+    let sock_ref = SockRef::from(&std_socket);
+    let effective_rcvbuf_bytes = sock_ref.recv_buffer_size().unwrap_or(0);
+    let effective_sndbuf_bytes = sock_ref.send_buffer_size().unwrap_or(0);
+    Ok((
+        std_socket,
+        SocketBufferSizes {
+            requested_rcvbuf_bytes: tuning.socket_rcvbuf_bytes,
+            requested_sndbuf_bytes: tuning.socket_sndbuf_bytes,
+            effective_rcvbuf_bytes,
+            effective_sndbuf_bytes,
+        },
+    ))
 }
 
 /// Create and connect a per-flow UDP socket to the target game address.
@@ -440,8 +514,8 @@ fn run_shard(
                 continue;
             };
 
-            // Drain all available datagrams.
-            loop {
+            // Drain a bounded burst so one hot game flow cannot monopolize the shard.
+            for _ in 0..MAX_FLOW_RECV_BURST {
                 match flow.socket.recv(&mut recv_buf) {
                     Ok(len) => {
                         flow.last_activity = Instant::now();
@@ -453,7 +527,7 @@ fn run_shard(
                         }
 
                         let Some(buf_idx) = pool.try_acquire() else {
-                            stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+                            stats.drop_out(super::DropReason::Pool);
                             stats.pool_exhausted.fetch_add(1, Ordering::Relaxed);
                             break;
                         };
@@ -483,7 +557,7 @@ fn run_shard(
                         };
 
                         if tx_data.try_send(packet).is_err() {
-                            stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+                            stats.drop_out(super::DropReason::TxQueue);
                             pool.release(buf_idx);
                         }
                     }
@@ -503,7 +577,10 @@ fn run_shard(
         }
 
         // Drain inbox (woken by RX thread).
-        while let Ok(msg) = inbox.try_recv() {
+        for _ in 0..MAX_INBOX_DRAIN_BURST {
+            let Ok(msg) = inbox.try_recv() else {
+                break;
+            };
             match msg {
                 ShardMsg::ClientPacket {
                     session_id,
@@ -530,6 +607,7 @@ fn run_shard(
                                         game_addr,
                                         e
                                     );
+                                    stats.drop_in(super::DropReason::FlowCreate);
                                     pool.release(payload_idx);
                                     continue;
                                 }
@@ -542,6 +620,7 @@ fn run_shard(
                                     shard_id,
                                     flows.len()
                                 );
+                                stats.drop_in(super::DropReason::FlowCreate);
                                 pool.release(payload_idx);
                                 continue;
                             };
@@ -555,6 +634,7 @@ fn run_shard(
                                     game_addr,
                                     e
                                 );
+                                stats.drop_in(super::DropReason::FlowCreate);
                                 pool.release(payload_idx);
                                 continue;
                             }
@@ -586,7 +666,7 @@ fn run_shard(
                     match send_result {
                         Ok(_) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            stats.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            stats.drop_in(super::DropReason::FlowSend);
                         }
                         Err(e) => {
                             log::debug!(
@@ -693,6 +773,7 @@ pub(super) async fn run_datapath_v2(
     stats_port: u16,
     stats_token: Option<String>,
     auth_config: super::RelayAuthConfig,
+    runtime_config: super::RelayRuntimeConfig,
     stats: Arc<super::Stats>,
     started_at: Instant,
     tun_tx_sender: Option<crossbeam_channel::Sender<super::tcp_tun::InboundTunPacket>>,
@@ -701,10 +782,11 @@ pub(super) async fn run_datapath_v2(
     tcp_enabled: bool,
     session_traffic: Arc<DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>>,
 ) -> Result<()> {
-    let shard_count = get_shard_count();
-    let shard_queue_cap = get_shard_queue_cap();
-    let tx_queue_cap = get_tx_queue_cap();
-    let pool_slots = get_pool_slots();
+    let tuning = relay_v2_tuning();
+    let shard_count = tuning.shard_count;
+    let shard_queue_cap = tuning.shard_queue_cap;
+    let tx_queue_cap = tuning.tx_queue_cap;
+    let pool_slots = tuning.pool_slots;
 
     log::info!("Relay datapath: v2 (sharded)");
     log::info!("  Shards: {} (env RELAY_SHARDS)", shard_count);
@@ -723,6 +805,7 @@ pub(super) async fn run_datapath_v2(
             sessions: Arc::clone(&sessions),
             session_traffic: Arc::clone(&session_traffic),
             stats: Arc::clone(&stats),
+            runtime_config: runtime_config.clone(),
             started_at,
             rate_window: std::sync::Mutex::new(super::StatsRateWindow::new()),
             connections_snapshot: std::sync::RwLock::new(super::empty_connections_payload()),
@@ -797,7 +880,7 @@ pub(super) async fn run_datapath_v2(
         let flow_counts = Arc::clone(&flow_counts);
         let waker_pub = waker_pub_s.clone();
 
-        std::thread::Builder::new()
+        let shard_handle = std::thread::Builder::new()
             .name(format!("relay-shard-{}", shard_id))
             .spawn(move || -> Result<()> {
                 run_shard(
@@ -813,6 +896,7 @@ pub(super) async fn run_datapath_v2(
                 )
             })
             .context("Failed to spawn shard thread")?;
+        supervise_critical_thread(format!("relay-shard-{}", shard_id), shard_handle)?;
     }
     drop(waker_pub_s);
 
@@ -950,6 +1034,7 @@ pub(super) async fn run_datapath_v2(
                 stats_rx.bytes_in.fetch_add(len as u64, Ordering::Relaxed);
 
                 if len < super::SESSION_ID_LEN {
+                    stats_rx.drop_in(super::DropReason::TooSmall);
                     continue;
                 }
 
@@ -1059,7 +1144,7 @@ pub(super) async fn run_datapath_v2(
                     && buf[super::SESSION_ID_LEN] == super::PING_FRAME_TYPE
                 {
                     if auth_config_rx.mode.requires_auth() && !session_authenticated {
-                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        stats_rx.drop_in(super::DropReason::Auth);
                         continue;
                     }
 
@@ -1082,7 +1167,8 @@ pub(super) async fn run_datapath_v2(
                     let server_rx_ts_mono_ms = super::mono_timestamp_ms();
 
                     let Some(buf_idx) = pool_rx.try_acquire() else {
-                        stats_rx.dropped_out.fetch_add(1, Ordering::Relaxed);
+                        stats_rx.drop_out(super::DropReason::Pool);
+                        stats_rx.pool_exhausted.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
 
@@ -1106,7 +1192,7 @@ pub(super) async fn run_datapath_v2(
                         len: out_len,
                     };
                     if tx_control_rx.try_send(packet).is_err() {
-                        stats_rx.dropped_out.fetch_add(1, Ordering::Relaxed);
+                        stats_rx.drop_out(super::DropReason::TxQueue);
                         pool_rx.release(buf_idx);
                     }
                     continue;
@@ -1123,7 +1209,7 @@ pub(super) async fn run_datapath_v2(
                     && buf[super::SESSION_ID_LEN] == super::RTT_REPORT_FRAME_TYPE
                 {
                     if auth_config_rx.mode.requires_auth() && !session_authenticated {
-                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        stats_rx.drop_in(super::DropReason::Auth);
                         continue;
                     }
                     let rtt_us = u32::from_be_bytes([
@@ -1144,7 +1230,7 @@ pub(super) async fn run_datapath_v2(
                 // Keepalive:
                 if len == super::SESSION_ID_LEN {
                     if auth_config_rx.mode.requires_auth() && !session_authenticated {
-                        stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                        stats_rx.drop_in(super::DropReason::Auth);
                         continue;
                     }
 
@@ -1157,7 +1243,7 @@ pub(super) async fn run_datapath_v2(
                             })
                             .is_err()
                         {
-                            stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            stats_rx.drop_in(super::DropReason::ShardQueue);
                         } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
                             let _ = waker.wake();
                         }
@@ -1166,33 +1252,82 @@ pub(super) async fn run_datapath_v2(
                 }
 
                 if auth_config_rx.mode.requires_auth() && !session_authenticated {
-                    stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                    stats_rx.drop_in(super::DropReason::Auth);
                     continue;
                 }
 
                 if len < super::SESSION_ID_LEN + super::IP_HEADER_MIN {
+                    stats_rx.drop_in(super::DropReason::TooSmall);
                     continue;
                 }
 
                 let ip_packet = &buf[super::SESSION_ID_LEN..len];
                 let parsed = match super::parse_ip_packet_full(ip_packet) {
                     Some(p) => p,
-                    None => continue,
+                    None => {
+                        stats_rx.drop_in(super::DropReason::Parse);
+                        continue;
+                    }
                 };
 
                 match parsed {
+                    super::ParsedPacket::Fragment {
+                        protocol,
+                        src_ip,
+                        raw_ip_packet,
+                    } => {
+                        let can_tun = (protocol == 17 && tun_udp_enabled_rx)
+                            || (protocol == 6 && tcp_enabled_rx);
+                        if can_tun {
+                            if let Some(ref tun_sender) = tun_tx_sender_rx {
+                                if tun_sender
+                                    .try_send(super::tcp_tun::InboundTunPacket {
+                                        session_id,
+                                        client_addr,
+                                        raw_ip_packet: raw_ip_packet.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    stats_rx.drop_in(super::DropReason::TunQueue);
+                                } else if protocol == 6 {
+                                    stats_rx.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    stats_rx.tun_udp_forwarded.fetch_add(1, Ordering::Relaxed);
+                                }
+                            } else {
+                                stats_rx.drop_in(super::DropReason::TunQueue);
+                            }
+                        } else {
+                            stats_rx.drop_in(super::DropReason::Fragment);
+                        }
+                        if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                            if !matches!(
+                                session_entry.auth_state,
+                                super::SessionAuthState::Authenticated
+                            ) {
+                                session_entry.user_id = src_ip.to_string();
+                            }
+                        }
+                        continue;
+                    }
                     super::ParsedPacket::Tcp {
                         original_info,
                         raw_ip_packet,
                     } => {
                         if tcp_enabled_rx {
                             if let Some(ref tun_sender) = tun_tx_sender_rx {
-                                let _ = tun_sender.try_send(super::tcp_tun::InboundTunPacket {
-                                    session_id,
-                                    client_addr,
-                                    raw_ip_packet: raw_ip_packet.to_vec(),
-                                });
-                                stats_rx.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
+                                if tun_sender
+                                    .try_send(super::tcp_tun::InboundTunPacket {
+                                        session_id,
+                                        client_addr,
+                                        raw_ip_packet: raw_ip_packet.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    stats_rx.drop_in(super::DropReason::TunQueue);
+                                } else {
+                                    stats_rx.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
@@ -1209,17 +1344,24 @@ pub(super) async fn run_datapath_v2(
                         game_addr,
                         payload: udp_payload,
                         original_info,
+                        raw_ip_packet,
                     } => {
                         if tun_udp_enabled_rx {
                             if let Some(ref tun_sender) = tun_tx_sender_rx {
-                                let _ = tun_sender.try_send(super::tcp_tun::InboundTunPacket {
-                                    session_id,
-                                    client_addr,
-                                    raw_ip_packet: ip_packet.to_vec(),
-                                });
-                                stats_rx.tun_udp_forwarded.fetch_add(1, Ordering::Relaxed);
+                                if tun_sender
+                                    .try_send(super::tcp_tun::InboundTunPacket {
+                                        session_id,
+                                        client_addr,
+                                        raw_ip_packet: raw_ip_packet.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    stats_rx.drop_in(super::DropReason::TunQueue);
+                                } else {
+                                    stats_rx.tun_udp_forwarded.fetch_add(1, Ordering::Relaxed);
+                                }
                             } else {
-                                stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                                stats_rx.drop_in(super::DropReason::TunQueue);
                             }
                             if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
                                 if !matches!(
@@ -1242,7 +1384,8 @@ pub(super) async fn run_datapath_v2(
                         }
 
                         let Some(payload_idx) = pool_rx.try_acquire() else {
-                            stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            stats_rx.drop_in(super::DropReason::Pool);
+                            stats_rx.pool_exhausted.fetch_add(1, Ordering::Relaxed);
                             continue;
                         };
 
@@ -1264,13 +1407,13 @@ pub(super) async fn run_datapath_v2(
                                 })
                                 .is_err()
                             {
-                                stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                                stats_rx.drop_in(super::DropReason::ShardQueue);
                                 pool_rx.release(payload_idx);
                             } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
                                 let _ = waker.wake();
                             }
                         } else {
-                            stats_rx.dropped_in.fetch_add(1, Ordering::Relaxed);
+                            stats_rx.drop_in(super::DropReason::ShardQueue);
                             pool_rx.release(payload_idx);
                         }
                     }
@@ -1279,22 +1422,10 @@ pub(super) async fn run_datapath_v2(
         })
         .context("Failed to spawn RX thread")?;
 
-    // Keep this async task alive; we treat thread termination as fatal.
-    tokio::task::spawn_blocking(move || {
-        match tx_thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::error!("relay-tx thread exited with error: {}", e),
-            Err(panic) => log::error!("relay-tx thread panicked: {:?}", panic),
-        }
-        match rx_thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::error!("relay-rx thread exited with error: {}", e),
-            Err(panic) => log::error!("relay-rx thread panicked: {:?}", panic),
-        }
-    })
-    .await
-    .ok();
+    supervise_critical_thread("relay-tx".to_string(), tx_thread)?;
+    supervise_critical_thread("relay-rx".to_string(), rx_thread)?;
 
+    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -1309,7 +1440,7 @@ fn send_tx_packet(
     let bytes = unsafe { pool.buffer(packet.buf_idx) };
     if let Err(e) = socket.send_to(&bytes[..packet.len], packet.addr) {
         log::trace!("TX send error to {}: {}", packet.addr, e);
-        stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+        stats.drop_out(super::DropReason::SocketSend);
     } else {
         stats.packets_out.fetch_add(1, Ordering::Relaxed);
         stats
@@ -1341,7 +1472,7 @@ fn send_small_control_frame(
     stats: &super::Stats,
 ) {
     let Some(buf_idx) = pool.try_acquire() else {
-        stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+        stats.drop_out(super::DropReason::Pool);
         stats.pool_exhausted.fetch_add(1, Ordering::Relaxed);
         return;
     };
@@ -1362,7 +1493,7 @@ fn send_small_control_frame(
     };
 
     if tx_control.try_send(packet).is_err() {
-        stats.dropped_out.fetch_add(1, Ordering::Relaxed);
+        stats.drop_out(super::DropReason::TxQueue);
         pool.release(buf_idx);
     }
 }
