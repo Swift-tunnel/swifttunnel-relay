@@ -30,6 +30,10 @@ const DEFAULT_FLOW_SOCKET_RCVBUF_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_FLOW_SOCKET_SNDBUF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FLOW_RECV_BURST: usize = 64;
 const MAX_INBOX_DRAIN_BURST: usize = 1024;
+const MAX_DATA_QUEUE_AGE: Duration = Duration::from_millis(250);
+// Intentionally shorter than MAX_DATA_QUEUE_AGE: this bounds a single kernel
+// send-buffer stall, while stale-queue dropping sheds packets that waited too long.
+const MAIN_SOCKET_SEND_TIMEOUT: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RelayV2Tuning {
@@ -248,6 +252,7 @@ enum ShardMsg {
         original_info: super::OriginalPacketInfo,
         payload_idx: usize,
         payload_len: usize,
+        enqueued_at: Instant,
     },
     Keepalive {
         session_id: [u8; super::SESSION_ID_LEN],
@@ -258,12 +263,20 @@ enum ShardMsg {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueuedPacketKind {
+    Data,
+    Control,
+}
+
 #[derive(Clone, Copy)]
 struct TxPacket {
     addr: SocketAddr,
     session_id: [u8; super::SESSION_ID_LEN],
     buf_idx: usize,
     len: usize,
+    enqueued_at: Instant,
+    kind: QueuedPacketKind,
 }
 
 fn supervise_critical_thread(
@@ -304,6 +317,15 @@ fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize
     (sid as usize) % shard_count
 }
 
+fn should_drop_stale_queued_packet(
+    kind: QueuedPacketKind,
+    enqueued_at: Instant,
+    now: Instant,
+) -> bool {
+    kind == QueuedPacketKind::Data
+        && now.saturating_duration_since(enqueued_at) > MAX_DATA_QUEUE_AGE
+}
+
 /// Bind the relay's main UDP socket (client-facing) with tuned buffer sizes.
 pub(super) fn bind_main_socket(listen_port: u16) -> Result<(UdpSocket, SocketBufferSizes)> {
     let tuning = relay_v2_tuning();
@@ -323,6 +345,9 @@ pub(super) fn bind_main_socket(listen_port: u16) -> Result<(UdpSocket, SocketBuf
         .bind(&addr.into())
         .context("Failed to bind UDP socket")?;
     let std_socket: UdpSocket = socket.into();
+    std_socket
+        .set_write_timeout(Some(MAIN_SOCKET_SEND_TIMEOUT))
+        .context("Failed to set main socket write timeout")?;
     let sock_ref = SockRef::from(&std_socket);
     let effective_rcvbuf_bytes = sock_ref.recv_buffer_size().unwrap_or(0);
     let effective_sndbuf_bytes = sock_ref.send_buffer_size().unwrap_or(0);
@@ -518,11 +543,12 @@ fn run_shard(
             for _ in 0..MAX_FLOW_RECV_BURST {
                 match flow.socket.recv(&mut recv_buf) {
                     Ok(len) => {
-                        flow.last_activity = Instant::now();
+                        let received_at = Instant::now();
+                        flow.last_activity = received_at;
                         flow.marked_for_removal = None;
 
                         if let Some(mut session_entry) = sessions.get_mut(&flow_key.session_id) {
-                            session_entry.last_activity = Instant::now();
+                            session_entry.last_activity = received_at;
                             session_entry.last_activity_unix = super::unix_timestamp_secs();
                         }
 
@@ -554,6 +580,8 @@ fn run_shard(
                             session_id: flow_key.session_id,
                             buf_idx,
                             len: total_len,
+                            enqueued_at: received_at,
+                            kind: QueuedPacketKind::Data,
                         };
 
                         if tx_data.try_send(packet).is_err() {
@@ -589,7 +617,18 @@ fn run_shard(
                     original_info,
                     payload_idx,
                     payload_len,
+                    enqueued_at,
                 } => {
+                    if should_drop_stale_queued_packet(
+                        QueuedPacketKind::Data,
+                        enqueued_at,
+                        Instant::now(),
+                    ) {
+                        stats.drop_in(super::DropReason::StaleQueue);
+                        pool.release(payload_idx);
+                        continue;
+                    }
+
                     let key = FlowKey {
                         session_id,
                         game_addr,
@@ -1190,6 +1229,8 @@ pub(super) async fn run_datapath_v2(
                         session_id,
                         buf_idx,
                         len: out_len,
+                        enqueued_at: Instant::now(),
+                        kind: QueuedPacketKind::Control,
                     };
                     if tx_control_rx.try_send(packet).is_err() {
                         stats_rx.drop_out(super::DropReason::TxQueue);
@@ -1404,6 +1445,7 @@ pub(super) async fn run_datapath_v2(
                                     original_info,
                                     payload_idx,
                                     payload_len: udp_payload.len(),
+                                    enqueued_at: now,
                                 })
                                 .is_err()
                             {
@@ -1437,6 +1479,12 @@ fn send_tx_packet(
     session_traffic: &DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>,
     packet: TxPacket,
 ) {
+    if should_drop_stale_queued_packet(packet.kind, packet.enqueued_at, Instant::now()) {
+        stats.drop_out(super::DropReason::StaleQueue);
+        pool.release(packet.buf_idx);
+        return;
+    }
+
     let bytes = unsafe { pool.buffer(packet.buf_idx) };
     if let Err(e) = socket.send_to(&bytes[..packet.len], packet.addr) {
         log::trace!("TX send error to {}: {}", packet.addr, e);
@@ -1490,6 +1538,8 @@ fn send_small_control_frame(
         session_id,
         buf_idx,
         len,
+        enqueued_at: Instant::now(),
+        kind: QueuedPacketKind::Control,
     };
 
     if tx_control.try_send(packet).is_err() {
@@ -1522,6 +1572,36 @@ mod tests {
             session_id,
             game_addr: SocketAddr::from(([127, 0, 0, 1], port)),
         }
+    }
+
+    #[test]
+    fn test_stale_data_queue_packet_is_dropped() {
+        let now = Instant::now();
+        assert!(should_drop_stale_queued_packet(
+            QueuedPacketKind::Data,
+            now - MAX_DATA_QUEUE_AGE - Duration::from_millis(1),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_fresh_data_queue_packet_is_not_dropped() {
+        let now = Instant::now();
+        assert!(!should_drop_stale_queued_packet(
+            QueuedPacketKind::Data,
+            now - MAX_DATA_QUEUE_AGE,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_stale_control_queue_packet_is_not_dropped() {
+        let now = Instant::now();
+        assert!(!should_drop_stale_queued_packet(
+            QueuedPacketKind::Control,
+            now - MAX_DATA_QUEUE_AGE - Duration::from_millis(1),
+            now
+        ));
     }
 
     // ── get_relay_datapath ──────────────────────────────────────────────
