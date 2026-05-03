@@ -660,6 +660,7 @@ enum DropReason {
     Parse,
     Fragment,
     Pool,
+    StaleQueue,
     ShardQueue,
     TxQueue,
     TunQueue,
@@ -675,6 +676,7 @@ struct DropReasonCounters {
     parse: AtomicU64,
     fragment: AtomicU64,
     pool: AtomicU64,
+    stale_queue: AtomicU64,
     shard_queue: AtomicU64,
     tx_queue: AtomicU64,
     tun_queue: AtomicU64,
@@ -692,6 +694,7 @@ impl DropReasonCounters {
             parse: AtomicU64::new(0),
             fragment: AtomicU64::new(0),
             pool: AtomicU64::new(0),
+            stale_queue: AtomicU64::new(0),
             shard_queue: AtomicU64::new(0),
             tx_queue: AtomicU64::new(0),
             tun_queue: AtomicU64::new(0),
@@ -709,6 +712,7 @@ impl DropReasonCounters {
             DropReason::Parse => &self.parse,
             DropReason::Fragment => &self.fragment,
             DropReason::Pool => &self.pool,
+            DropReason::StaleQueue => &self.stale_queue,
             DropReason::ShardQueue => &self.shard_queue,
             DropReason::TxQueue => &self.tx_queue,
             DropReason::TunQueue => &self.tun_queue,
@@ -727,6 +731,7 @@ impl DropReasonCounters {
             "parse": self.parse.load(Ordering::Relaxed),
             "fragment": self.fragment.load(Ordering::Relaxed),
             "pool": self.pool.load(Ordering::Relaxed),
+            "stale_queue": self.stale_queue.load(Ordering::Relaxed),
             "shard_queue": self.shard_queue.load(Ordering::Relaxed),
             "tx_queue": self.tx_queue.load(Ordering::Relaxed),
             "tun_queue": self.tun_queue.load(Ordering::Relaxed),
@@ -4456,13 +4461,15 @@ mod async_stats_http_tests {
     fn test_render_stats_includes_drop_reasons_and_config() {
         let ctx = make_stats_context();
         ctx.stats.drop_in(DropReason::Auth);
+        ctx.stats.drop_in(DropReason::StaleQueue);
         ctx.stats.drop_out(DropReason::TxQueue);
 
         let payload = render_stats_payload(&ctx);
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(parsed["dropped_in"], 1);
+        assert_eq!(parsed["dropped_in"], 2);
         assert_eq!(parsed["dropped_out"], 1);
         assert_eq!(parsed["drops"]["auth"], 1);
+        assert_eq!(parsed["drops"]["stale_queue"], 1);
         assert_eq!(parsed["drops"]["tx_queue"], 1);
         assert_eq!(parsed["config"]["datapath"], "v2");
         assert_eq!(parsed["config"]["version"], RELAY_VERSION);
