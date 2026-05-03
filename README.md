@@ -189,7 +189,7 @@ When `RELAY_STATS_TOKEN` is set, the localhost stats API exposes:
 - `GET /v1/config`: relay version, datapath, auth mode, server ID, TUN flags, queue sizes, and requested/effective socket buffers.
 - `GET /v1/connections`: session-level connection snapshot.
 
-Drop reasons currently include auth, parse, fragment, pool, shard queue, TX queue, TUN queue, flow queue, flow create, flow send, and socket send failures.
+Drop reasons currently include auth, parse, fragment, pool, stale queue, shard queue, TX queue, TUN queue, flow queue, flow create, flow send, and socket send failures.
 
 ### systemd Service
 
