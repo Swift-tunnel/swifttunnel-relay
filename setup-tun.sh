@@ -41,7 +41,21 @@ if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.d/*.conf 2>/dev/null; then
     echo "[+] Persisted IP forwarding to /etc/sysctl.d/99-swifttunnel.conf"
 fi
 
-# 3. Detect primary outbound interface
+# 3. Raise UDP socket buffer ceilings for relay burst handling
+#
+# The relay requests multi-megabyte SO_RCVBUF/SO_SNDBUF values. Some fresh
+# Ubuntu images default net.core.rmem_max/wmem_max to 212992, silently capping
+# the relay to ~416 KiB effective buffers and causing burst loss under load.
+cat > /etc/sysctl.d/98-swifttunnel-relay-buffers.conf <<'EOF'
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=8388608
+net.core.wmem_default=8388608
+EOF
+sysctl --system >/dev/null
+echo "[+] Applied relay socket buffer sysctls"
+
+# 4. Detect primary outbound interface
 PRIMARY_IF=$(ip route show default | awk '/default/ {print $5; exit}')
 if [ -z "$PRIMARY_IF" ]; then
     echo "[!] Could not detect primary interface, defaulting to eth0"
@@ -49,7 +63,7 @@ if [ -z "$PRIMARY_IF" ]; then
 fi
 echo "[*] Primary interface: $PRIMARY_IF"
 
-# 4. NAT masquerade for TUN subnet
+# 5. NAT masquerade for TUN subnet
 if ! iptables -t nat -C POSTROUTING -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j MASQUERADE 2>/dev/null; then
     echo "[+] Adding MASQUERADE rule for $TUN_SUBNET..."
     iptables -t nat -A POSTROUTING -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j MASQUERADE
@@ -57,24 +71,48 @@ else
     echo "[=] MASQUERADE rule already exists"
 fi
 
-# 5. TCP MSS clamping to avoid fragmentation through the tunnel
+# 6. TCP MSS clamping to avoid fragmentation through the tunnel
 # This remains TCP-specific; UDP uses the same NAT/FORWARD path but has no MSS.
-# MTU: 1500 (ethernet) - 20 (outer IP) - 8 (outer UDP) - 8 (session_id) - 20 (inner IP) - 20 (TCP)
-# = 1424 bytes MSS
-if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNET" -j TCPMSS --set-mss 1424 2>/dev/null; then
-    echo "[+] Adding TCP MSS clamping rule (1424)..."
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNET" -j TCPMSS --set-mss 1424
+# swifttun0 runs at MTU 1400. Use a worst-case IPv4+TCP header budget (60)
+# so large TCP/API asset responses do not rely on PMTU discovery or fragments.
+TCP_MSS=1340
+
+# Remove the old overly-large rule if it exists; otherwise it can match before
+# the safe clamp and still advertise segments too large for swifttun0.
+iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNET" -j TCPMSS --set-mss 1424 2>/dev/null || true
+
+if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNET" -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; then
+    echo "[+] Adding TCP MSS clamping rule ($TCP_MSS)..."
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNET" -j TCPMSS --set-mss "$TCP_MSS"
 else
     echo "[=] TCP MSS clamping rule already exists"
 fi
 
-# 6. FORWARD rules — needed when default FORWARD policy is DROP (e.g. UFW)
-if ! iptables -C FORWARD -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT 2>/dev/null; then
-    echo "[+] Adding FORWARD ACCEPT rule for $TUN_DEVICE → $PRIMARY_IF..."
-    iptables -I FORWARD 1 -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT
-else
-    echo "[=] FORWARD outbound rule already exists"
-fi
+# 7. FORWARD rules — needed when default FORWARD policy is DROP (e.g. UFW)
+while iptables -D FORWARD -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT 2>/dev/null; do
+    :
+done
+echo "[+] Adding managed FORWARD ACCEPT rule for $TUN_DEVICE → $PRIMARY_IF..."
+iptables -I FORWARD 1 -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT
+
+FORBIDDEN_FORWARD_DESTS=(
+    "0.0.0.0/8"
+    "10.0.0.0/8"
+    "100.64.0.0/10"
+    "127.0.0.0/8"
+    "169.254.0.0/16"
+    "172.16.0.0/12"
+    "192.168.0.0/16"
+    "224.0.0.0/4"
+    "240.0.0.0/4"
+)
+for dst in "${FORBIDDEN_FORWARD_DESTS[@]}"; do
+    while iptables -D FORWARD -i "$TUN_DEVICE" -d "$dst" -j DROP 2>/dev/null; do
+        :
+    done
+    echo "[+] Adding FORWARD DROP rule for forbidden destination $dst..."
+    iptables -I FORWARD 1 -i "$TUN_DEVICE" -d "$dst" -j DROP
+done
 
 if ! iptables -C FORWARD -i "$PRIMARY_IF" -o "$TUN_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
     echo "[+] Adding FORWARD ACCEPT rule for return traffic → $TUN_DEVICE..."
@@ -83,7 +121,7 @@ else
     echo "[=] FORWARD return traffic rule already exists"
 fi
 
-# 7. Persist iptables rules
+# 8. Persist iptables rules
 if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
     echo "[+] Saved iptables rules via netfilter-persistent"

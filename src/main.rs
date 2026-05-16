@@ -42,7 +42,7 @@ use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{ErrorKind, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::net::{Ipv4Addr, Shutdown};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -77,8 +77,21 @@ const AUTH_ACK_EXPIRED: u8 = 3;
 const AUTH_ACK_SID_MISMATCH: u8 = 4;
 const AUTH_ACK_SERVER_MISMATCH: u8 = 5;
 const AUTH_ACK_AUTH_DISABLED: u8 = 6;
+const AUTH_ACK_REPLAY: u8 = 7;
 const MAX_AUTH_TOKEN_LEN: usize = 4096;
 const AUTH_CLOCK_SKEW_SECS: u64 = 30;
+const RELAY_ALLOW_INSECURE_ENV: &str = "RELAY_ALLOW_INSECURE";
+const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(1);
+const SOURCE_RATE_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+const SOURCE_RATE_IDLE_TTL: Duration = Duration::from_secs(120);
+const REPLAY_CACHE_PRUNE_INTERVAL_SECS: u64 = 30;
+const MAX_PACKETS_PER_SOURCE_WINDOW: u32 = 50_000;
+const MAX_NEW_SESSIONS_PER_SOURCE_WINDOW: u32 = 256;
+const MAX_NEW_FLOWS_PER_SOURCE_WINDOW: u32 = 4096;
+const MAX_SESSIONS_TOTAL: usize = 65_536;
+const MAX_SESSIONS_PER_SRC_IP: usize = 512;
+const MAX_FLOWS_TOTAL: usize = 262_144;
+const MAX_FLOWS_PER_SESSION: usize = 1024;
 const PING_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8;
 const PONG_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4 + 8 + 8;
 /// Client-reported RTT (optional, backward-compatible).
@@ -103,7 +116,8 @@ impl RelayAuthMode {
         {
             Some("required") => Self::Required,
             Some("optional") => Self::Optional,
-            _ => Self::Off,
+            Some("off") => Self::Off,
+            _ => Self::Required,
         }
     }
 
@@ -116,7 +130,7 @@ impl RelayAuthMode {
     }
 
     fn requires_auth(self) -> bool {
-        matches!(self, Self::Required)
+        !matches!(self, Self::Off)
     }
 }
 
@@ -131,6 +145,11 @@ impl RelayAuthConfig {
     fn from_env() -> Result<Self> {
         let mode = RelayAuthMode::from_env(env::var("RELAY_AUTH_MODE").ok());
         if mode == RelayAuthMode::Off {
+            if env::var(RELAY_ALLOW_INSECURE_ENV).ok().as_deref() != Some("1") {
+                anyhow::bail!(
+                    "RELAY_AUTH_MODE=off requires RELAY_ALLOW_INSECURE=1; refusing to start open relay"
+                );
+            }
             return Ok(Self {
                 mode,
                 public_key: None,
@@ -188,8 +207,14 @@ struct RelayTicketClaims {
     srv: String,
     iat: u64,
     exp: u64,
-    #[allow(dead_code)]
     jti: String,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedRelayTicket {
+    user_id: String,
+    jti: String,
+    exp: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +224,7 @@ enum RelayAuthVerifyError {
     Expired,
     SidMismatch,
     ServerMismatch,
+    Replay,
 }
 
 impl RelayAuthVerifyError {
@@ -209,7 +235,22 @@ impl RelayAuthVerifyError {
             Self::Expired => AUTH_ACK_EXPIRED,
             Self::SidMismatch => AUTH_ACK_SID_MISMATCH,
             Self::ServerMismatch => AUTH_ACK_SERVER_MISMATCH,
+            Self::Replay => AUTH_ACK_REPLAY,
         }
+    }
+}
+
+fn log_auth_verify_error(
+    err: RelayAuthVerifyError,
+    client_addr: SocketAddr,
+    session_id: [u8; SESSION_ID_LEN],
+) {
+    if err == RelayAuthVerifyError::Replay {
+        log::warn!(
+            "Rejected replayed relay ticket from {} for session {:016x}",
+            client_addr,
+            u64::from_be_bytes(session_id)
+        );
     }
 }
 
@@ -248,12 +289,318 @@ fn decode_base64_flexible(input: &str) -> Option<Vec<u8>> {
         .or_else(|| BASE64_STANDARD.decode(input).ok())
 }
 
+fn is_cgnat_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
+fn is_this_network_ipv4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceLimitKind {
+    Packet,
+    NewSession,
+    NewFlow,
+}
+
+#[derive(Debug, Clone)]
+struct SourceRateState {
+    window_start: Instant,
+    packets: u32,
+    new_sessions: u32,
+    new_flows: u32,
+}
+
+impl SourceRateState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            packets: 0,
+            new_sessions: 0,
+            new_flows: 0,
+        }
+    }
+
+    fn allow(&mut self, kind: SourceLimitKind, now: Instant) -> bool {
+        if now.saturating_duration_since(self.window_start) >= SOURCE_RATE_WINDOW {
+            *self = Self::new(now);
+        }
+
+        match kind {
+            SourceLimitKind::Packet => {
+                if self.packets >= MAX_PACKETS_PER_SOURCE_WINDOW {
+                    return false;
+                }
+                self.packets += 1;
+            }
+            SourceLimitKind::NewSession => {
+                if self.new_sessions >= MAX_NEW_SESSIONS_PER_SOURCE_WINDOW {
+                    return false;
+                }
+                self.new_sessions += 1;
+            }
+            SourceLimitKind::NewFlow => {
+                if self.new_flows >= MAX_NEW_FLOWS_PER_SOURCE_WINDOW {
+                    return false;
+                }
+                self.new_flows += 1;
+            }
+        }
+        true
+    }
+}
+
+pub(crate) struct SourceRateLimiter {
+    sources: DashMap<IpAddr, SourceRateState>,
+    created_at: Instant,
+    last_prune_ms: AtomicU64,
+}
+
+impl SourceRateLimiter {
+    fn new() -> Self {
+        Self {
+            sources: DashMap::new(),
+            created_at: Instant::now(),
+            last_prune_ms: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn allow(&self, ip: IpAddr, kind: SourceLimitKind, now: Instant) -> bool {
+        self.prune_idle(now);
+        self.sources
+            .entry(ip)
+            .or_insert_with(|| SourceRateState::new(now))
+            .allow(kind, now)
+    }
+
+    fn prune_idle(&self, now: Instant) {
+        let now_ms = duration_millis_u64(now.saturating_duration_since(self.created_at));
+        let last_prune_ms = self.last_prune_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_prune_ms) < duration_millis_u64(SOURCE_RATE_PRUNE_INTERVAL) {
+            return;
+        }
+
+        if self
+            .last_prune_ms
+            .compare_exchange(last_prune_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.sources.retain(|_, state| {
+            now.saturating_duration_since(state.window_start) < SOURCE_RATE_IDLE_TTL
+        });
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+struct RelayTicketReplayCache {
+    seen_jti: DashMap<String, u64>,
+    last_prune_unix: AtomicU64,
+}
+
+impl RelayTicketReplayCache {
+    fn new() -> Self {
+        Self {
+            seen_jti: DashMap::new(),
+            last_prune_unix: AtomicU64::new(0),
+        }
+    }
+
+    fn accept_once(&self, jti: &str, exp: u64, now_unix: u64) -> bool {
+        self.prune_expired(now_unix);
+
+        match self.seen_jti.entry(jti.to_string()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(exp);
+                true
+            }
+        }
+    }
+
+    fn prune_expired(&self, now_unix: u64) {
+        let last_prune = self.last_prune_unix.load(Ordering::Relaxed);
+        if now_unix.saturating_sub(last_prune) < REPLAY_CACHE_PRUNE_INTERVAL_SECS {
+            return;
+        }
+
+        if self
+            .last_prune_unix
+            .compare_exchange(last_prune, now_unix, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.seen_jti
+            .retain(|_, seen_exp| now_unix <= seen_exp.saturating_add(AUTH_CLOCK_SKEW_SECS));
+    }
+}
+
+pub(crate) fn source_session_count(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    source_ip: IpAddr,
+) -> u64 {
+    source_session_counts
+        .get(&source_ip)
+        .map_or(0, |count| *count)
+}
+
+pub(crate) fn increment_source_session_count(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    source_ip: IpAddr,
+) {
+    let mut count = source_session_counts.entry(source_ip).or_insert(0);
+    *count += 1;
+}
+
+pub(crate) fn decrement_source_session_count(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    source_ip: IpAddr,
+) {
+    if let Some(mut count) = source_session_counts.get_mut(&source_ip) {
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+    }
+    source_session_counts.remove(&source_ip);
+}
+
+pub(crate) fn update_source_session_count_for_rebind(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    old_ip: IpAddr,
+    new_ip: IpAddr,
+) {
+    if old_ip == new_ip {
+        return;
+    }
+
+    decrement_source_session_count(source_session_counts, old_ip);
+    increment_source_session_count(source_session_counts, new_ip);
+}
+
+fn indexed_session_flow_count(
+    session_flow_keys: &DashMap<[u8; SESSION_ID_LEN], Vec<String>>,
+    session_id: [u8; SESSION_ID_LEN],
+) -> usize {
+    session_flow_keys
+        .get(&session_id)
+        .map_or(0, |keys| keys.len())
+}
+
+pub(crate) fn allow_source_event(
+    limiter: &SourceRateLimiter,
+    stats: &Stats,
+    client_addr: SocketAddr,
+    kind: SourceLimitKind,
+    now: Instant,
+) -> bool {
+    if limiter.allow(client_addr.ip(), kind, now) {
+        return true;
+    }
+
+    stats.throttled_users.fetch_add(1, Ordering::Relaxed);
+    stats.drop_in(DropReason::RateLimit);
+    false
+}
+
+fn v1_session_capacity_available(
+    sessions: &DashMap<[u8; SESSION_ID_LEN], SessionEntry>,
+    source_session_counts: &DashMap<IpAddr, u64>,
+    stats: &Stats,
+    source_ip: IpAddr,
+) -> bool {
+    if sessions.len() >= MAX_SESSIONS_TOTAL {
+        stats.drop_in(DropReason::Capacity);
+        return false;
+    }
+
+    if source_session_count(source_session_counts, source_ip) >= MAX_SESSIONS_PER_SRC_IP as u64 {
+        stats.drop_in(DropReason::Capacity);
+        return false;
+    }
+
+    true
+}
+
+fn v1_flow_capacity_available(
+    flows: &DashMap<String, FlowEntry>,
+    session_flow_keys: &DashMap<[u8; SESSION_ID_LEN], Vec<String>>,
+    stats: &Stats,
+    session_id: [u8; SESSION_ID_LEN],
+) -> bool {
+    if flows.len() >= MAX_FLOWS_TOTAL {
+        stats.drop_in(DropReason::Capacity);
+        return false;
+    }
+
+    if indexed_session_flow_count(session_flow_keys, session_id) >= MAX_FLOWS_PER_SESSION {
+        stats.drop_in(DropReason::Capacity);
+        return false;
+    }
+
+    true
+}
+
+fn remove_v1_session_flow_key(
+    session_flow_keys: &DashMap<[u8; SESSION_ID_LEN], Vec<String>>,
+    session_id: [u8; SESSION_ID_LEN],
+    flow_key: &str,
+) {
+    if let Some(mut keys) = session_flow_keys.get_mut(&session_id) {
+        keys.retain(|key| key != flow_key);
+    }
+    if session_flow_keys
+        .get(&session_id)
+        .is_some_and(|keys| keys.is_empty())
+    {
+        session_flow_keys.remove(&session_id);
+    }
+}
+
+pub(crate) fn authenticated_session_source_allowed(
+    session: &SessionEntry,
+    auth_required: bool,
+    client_addr: SocketAddr,
+    is_auth_hello: bool,
+) -> bool {
+    if !auth_required || !matches!(session.auth_state, SessionAuthState::Authenticated) {
+        return true;
+    }
+
+    is_auth_hello || session.client_addr.ip() == client_addr.ip()
+}
+
+pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || is_this_network_ipv4(ip)
+        || is_reserved_ipv4(ip)
+        || is_cgnat_ipv4(ip)
+}
+
 fn verify_relay_ticket(
     token: &str,
     session_id: [u8; SESSION_ID_LEN],
     auth: &RelayAuthConfig,
     now_unix: u64,
-) -> Result<String, RelayAuthVerifyError> {
+) -> Result<VerifiedRelayTicket, RelayAuthVerifyError> {
     if token.is_empty() || token.len() > MAX_AUTH_TOKEN_LEN {
         return Err(RelayAuthVerifyError::BadFormat);
     }
@@ -306,7 +653,25 @@ fn verify_relay_ticket(
         return Err(RelayAuthVerifyError::Expired);
     }
 
-    Ok(claims.sub)
+    Ok(VerifiedRelayTicket {
+        user_id: claims.sub,
+        jti: claims.jti,
+        exp: claims.exp,
+    })
+}
+
+fn verify_relay_ticket_once(
+    token: &str,
+    session_id: [u8; SESSION_ID_LEN],
+    auth: &RelayAuthConfig,
+    now_unix: u64,
+    replay_cache: &RelayTicketReplayCache,
+) -> Result<VerifiedRelayTicket, RelayAuthVerifyError> {
+    let ticket = verify_relay_ticket(token, session_id, auth, now_unix)?;
+    if !replay_cache.accept_once(&ticket.jti, ticket.exp, now_unix) {
+        return Err(RelayAuthVerifyError::Replay);
+    }
+    Ok(ticket)
 }
 
 fn parse_auth_hello_token(frame: &[u8], len: usize) -> Result<&str, RelayAuthVerifyError> {
@@ -656,9 +1021,13 @@ impl Stats {
 #[derive(Debug, Clone, Copy)]
 enum DropReason {
     Auth,
+    RateLimit,
+    Capacity,
     TooSmall,
     Parse,
     Fragment,
+    ForbiddenDst,
+    TcpDisabled,
     Pool,
     StaleQueue,
     ShardQueue,
@@ -672,9 +1041,13 @@ enum DropReason {
 
 struct DropReasonCounters {
     auth: AtomicU64,
+    rate_limit: AtomicU64,
+    capacity: AtomicU64,
     too_small: AtomicU64,
     parse: AtomicU64,
     fragment: AtomicU64,
+    forbidden_dst: AtomicU64,
+    tcp_disabled: AtomicU64,
     pool: AtomicU64,
     stale_queue: AtomicU64,
     shard_queue: AtomicU64,
@@ -690,9 +1063,13 @@ impl DropReasonCounters {
     fn new() -> Self {
         Self {
             auth: AtomicU64::new(0),
+            rate_limit: AtomicU64::new(0),
+            capacity: AtomicU64::new(0),
             too_small: AtomicU64::new(0),
             parse: AtomicU64::new(0),
             fragment: AtomicU64::new(0),
+            forbidden_dst: AtomicU64::new(0),
+            tcp_disabled: AtomicU64::new(0),
             pool: AtomicU64::new(0),
             stale_queue: AtomicU64::new(0),
             shard_queue: AtomicU64::new(0),
@@ -708,9 +1085,13 @@ impl DropReasonCounters {
     fn increment(&self, reason: DropReason) {
         let counter = match reason {
             DropReason::Auth => &self.auth,
+            DropReason::RateLimit => &self.rate_limit,
+            DropReason::Capacity => &self.capacity,
             DropReason::TooSmall => &self.too_small,
             DropReason::Parse => &self.parse,
             DropReason::Fragment => &self.fragment,
+            DropReason::ForbiddenDst => &self.forbidden_dst,
+            DropReason::TcpDisabled => &self.tcp_disabled,
             DropReason::Pool => &self.pool,
             DropReason::StaleQueue => &self.stale_queue,
             DropReason::ShardQueue => &self.shard_queue,
@@ -727,9 +1108,13 @@ impl DropReasonCounters {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "auth": self.auth.load(Ordering::Relaxed),
+            "rate_limit": self.rate_limit.load(Ordering::Relaxed),
+            "capacity": self.capacity.load(Ordering::Relaxed),
             "too_small": self.too_small.load(Ordering::Relaxed),
             "parse": self.parse.load(Ordering::Relaxed),
             "fragment": self.fragment.load(Ordering::Relaxed),
+            "forbidden_dst": self.forbidden_dst.load(Ordering::Relaxed),
+            "tcp_disabled": self.tcp_disabled.load(Ordering::Relaxed),
             "pool": self.pool.load(Ordering::Relaxed),
             "stale_queue": self.stale_queue.load(Ordering::Relaxed),
             "shard_queue": self.shard_queue.load(Ordering::Relaxed),
@@ -773,6 +1158,10 @@ struct RelayV2RuntimeConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if handle_cli_args()? {
+        return Ok(());
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let listen_port = get_listen_port();
@@ -896,6 +1285,8 @@ async fn main() -> Result<()> {
         tun_udp_enabled,
         main_socket_buffers,
     );
+    let source_limiter = Arc::new(SourceRateLimiter::new());
+    let replay_cache = Arc::new(RelayTicketReplayCache::new());
 
     if matches!(datapath, datapath_v2::RelayDatapath::V2) {
         return datapath_v2::run_datapath_v2(
@@ -911,6 +1302,8 @@ async fn main() -> Result<()> {
             tun_udp_enabled,
             tcp_enabled,
             session_traffic,
+            Arc::clone(&source_limiter),
+            Arc::clone(&replay_cache),
         )
         .await;
     }
@@ -943,9 +1336,12 @@ async fn main() -> Result<()> {
 
     // Session tracking
     let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
+    let source_session_counts: Arc<DashMap<IpAddr, u64>> = Arc::new(DashMap::new());
 
     // Flow tracking: "session_hex:game_addr" -> FlowEntry
     let flows: Arc<DashMap<String, FlowEntry>> = Arc::new(DashMap::new());
+    let session_flow_keys: Arc<DashMap<[u8; SESSION_ID_LEN], Vec<String>>> =
+        Arc::new(DashMap::new());
 
     if let Some(token) = stats_token {
         let ctx = Arc::new(StatsApiContext {
@@ -1000,7 +1396,9 @@ async fn main() -> Result<()> {
 
     // Spawn cleanup task with soft-delete grace period
     let sessions_cleanup = Arc::clone(&sessions);
+    let source_session_counts_cleanup = Arc::clone(&source_session_counts);
     let flows_cleanup = Arc::clone(&flows);
+    let session_flow_keys_cleanup = Arc::clone(&session_flow_keys);
     let stats_cleanup = Arc::clone(&stats);
     let session_traffic_cleanup = Arc::clone(&session_traffic);
     let tcp_cleanup = tun_session_cleanup;
@@ -1048,11 +1446,20 @@ async fn main() -> Result<()> {
                 true
             });
 
+            session_flow_keys_cleanup.retain(|session_id, keys| {
+                keys.retain(|key| flows_cleanup.contains_key(key));
+                !keys.is_empty() && sessions_cleanup.contains_key(session_id)
+            });
+
             let mut sessions_removed = 0u32;
             let session_idle_limit = SESSION_TIMEOUT + FLOW_GRACE_PERIOD;
             sessions_cleanup.retain(|session_id, session| {
                 if now.duration_since(session.last_activity) >= session_idle_limit {
                     session_traffic_cleanup.remove(session_id);
+                    decrement_source_session_count(
+                        &source_session_counts_cleanup,
+                        session.client_addr.ip(),
+                    );
                     sessions_removed += 1;
                     stats_cleanup
                         .active_sessions
@@ -1145,19 +1552,63 @@ async fn main() -> Result<()> {
 
         let now = Instant::now();
         let now_unix = unix_timestamp_secs();
+        let is_auth_hello =
+            len >= SESSION_ID_LEN + 3 && buf[SESSION_ID_LEN] == AUTH_HELLO_FRAME_TYPE;
+
+        if !allow_source_event(
+            &source_limiter,
+            &stats,
+            client_addr,
+            SourceLimitKind::Packet,
+            now,
+        ) {
+            continue;
+        }
+
+        if !sessions.contains_key(&session_id) {
+            if !v1_session_capacity_available(
+                &sessions,
+                &source_session_counts,
+                &stats,
+                client_addr.ip(),
+            ) {
+                continue;
+            }
+            if !allow_source_event(
+                &source_limiter,
+                &stats,
+                client_addr,
+                SourceLimitKind::NewSession,
+                now,
+            ) {
+                continue;
+            }
+        }
 
         // Update session
         let mut session_authenticated = false;
+        let mut session_source_allowed = true;
         let auth_required = auth_config.mode.requires_auth();
         match sessions.entry(session_id) {
             Entry::Occupied(mut entry) => {
                 let session = entry.get_mut();
                 session_authenticated =
                     matches!(session.auth_state, SessionAuthState::Authenticated);
-                // Only trust client_addr updates from authenticated traffic when auth is
-                // required; otherwise an unauthenticated attacker with a known session_id
-                // can rewrite the session's observed client endpoint.
-                if !auth_required || session_authenticated {
+                session_source_allowed = authenticated_session_source_allowed(
+                    session,
+                    auth_required,
+                    client_addr,
+                    is_auth_hello,
+                );
+                if !auth_required
+                    || !session_authenticated
+                    || session.client_addr.ip() == client_addr.ip()
+                {
+                    update_source_session_count_for_rebind(
+                        &source_session_counts,
+                        session.client_addr.ip(),
+                        client_addr.ip(),
+                    );
                     session.client_addr = client_addr;
                     session.last_activity = now;
                     session.last_activity_unix = now_unix;
@@ -1172,6 +1623,7 @@ async fn main() -> Result<()> {
                     last_activity: now,
                     last_activity_unix: now_unix,
                 });
+                increment_source_session_count(&source_session_counts, client_addr.ip());
                 stats.active_sessions.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1180,7 +1632,7 @@ async fn main() -> Result<()> {
 
         // Auth hello control frame:
         // [session_id:8][0xA1][token_len_be_u16][token_utf8]
-        if len >= SESSION_ID_LEN + 3 && buf[SESSION_ID_LEN] == AUTH_HELLO_FRAME_TYPE {
+        if is_auth_hello {
             if auth_config.mode == RelayAuthMode::Off {
                 send_auth_ack(
                     socket.as_ref(),
@@ -1200,18 +1652,33 @@ async fn main() -> Result<()> {
                 }
             };
 
-            match verify_relay_ticket(token, session_id, &auth_config, now_unix) {
-                Ok(user_id) => {
+            match verify_relay_ticket_once(token, session_id, &auth_config, now_unix, &replay_cache)
+            {
+                Ok(ticket) => {
                     if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-                        session_entry.user_id = user_id;
+                        update_source_session_count_for_rebind(
+                            &source_session_counts,
+                            session_entry.client_addr.ip(),
+                            client_addr.ip(),
+                        );
+                        session_entry.user_id = ticket.user_id;
                         session_entry.auth_state = SessionAuthState::Authenticated;
+                        session_entry.client_addr = client_addr;
+                        session_entry.last_activity = now;
+                        session_entry.last_activity_unix = now_unix;
                     }
                     send_auth_ack(socket.as_ref(), client_addr, session_id, AUTH_ACK_OK).await;
                 }
                 Err(err) => {
+                    log_auth_verify_error(err, client_addr, session_id);
                     send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
                 }
             }
+            continue;
+        }
+
+        if !session_source_allowed {
+            stats.drop_in(DropReason::Auth);
             continue;
         }
 
@@ -1304,13 +1771,12 @@ async fn main() -> Result<()> {
 
             log::trace!("Keepalive from {:016x}", u64::from_be_bytes(session_id));
 
-            // IMPORTANT: Update activity time for ALL flows belonging to this session
-            // This prevents flows from expiring during idle game periods (loading screens, menus)
-            // which would cause Error 277 (connection lost)
-            let session_prefix = format!("{:016x}:", u64::from_be_bytes(session_id));
             let mut flows_refreshed = 0;
-            for mut entry in flows.iter_mut() {
-                if entry.key().starts_with(&session_prefix) {
+            if let Some(flow_keys) = session_flow_keys.get(&session_id) {
+                for flow_key in flow_keys.iter() {
+                    let Some(mut entry) = flows.get_mut(flow_key) else {
+                        continue;
+                    };
                     entry.last_activity = Instant::now();
                     entry.client_addr = client_addr; // Update client addr in case of NAT rebind
                     flows_refreshed += 1;
@@ -1349,6 +1815,10 @@ async fn main() -> Result<()> {
         };
 
         match parsed {
+            ParsedPacket::ForbiddenDst => {
+                stats.drop_in(DropReason::ForbiddenDst);
+                continue;
+            }
             ParsedPacket::Fragment {
                 protocol,
                 src_ip,
@@ -1402,7 +1872,11 @@ async fn main() -> Result<()> {
                         } else {
                             stats.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
                         }
+                    } else {
+                        stats.drop_in(DropReason::TunQueue);
                     }
+                } else {
+                    stats.drop_in(DropReason::TcpDisabled);
                 }
                 // Update session user_id for TCP too
                 if let Some(mut session_entry) = sessions.get_mut(&session_id) {
@@ -1473,10 +1947,33 @@ async fn main() -> Result<()> {
                                 // Flow task died, remove entry so it can be recreated
                                 drop(entry);
                                 flows.remove(&flow_key);
+                                remove_v1_session_flow_key(
+                                    &session_flow_keys,
+                                    session_id,
+                                    &flow_key,
+                                );
                             }
                         }
                     }
                     Entry::Vacant(entry) => {
+                        if !v1_flow_capacity_available(
+                            &flows,
+                            &session_flow_keys,
+                            &stats,
+                            session_id,
+                        ) {
+                            continue;
+                        }
+                        if !allow_source_event(
+                            &source_limiter,
+                            &stats,
+                            client_addr,
+                            SourceLimitKind::NewFlow,
+                            now,
+                        ) {
+                            continue;
+                        }
+
                         // New flow - create atomically
                         let (tx, rx) = mpsc::channel(flow_channel_capacity);
 
@@ -1494,12 +1991,17 @@ async fn main() -> Result<()> {
                             original_info,
                             marked_for_removal: None,
                         });
+                        session_flow_keys
+                            .entry(session_id)
+                            .or_default()
+                            .push(flow_key.clone());
 
                         // Spawn flow handler
                         let response_tx = response_tx.clone();
                         let flows_ref = Arc::clone(&flows);
                         let sessions_ref = Arc::clone(&sessions);
                         let stats_ref = Arc::clone(&stats);
+                        let session_flow_keys_ref = Arc::clone(&session_flow_keys);
 
                         tokio::spawn(async move {
                             run_flow_handler(
@@ -1510,6 +2012,7 @@ async fn main() -> Result<()> {
                                 response_tx,
                                 flows_ref,
                                 sessions_ref,
+                                session_flow_keys_ref,
                                 stats_ref,
                             )
                             .await;
@@ -1530,6 +2033,33 @@ async fn main() -> Result<()> {
     }
 }
 
+fn handle_cli_args() -> Result<bool> {
+    let mut args = env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return Ok(false);
+    };
+
+    match arg.as_str() {
+        "-V" | "--version" => {
+            println!("swifttunnel-relay {}", RELAY_VERSION);
+            Ok(true)
+        }
+        "-h" | "--help" => {
+            println!(
+                "swifttunnel-relay {}\n\nUsage: swifttunnel-relay [--version|--help]\n\nConfiguration is provided through RELAY_* environment variables.",
+                RELAY_VERSION
+            );
+            Ok(true)
+        }
+        other => {
+            anyhow::bail!(
+                "unknown argument '{}'; use --help for supported options",
+                other
+            )
+        }
+    }
+}
+
 /// Handle a flow: receive packets from main loop, send to game server, receive responses
 async fn run_flow_handler(
     flow_key: String,
@@ -1539,14 +2069,30 @@ async fn run_flow_handler(
     response_tx: ResponseTx,
     flows: Arc<DashMap<String, FlowEntry>>,
     sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>>,
+    session_flow_keys: Arc<DashMap<[u8; SESSION_ID_LEN], Vec<String>>>,
     stats: Arc<Stats>,
 ) {
+    if let std::net::IpAddr::V4(dst_ip) = game_addr.ip() {
+        if is_forbidden_dst(dst_ip) {
+            log::warn!(
+                "Dropping flow {} to forbidden destination {}",
+                flow_key,
+                game_addr
+            );
+            stats.drop_in(DropReason::ForbiddenDst);
+            flows.remove(&flow_key);
+            remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
+            return;
+        }
+    }
+
     // Create socket for this flow
     let socket = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
             log::warn!("Failed to create flow socket: {}", e);
             flows.remove(&flow_key);
+            remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
             return;
         }
     };
@@ -1555,6 +2101,7 @@ async fn run_flow_handler(
     if let Err(e) = socket.connect(game_addr).await {
         log::warn!("Failed to connect to {}: {}", game_addr, e);
         flows.remove(&flow_key);
+        remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
         return;
     }
 
@@ -1672,6 +2219,7 @@ async fn run_flow_handler(
 
     // Cleanup
     flows.remove(&flow_key);
+    remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
     log::trace!("Flow {} ended", flow_key);
 }
 
@@ -2344,6 +2892,7 @@ pub(crate) enum ParsedPacket<'a> {
         src_ip: Ipv4Addr,
         raw_ip_packet: &'a [u8],
     },
+    ForbiddenDst,
 }
 
 /// Parse an IP packet and extract protocol-specific information.
@@ -2351,7 +2900,8 @@ pub(crate) enum ParsedPacket<'a> {
 /// Returns `ParsedPacket::Udp` for UDP (protocol 17) with the game address,
 /// payload, and original packet info. Returns `ParsedPacket::Tcp` for TCP
 /// (protocol 6) with the original packet info and a reference to the raw IP
-/// packet. Returns `None` for other protocols or malformed packets.
+/// packet. Returns `ParsedPacket::ForbiddenDst` for blocked destinations.
+/// Returns `None` for other protocols or malformed packets.
 fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     if packet.len() < IP_HEADER_MIN {
         return None;
@@ -2386,6 +2936,9 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     let more_fragments = (fragment_bits & 0x2000) != 0;
     let fragment_offset = fragment_bits & 0x1FFF;
     if more_fragments || fragment_offset != 0 {
+        if is_forbidden_dst(dst_ip) {
+            return Some(ParsedPacket::ForbiddenDst);
+        }
         return Some(ParsedPacket::Fragment {
             protocol,
             src_ip,
@@ -2429,6 +2982,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_port,
             };
 
+            if is_forbidden_dst(dst_ip) {
+                return Some(ParsedPacket::ForbiddenDst);
+            }
+
             Some(ParsedPacket::Udp {
                 game_addr: SocketAddr::from((dst_ip, dst_port)),
                 payload,
@@ -2457,6 +3014,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_ip,
                 dst_port,
             };
+
+            if is_forbidden_dst(dst_ip) {
+                return Some(ParsedPacket::ForbiddenDst);
+            }
 
             Some(ParsedPacket::Tcp {
                 original_info,
@@ -2775,8 +3336,45 @@ mod tests {
         let sid = format!("{:016x}", u64::from_be_bytes(session_id));
         let token = make_ticket_token(&key_pair, &sid, "us-east-nj", now, now + 300);
 
-        let user = verify_relay_ticket(&token, session_id, &auth_config, now).expect("valid token");
-        assert_eq!(user, "11111111-1111-1111-1111-111111111111");
+        let ticket =
+            verify_relay_ticket(&token, session_id, &auth_config, now).expect("valid token");
+        assert_eq!(ticket.user_id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(ticket.jti, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[test]
+    fn test_verify_relay_ticket_once_rejects_replay() {
+        let (key_pair, auth_config) = test_auth_materials();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let now = 1_739_790_000_u64;
+        let sid = format!("{:016x}", u64::from_be_bytes(session_id));
+        let token = make_ticket_token(&key_pair, &sid, "us-east-nj", now, now + 300);
+        let replay_cache = RelayTicketReplayCache::new();
+
+        assert!(
+            verify_relay_ticket_once(&token, session_id, &auth_config, now, &replay_cache).is_ok()
+        );
+        let replay =
+            verify_relay_ticket_once(&token, session_id, &auth_config, now + 1, &replay_cache);
+        assert!(matches!(replay, Err(RelayAuthVerifyError::Replay)));
+    }
+
+    #[test]
+    fn test_ticket_replay_cache_expires_old_jti() {
+        let cache = RelayTicketReplayCache::new();
+
+        assert!(cache.accept_once("jti-a", 100, 90));
+        assert!(!cache.accept_once("jti-a", 100, 91));
+        assert!(cache.accept_once("jti-a", 200, 131));
+    }
+
+    #[test]
+    fn test_ticket_replay_cache_prunes_on_interval() {
+        let cache = RelayTicketReplayCache::new();
+
+        assert!(cache.accept_once("jti-stale", 50, 90));
+        assert!(!cache.accept_once("jti-stale", 50, 100));
+        assert!(cache.accept_once("jti-stale", 200, 121));
     }
 
     #[test]
@@ -2934,7 +3532,7 @@ mod auth_config_utility_tests {
 
     #[test]
     fn test_from_env_none() {
-        assert_eq!(RelayAuthMode::from_env(None), RelayAuthMode::Off);
+        assert_eq!(RelayAuthMode::from_env(None), RelayAuthMode::Required);
     }
 
     #[test]
@@ -2951,6 +3549,178 @@ mod auth_config_utility_tests {
             RelayAuthMode::from_env(Some("REQUIRED".into())),
             RelayAuthMode::Required
         );
+    }
+
+    #[test]
+    fn test_source_rate_state_resets_after_window() {
+        let now = Instant::now();
+        let mut state = SourceRateState::new(now);
+        state.packets = MAX_PACKETS_PER_SOURCE_WINDOW;
+
+        assert!(!state.allow(SourceLimitKind::Packet, now));
+        assert!(state.allow(
+            SourceLimitKind::Packet,
+            now + SOURCE_RATE_WINDOW + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn test_source_rate_buckets_are_independent() {
+        let now = Instant::now();
+        let mut state = SourceRateState::new(now);
+        state.new_sessions = MAX_NEW_SESSIONS_PER_SOURCE_WINDOW;
+
+        assert!(!state.allow(SourceLimitKind::NewSession, now));
+        assert!(state.allow(SourceLimitKind::NewFlow, now));
+        assert!(state.allow(SourceLimitKind::Packet, now));
+    }
+
+    #[test]
+    fn test_allow_source_event_records_rate_limit_drop() {
+        let limiter = SourceRateLimiter::new();
+        let stats = Stats::new();
+        let client_addr: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+        let now = Instant::now();
+        let mut saturated = SourceRateState::new(now);
+        saturated.new_flows = MAX_NEW_FLOWS_PER_SOURCE_WINDOW;
+        limiter.sources.insert(client_addr.ip(), saturated);
+
+        assert!(!allow_source_event(
+            &limiter,
+            &stats,
+            client_addr,
+            SourceLimitKind::NewFlow,
+            now
+        ));
+        assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.throttled_users.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.drop_reasons.rate_limit.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_source_rate_limiter_prunes_idle_sources() {
+        let limiter = SourceRateLimiter::new();
+        let now = limiter.created_at + SOURCE_RATE_PRUNE_INTERVAL + Duration::from_millis(1);
+        let stale_ip: IpAddr = "203.0.113.10".parse().unwrap();
+        let active_ip: IpAddr = "203.0.113.11".parse().unwrap();
+
+        limiter.sources.insert(
+            stale_ip,
+            SourceRateState::new(now - SOURCE_RATE_IDLE_TTL - Duration::from_secs(1)),
+        );
+        limiter.sources.insert(active_ip, SourceRateState::new(now));
+
+        assert!(limiter.allow(active_ip, SourceLimitKind::Packet, now));
+        assert!(!limiter.sources.contains_key(&stale_ip));
+        assert!(limiter.sources.contains_key(&active_ip));
+    }
+
+    #[test]
+    fn test_v1_flow_capacity_uses_session_flow_index() {
+        let flows = DashMap::new();
+        let session_flow_keys = DashMap::new();
+        let stats = Stats::new();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+
+        session_flow_keys.insert(
+            session_id,
+            (0..MAX_FLOWS_PER_SESSION)
+                .map(|idx| format!("0123456789abcdef:203.0.113.1:{}", idx))
+                .collect(),
+        );
+
+        assert!(!v1_flow_capacity_available(
+            &flows,
+            &session_flow_keys,
+            &stats,
+            session_id
+        ));
+        assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.drop_reasons.capacity.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_source_session_counts_track_rebind_and_removal() {
+        let source_session_counts = DashMap::new();
+        let old_ip: IpAddr = "198.51.100.10".parse().unwrap();
+        let new_ip: IpAddr = "198.51.100.11".parse().unwrap();
+
+        increment_source_session_count(&source_session_counts, old_ip);
+        assert_eq!(source_session_count(&source_session_counts, old_ip), 1);
+
+        update_source_session_count_for_rebind(&source_session_counts, old_ip, new_ip);
+        assert_eq!(source_session_count(&source_session_counts, old_ip), 0);
+        assert_eq!(source_session_count(&source_session_counts, new_ip), 1);
+
+        decrement_source_session_count(&source_session_counts, new_ip);
+        assert_eq!(source_session_count(&source_session_counts, new_ip), 0);
+    }
+
+    #[test]
+    fn test_v1_session_capacity_uses_source_session_counter() {
+        let sessions = DashMap::new();
+        let source_session_counts = DashMap::new();
+        let stats = Stats::new();
+        let source_ip: IpAddr = "198.51.100.10".parse().unwrap();
+        source_session_counts.insert(source_ip, MAX_SESSIONS_PER_SRC_IP as u64);
+
+        assert!(!v1_session_capacity_available(
+            &sessions,
+            &source_session_counts,
+            &stats,
+            source_ip
+        ));
+        assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.drop_reasons.capacity.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_authenticated_session_source_rejects_forged_address() {
+        let session = SessionEntry {
+            user_id: "user".to_string(),
+            auth_state: SessionAuthState::Authenticated,
+            client_addr: "198.51.100.10:40000".parse().unwrap(),
+            created_at_unix: 1,
+            last_activity: Instant::now(),
+            last_activity_unix: 1,
+        };
+
+        assert!(authenticated_session_source_allowed(
+            &session,
+            true,
+            "198.51.100.10:40001".parse().unwrap(),
+            false
+        ));
+        assert!(!authenticated_session_source_allowed(
+            &session,
+            true,
+            "203.0.113.55:40000".parse().unwrap(),
+            false
+        ));
+        assert!(authenticated_session_source_allowed(
+            &session,
+            true,
+            "203.0.113.55:40000".parse().unwrap(),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_v1_session_flow_index_removes_only_target_flow() {
+        let index = DashMap::new();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        index.insert(
+            session_id,
+            vec![
+                "0123456789abcdef:1.1.1.1:1000".to_string(),
+                "0123456789abcdef:2.2.2.2:2000".to_string(),
+            ],
+        );
+
+        remove_v1_session_flow_key(&index, session_id, "0123456789abcdef:1.1.1.1:1000");
+
+        let keys = index.get(&session_id).unwrap();
+        assert_eq!(keys.as_slice(), ["0123456789abcdef:2.2.2.2:2000"]);
     }
 
     // ---- RelayAuthMode::as_str tests ----
@@ -2979,7 +3749,7 @@ mod auth_config_utility_tests {
 
     #[test]
     fn test_requires_auth_optional() {
-        assert!(!RelayAuthMode::Optional.requires_auth());
+        assert!(RelayAuthMode::Optional.requires_auth());
     }
 
     #[test]
@@ -3036,6 +3806,12 @@ mod auth_config_utility_tests {
             RelayAuthVerifyError::ServerMismatch.ack_status(),
             AUTH_ACK_SERVER_MISMATCH
         );
+    }
+
+    #[test]
+    fn test_ack_status_replay() {
+        assert_eq!(RelayAuthVerifyError::Replay.ack_status(), AUTH_ACK_REPLAY);
+        assert_ne!(AUTH_ACK_REPLAY, AUTH_ACK_BAD_SIGNATURE);
     }
 
     // ---- decode_base64_flexible tests ----
@@ -3539,9 +4315,9 @@ mod packet_construction_tests {
         packet[14] = 1;
         packet[15] = 1;
         // Dest IP
-        packet[16] = 10;
-        packet[17] = 0;
-        packet[18] = 0;
+        packet[16] = 8;
+        packet[17] = 8;
+        packet[18] = 8;
         packet[19] = 1;
         // UDP header starts at byte 24 (IHL=6, 6*4=24)
         // Source port = 5000
@@ -3563,7 +4339,7 @@ mod packet_construction_tests {
                 original_info: info,
                 ..
             } => {
-                assert_eq!(addr.ip().to_string(), "10.0.0.1");
+                assert_eq!(addr.ip().to_string(), "8.8.8.1");
                 assert_eq!(addr.port(), 6000);
                 assert_eq!(info.src_ip.to_string(), "192.168.1.1");
                 assert_eq!(info.src_port, 5000);
@@ -3621,6 +4397,50 @@ mod packet_construction_tests {
             }
             _ => panic!("Expected ParsedPacket::Tcp"),
         }
+    }
+
+    #[test]
+    fn test_forbidden_destinations_are_blocked() {
+        for ip in [
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(224, 0, 0, 251),
+            Ipv4Addr::new(255, 255, 255, 255),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(0, 1, 2, 3),
+            Ipv4Addr::new(240, 0, 0, 1),
+        ] {
+            assert!(is_forbidden_dst(ip), "{ip} should be forbidden");
+        }
+        assert!(!is_forbidden_dst(Ipv4Addr::new(128, 116, 50, 10)));
+    }
+
+    #[test]
+    fn test_parse_ip_packet_drops_imds_destination() {
+        let mut packet = vec![0u8; 32];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[12] = 10;
+        packet[13] = 0;
+        packet[14] = 0;
+        packet[15] = 5;
+        packet[16] = 169;
+        packet[17] = 254;
+        packet[18] = 169;
+        packet[19] = 254;
+        packet[20] = 0x13;
+        packet[21] = 0x88;
+        packet[22] = 0x00;
+        packet[23] = 0x50;
+        stamp_ipv4_lengths(&mut packet);
+
+        assert!(matches!(
+            parse_ip_packet_full(&packet),
+            Some(ParsedPacket::ForbiddenDst)
+        ));
     }
 
     #[test]
@@ -3746,6 +4566,10 @@ mod packet_construction_tests {
         packet[13] = 16;
         packet[14] = 0;
         packet[15] = 1;
+        packet[16] = 8;
+        packet[17] = 8;
+        packet[18] = 8;
+        packet[19] = 8;
         stamp_ipv4_lengths(&mut packet);
         packet[6] = 0x20; // more-fragments flag
 
@@ -3865,7 +4689,7 @@ mod packet_construction_tests {
     #[test]
     fn test_build_response_ip_checksum_validity() {
         let original = OriginalPacketInfo {
-            src_ip: "10.0.0.5".parse().unwrap(),
+            src_ip: "8.8.8.8".parse().unwrap(),
             src_port: 54321,
             dst_ip: "1.2.3.4".parse().unwrap(),
             dst_port: 12345,
@@ -3981,7 +4805,7 @@ mod packet_construction_tests {
     #[test]
     fn test_roundtrip_build_then_parse() {
         let original = OriginalPacketInfo {
-            src_ip: "10.0.0.5".parse().unwrap(),
+            src_ip: "8.8.8.8".parse().unwrap(),
             src_port: 54321,
             dst_ip: "1.2.3.4".parse().unwrap(),
             dst_port: 12345,
@@ -4004,10 +4828,10 @@ mod packet_construction_tests {
                 assert_eq!(info.src_ip.to_string(), "1.2.3.4");
                 assert_eq!(info.src_port, 12345);
                 // Dest IP = original.src_ip (client)
-                assert_eq!(info.dst_ip.to_string(), "10.0.0.5");
+                assert_eq!(info.dst_ip.to_string(), "8.8.8.8");
                 assert_eq!(info.dst_port, 54321);
                 // SocketAddr should point to the packet's dest (the client)
-                assert_eq!(addr.ip().to_string(), "10.0.0.5");
+                assert_eq!(addr.ip().to_string(), "8.8.8.8");
                 assert_eq!(addr.port(), 54321);
                 // Payload should survive roundtrip
                 assert_eq!(parsed_payload, payload);
@@ -4461,14 +5285,18 @@ mod async_stats_http_tests {
     fn test_render_stats_includes_drop_reasons_and_config() {
         let ctx = make_stats_context();
         ctx.stats.drop_in(DropReason::Auth);
+        ctx.stats.drop_in(DropReason::ForbiddenDst);
+        ctx.stats.drop_in(DropReason::TcpDisabled);
         ctx.stats.drop_in(DropReason::StaleQueue);
         ctx.stats.drop_out(DropReason::TxQueue);
 
         let payload = render_stats_payload(&ctx);
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(parsed["dropped_in"], 2);
+        assert_eq!(parsed["dropped_in"], 4);
         assert_eq!(parsed["dropped_out"], 1);
         assert_eq!(parsed["drops"]["auth"], 1);
+        assert_eq!(parsed["drops"]["forbidden_dst"], 1);
+        assert_eq!(parsed["drops"]["tcp_disabled"], 1);
         assert_eq!(parsed["drops"]["stale_queue"], 1);
         assert_eq!(parsed["drops"]["tx_queue"], 1);
         assert_eq!(parsed["config"]["datapath"], "v2");

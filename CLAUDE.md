@@ -14,7 +14,7 @@ Use this runbook for the authenticated relay rollout (ticket handshake + auth mo
 ## Non-Negotiables
 
 1. Roll out canary first, then fleet.
-2. First rollout mode is always `RELAY_AUTH_MODE=optional` (not `required`).
+2. Relays fail closed: deploy with `RELAY_AUTH_MODE=required` unless an incident explicitly sets `RELAY_AUTH_MODE=off` together with `RELAY_ALLOW_INSECURE=1`.
 3. Every server must have the correct `RELAY_SERVER_ID` for that host/region.
 4. Validate each canary before touching more servers.
 5. Keep rollback steps ready before each deployment wave.
@@ -64,7 +64,7 @@ sudo tee /etc/systemd/system/v3-relay.service.d/10-auth.conf >/dev/null <<'EOF'
 [Service]
 Environment=RELAY_STATS_PORT=51822
 Environment=RELAY_STATS_TOKEN=__RELAY_STATS_TOKEN__
-Environment=RELAY_AUTH_MODE=optional
+Environment=RELAY_AUTH_MODE=required
 Environment=RELAY_AUTH_PUBLIC_KEY_B64=__RELAY_AUTH_PUBLIC_KEY_B64__
 Environment=RELAY_SERVER_ID=__RELAY_SERVER_ID__
 Environment=RELAY_TUN_UDP=false
@@ -109,7 +109,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart v3-relay
 ```
 
-`setup-tun.sh` only needs to install the NAT/FORWARD prerequisites. The relay itself now re-applies `swifttun0` link-up state and `10.200.0.1/16` on every start, so a plain service restart should not leave the TUN device down/unaddressed anymore.
+`setup-tun.sh` installs the NAT/FORWARD prerequisites, forbidden-destination drops for private/link-local/loopback/multicast/CGNAT ranges, and persists the relay socket-buffer sysctls (`rmem_max`/`wmem_max` 16 MiB, defaults 8 MiB). The deploy helpers abort if this setup script fails and print `/tmp/swifttunnel-setup-tun.log`; do not start a relay that lacks those TUN/firewall prerequisites. The relay itself now re-applies `swifttun0` link-up state and `10.200.0.1/16` on every start, so a plain service restart should not leave the TUN device down/unaddressed anymore.
 
 ## Canary Verification Checklist
 
@@ -161,6 +161,8 @@ After canaries are healthy:
 You may use `deploy.sh` only as a binary distribution helper, but still apply per-server auth env overrides manually because `RELAY_SERVER_ID` differs per host.
 
 Operational note:
+- Desktop API tunneling depends on relay TCP forwarding. Keep `RELAY_TCP_ENABLED=true` on production relays; if it is off, TCP packets are counted under the structured `tcp_disabled` drop reason instead of being silently consumed. Forbidden relay destinations are counted under `forbidden_dst`.
+- Public relay datapaths apply per-source packet/new-session/new-flow buckets before state allocation and emit structured `rate_limit`/`capacity` drops. Auth tickets are single-use per `jti`, and authenticated sessions do not rebind to a different source IP from bare data/keepalive frames.
 - Treat `RELAY_STATS_TOKEN=` with an empty value as broken config, not as "already set". The current `deploy.sh` and `manual-deploy-host.sh` helpers regenerate empty tokens and keep `RELAY_STATS_PORT=51822` plus `RELAY_FLOW_CHANNEL_CAPACITY=256` present in `/etc/swifttunnel/relay.env`.
 - Preserve the lock order `sessions -> session_traffic` in relay code. If RX
   keeps a `session_traffic` `DashMap` guard alive while later mutating
@@ -169,22 +171,18 @@ Operational note:
 
 ## Rollback
 
-Fast rollback on a host (keep new binary, disable auth enforcement path):
+Emergency rollback on a host (keep new binary, explicitly disable auth enforcement path):
 
-1. Edit drop-in to set `RELAY_AUTH_MODE=off`.
+1. Edit drop-in to set `RELAY_AUTH_MODE=off` and `RELAY_ALLOW_INSECURE=1`.
 2. `sudo systemctl daemon-reload && sudo systemctl restart v3-relay`.
 
 If service/binary regression exists:
 
 1. Redeploy previous known-good commit with `deploy-single.sh`.
-2. Keep `RELAY_AUTH_MODE=off` until issue is resolved.
+2. Keep `RELAY_AUTH_MODE=off` with `RELAY_ALLOW_INSECURE=1` only until the issue is resolved.
 
 ## Post-Deployment Migration Steps
 
-1. Keep relay in `optional` mode during migration window.
+1. Keep relay and web auth policy in `required` mode.
 2. Release updated app and observe adoption (`auth_state` in relay connections).
-3. After adoption is stable, coordinate:
-   - web `RELAY_AUTH_MODE=required`
-   - relay `RELAY_AUTH_MODE=required`
-
-Do not switch to `required` until app adoption and canary/fleet telemetry are healthy.
+3. If an incident requires insecure fallback, document the host, reason, and cleanup time before setting `RELAY_ALLOW_INSECURE=1`.

@@ -11,7 +11,8 @@ ExecStart=/usr/local/bin/swifttunnel-relay
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
-Environment=RELAY_TCP_ENABLED=false
+Environment=RELAY_AUTH_MODE=required
+Environment=RELAY_TCP_ENABLED=true
 Environment=RELAY_TUN_UDP=false
 
 # Security hardening

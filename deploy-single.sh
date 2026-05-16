@@ -51,6 +51,7 @@ $SCP_CMD "$SCRIPT_DIR/src/main.rs" "$SERVER:/tmp/v3-relay/src/"
 $SCP_CMD "$SCRIPT_DIR/src/datapath_v2.rs" "$SERVER:/tmp/v3-relay/src/"
 $SCP_CMD "$SCRIPT_DIR/src/tcp_tun.rs" "$SERVER:/tmp/v3-relay/src/"
 $SCP_CMD "$SCRIPT_DIR/v3-relay.service" "$SERVER:/tmp/v3-relay/"
+$SCP_CMD "$SCRIPT_DIR/setup-tun.sh" "$SERVER:/tmp/v3-relay/"
 
 # Build and install
 $SSH_CMD "$SERVER" "
@@ -73,8 +74,14 @@ $SSH_CMD "$SERVER" "
     $SUDO chmod +x /usr/local/bin/swifttunnel-relay.new
     $SUDO mv -f /usr/local/bin/swifttunnel-relay.new /usr/local/bin/swifttunnel-relay
     $SUDO cp v3-relay.service /etc/systemd/system/
+    $SUDO install -m 0755 setup-tun.sh /usr/local/sbin/swifttunnel-setup-tun
+    if ! $SUDO /usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log 2>&1; then
+        echo 'swifttunnel-setup-tun failed; refusing to start relay without TUN/firewall prerequisites' >&2
+        cat /tmp/swifttunnel-setup-tun.log >&2 || true
+        exit 1
+    fi
 
-    # Ensure env + forced UDP-TUN rollback override exist
+    # Ensure env + TCP API tunneling + forced UDP-TUN rollback override exist
     $SUDO mkdir -p /etc/swifttunnel
     $SUDO mkdir -p /etc/systemd/system/v3-relay.service.d
     if [ ! -f /etc/swifttunnel/relay.env ]; then
@@ -82,6 +89,19 @@ $SSH_CMD "$SERVER" "
     fi
     grep -q '^RELAY_STATS_PORT=' /etc/swifttunnel/relay.env || echo 'RELAY_STATS_PORT=51822' | $SUDO tee -a /etc/swifttunnel/relay.env >/dev/null
     grep -q '^RELAY_FLOW_CHANNEL_CAPACITY=' /etc/swifttunnel/relay.env || echo 'RELAY_FLOW_CHANNEL_CAPACITY=256' | $SUDO tee -a /etc/swifttunnel/relay.env >/dev/null
+    grep -q '^RELAY_AUTH_MODE=' /etc/swifttunnel/relay.env || echo 'RELAY_AUTH_MODE=required' | $SUDO tee -a /etc/swifttunnel/relay.env >/dev/null
+    auth_mode=\$(grep -E '^RELAY_AUTH_MODE=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || true)
+    auth_key=\$(grep -E '^RELAY_AUTH_PUBLIC_KEY_B64=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || true)
+    auth_server=\$(grep -E '^RELAY_SERVER_ID=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || true)
+    allow_insecure=\$(grep -E '^RELAY_ALLOW_INSECURE=' /etc/swifttunnel/relay.env | head -n1 | cut -d= -f2- || true)
+    if [ \"\$auth_mode\" = 'off' ] && [ \"\$allow_insecure\" != '1' ]; then
+        echo 'RELAY_AUTH_MODE=off requires RELAY_ALLOW_INSECURE=1' >&2
+        exit 1
+    fi
+    if [ \"\$auth_mode\" != 'off' ] && { [ -z \"\$auth_key\" ] || [ -z \"\$auth_server\" ]; }; then
+        echo 'Relay auth is required but RELAY_AUTH_PUBLIC_KEY_B64 or RELAY_SERVER_ID is missing in /etc/swifttunnel/relay.env' >&2
+        exit 1
+    fi
     cat > /tmp/10-env.conf <<EOF
 [Service]
 EnvironmentFile=/etc/swifttunnel/relay.env
@@ -92,6 +112,11 @@ EOF
 Environment=RELAY_TUN_UDP=false
 EOF
     $SUDO mv -f /tmp/90-disable-tun-udp.conf /etc/systemd/system/v3-relay.service.d/90-disable-tun-udp.conf
+    cat > /tmp/20-tcp.conf <<EOF
+[Service]
+Environment=RELAY_TCP_ENABLED=true
+EOF
+    $SUDO mv -f /tmp/20-tcp.conf /etc/systemd/system/v3-relay.service.d/20-tcp.conf
 
     # Enable and start
     $SUDO systemctl daemon-reload
