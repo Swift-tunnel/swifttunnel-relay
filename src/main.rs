@@ -1790,6 +1790,10 @@ async fn main() -> Result<()> {
         };
 
         match parsed {
+            ParsedPacket::ForbiddenDst => {
+                stats.drop_in(DropReason::ForbiddenDst);
+                continue;
+            }
             ParsedPacket::Fragment {
                 protocol,
                 src_ip,
@@ -2863,6 +2867,7 @@ pub(crate) enum ParsedPacket<'a> {
         src_ip: Ipv4Addr,
         raw_ip_packet: &'a [u8],
     },
+    ForbiddenDst,
 }
 
 /// Parse an IP packet and extract protocol-specific information.
@@ -2870,7 +2875,8 @@ pub(crate) enum ParsedPacket<'a> {
 /// Returns `ParsedPacket::Udp` for UDP (protocol 17) with the game address,
 /// payload, and original packet info. Returns `ParsedPacket::Tcp` for TCP
 /// (protocol 6) with the original packet info and a reference to the raw IP
-/// packet. Returns `None` for other protocols or malformed packets.
+/// packet. Returns `ParsedPacket::ForbiddenDst` for blocked destinations.
+/// Returns `None` for other protocols or malformed packets.
 fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     if packet.len() < IP_HEADER_MIN {
         return None;
@@ -2900,14 +2906,14 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
 
     // Extract destination IP (bytes 16-19)
     let dst_ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    if is_forbidden_dst(dst_ip) {
-        return None;
-    }
 
     let fragment_bits = u16::from_be_bytes([packet[6], packet[7]]);
     let more_fragments = (fragment_bits & 0x2000) != 0;
     let fragment_offset = fragment_bits & 0x1FFF;
     if more_fragments || fragment_offset != 0 {
+        if is_forbidden_dst(dst_ip) {
+            return Some(ParsedPacket::ForbiddenDst);
+        }
         return Some(ParsedPacket::Fragment {
             protocol,
             src_ip,
@@ -2951,6 +2957,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_port,
             };
 
+            if is_forbidden_dst(dst_ip) {
+                return Some(ParsedPacket::ForbiddenDst);
+            }
+
             Some(ParsedPacket::Udp {
                 game_addr: SocketAddr::from((dst_ip, dst_port)),
                 payload,
@@ -2979,6 +2989,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_ip,
                 dst_port,
             };
+
+            if is_forbidden_dst(dst_ip) {
+                return Some(ParsedPacket::ForbiddenDst);
+            }
 
             Some(ParsedPacket::Tcp {
                 original_info,
@@ -4398,7 +4412,10 @@ mod packet_construction_tests {
         packet[23] = 0x50;
         stamp_ipv4_lengths(&mut packet);
 
-        assert!(parse_ip_packet_full(&packet).is_none());
+        assert!(matches!(
+            parse_ip_packet_full(&packet),
+            Some(ParsedPacket::ForbiddenDst)
+        ));
     }
 
     #[test]

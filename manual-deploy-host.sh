@@ -99,7 +99,7 @@ install -m 0755 /tmp/swifttunnel-relay /usr/local/bin/swifttunnel-relay.new
 mv -f /usr/local/bin/swifttunnel-relay.new /usr/local/bin/swifttunnel-relay
 mv -f /tmp/v3-relay.service /etc/systemd/system/v3-relay.service
 install -m 0755 /tmp/setup-tun.sh /usr/local/sbin/swifttunnel-setup-tun
-/usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log
+/usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log 2>&1
 
 # Ensure env + token for localhost stats + TCP API tunneling exists
 mkdir -p /etc/swifttunnel

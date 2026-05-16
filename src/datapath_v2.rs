@@ -1416,6 +1416,10 @@ pub(super) async fn run_datapath_v2(
                 };
 
                 match parsed {
+                    super::ParsedPacket::ForbiddenDst => {
+                        stats_rx.drop_in(super::DropReason::ForbiddenDst);
+                        continue;
+                    }
                     super::ParsedPacket::Fragment {
                         protocol,
                         src_ip,
