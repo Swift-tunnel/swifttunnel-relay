@@ -1245,6 +1245,11 @@ pub(super) async fn run_datapath_v2(
                     ) {
                         Ok(ticket) => {
                             if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
+                                super::update_source_session_count_for_rebind(
+                                    &source_session_counts_rx,
+                                    session_entry.client_addr.ip(),
+                                    client_addr.ip(),
+                                );
                                 session_entry.user_id = ticket.user_id;
                                 session_entry.auth_state = super::SessionAuthState::Authenticated;
                                 session_entry.client_addr = client_addr;

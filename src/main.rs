@@ -294,6 +294,10 @@ fn is_cgnat_ipv4(ip: Ipv4Addr) -> bool {
     a == 100 && (64..=127).contains(&b)
 }
 
+fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceLimitKind {
     Packet,
@@ -572,6 +576,7 @@ pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || ip.is_broadcast()
         || ip.is_unspecified()
+        || is_reserved_ipv4(ip)
         || is_cgnat_ipv4(ip)
 }
 
@@ -1636,6 +1641,11 @@ async fn main() -> Result<()> {
             {
                 Ok(ticket) => {
                     if let Some(mut session_entry) = sessions.get_mut(&session_id) {
+                        update_source_session_count_for_rebind(
+                            &source_session_counts,
+                            session_entry.client_addr.ip(),
+                            client_addr.ip(),
+                        );
                         session_entry.user_id = ticket.user_id;
                         session_entry.auth_state = SessionAuthState::Authenticated;
                         session_entry.client_addr = client_addr;
@@ -4387,6 +4397,7 @@ mod packet_construction_tests {
             Ipv4Addr::new(224, 0, 0, 251),
             Ipv4Addr::new(255, 255, 255, 255),
             Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(240, 0, 0, 1),
         ] {
             assert!(is_forbidden_dst(ip), "{ip} should be forbidden");
         }
