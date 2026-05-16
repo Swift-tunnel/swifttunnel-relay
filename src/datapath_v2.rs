@@ -372,6 +372,9 @@ fn create_flow_socket(game_addr: SocketAddr) -> Result<MioUdpSocket> {
     socket
         .set_send_buffer_size(get_flow_socket_sndbuf_bytes())
         .context("Failed to set flow SO_SNDBUF")?;
+    if let Err(e) = socket.set_recv_tos(true) {
+        log::debug!("Failed to enable IP_RECVTOS on flow socket: {}", e);
+    }
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
         .context("Failed to bind flow socket")?;
@@ -385,11 +388,69 @@ fn create_flow_socket(game_addr: SocketAddr) -> Result<MioUdpSocket> {
     Ok(MioUdpSocket::from_std(std_socket))
 }
 
+#[cfg(unix)]
+fn recv_flow_response(
+    socket: &MioUdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<u8>)> {
+    use std::os::fd::AsRawFd;
+
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+
+    let len = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
+    if len < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let tos = unsafe { extract_ipv4_tos_from_control(&msg) };
+    Ok((len as usize, tos))
+}
+
+#[cfg(unix)]
+unsafe fn extract_ipv4_tos_from_control(msg: &libc::msghdr) -> Option<u8> {
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        let header = unsafe { &*cmsg };
+        if header.cmsg_level == libc::IPPROTO_IP && header.cmsg_type == libc::IP_TOS {
+            let data = unsafe { libc::CMSG_DATA(cmsg) };
+            return Some(unsafe { *data });
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn recv_flow_response(
+    socket: &MioUdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<u8>)> {
+    socket.recv(buf).map(|len| (len, None))
+}
+
 /// Write a reconstructed IPv4+UDP packet into `dst` from a response payload.
 fn write_response_ip_packet_into(
     dst: &mut [u8],
     udp_payload: &[u8],
     original: super::OriginalPacketInfo,
+) -> Option<usize> {
+    write_response_ip_packet_into_with_tos(dst, udp_payload, original, original.tos)
+}
+
+fn write_response_ip_packet_into_with_tos(
+    dst: &mut [u8],
+    udp_payload: &[u8],
+    original: super::OriginalPacketInfo,
+    tos: u8,
 ) -> Option<usize> {
     let udp_len = super::UDP_HEADER_SIZE + udp_payload.len();
     let total_len = super::IP_HEADER_MIN + udp_len;
@@ -401,7 +462,7 @@ fn write_response_ip_packet_into(
 
     // === IP Header (20 bytes) ===
     packet[0] = 0x45; // v4, ihl=5
-    packet[1] = 0; // DSCP/ECN
+    packet[1] = tos; // DSCP/ECN
     packet[2] = ((total_len >> 8) & 0xFF) as u8;
     packet[3] = (total_len & 0xFF) as u8;
     // Identification (unused when DF is set; keep deterministic to avoid RNG overhead).
@@ -542,8 +603,8 @@ fn run_shard(
 
             // Drain a bounded burst so one hot game flow cannot monopolize the shard.
             for _ in 0..MAX_FLOW_RECV_BURST {
-                match flow.socket.recv(&mut recv_buf) {
-                    Ok(len) => {
+                match recv_flow_response(&flow.socket, &mut recv_buf) {
+                    Ok((len, response_tos)) => {
                         let received_at = Instant::now();
                         flow.last_activity = received_at;
                         flow.marked_for_removal = None;
@@ -562,10 +623,11 @@ fn run_shard(
                         let total_len = unsafe {
                             let out = pool.buffer_mut(buf_idx);
                             out[..super::SESSION_ID_LEN].copy_from_slice(&flow_key.session_id);
-                            let ip_len = match write_response_ip_packet_into(
+                            let ip_len = match write_response_ip_packet_into_with_tos(
                                 &mut out[super::SESSION_ID_LEN..],
                                 &recv_buf[..len],
                                 flow.original_info,
+                                response_tos.unwrap_or(flow.original_info.tos),
                             ) {
                                 Some(value) => value,
                                 None => {
@@ -1675,6 +1737,7 @@ mod tests {
 
     fn test_original_info() -> super::super::OriginalPacketInfo {
         super::super::OriginalPacketInfo {
+            tos: 0,
             src_ip: "10.0.0.5".parse().unwrap(),
             src_port: 54321,
             dst_ip: "1.2.3.4".parse().unwrap(),
@@ -1844,13 +1907,15 @@ mod tests {
     #[test]
     fn test_write_response_ip_packet_into_normal() {
         let payload = b"hello game";
-        let original = test_original_info();
+        let mut original = test_original_info();
+        original.tos = 0xb8;
         let total = super::super::IP_HEADER_MIN + super::super::UDP_HEADER_SIZE + payload.len();
         let mut buf = vec![0u8; total + 64]; // extra room
         let result = write_response_ip_packet_into(&mut buf, payload, original);
         assert_eq!(result, Some(total));
         // IP version+IHL
         assert_eq!(buf[0], 0x45);
+        assert_eq!(buf[1], 0xb8);
         // Protocol = UDP (17)
         assert_eq!(buf[9], 17);
         // TTL = 64
