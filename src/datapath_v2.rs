@@ -868,6 +868,7 @@ pub(super) async fn run_datapath_v2(
 
     let sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>> =
         Arc::new(DashMap::new());
+    let source_session_counts: Arc<DashMap<std::net::IpAddr, u64>> = Arc::new(DashMap::new());
 
     if let Some(token) = stats_token {
         let ctx = Arc::new(super::StatsApiContext {
@@ -985,6 +986,7 @@ pub(super) async fn run_datapath_v2(
 
     // Session cleanup task (drops sessions and signals shard flow cleanup).
     let sessions_cleanup = Arc::clone(&sessions);
+    let source_session_counts_cleanup = Arc::clone(&source_session_counts);
     let session_traffic_cleanup = Arc::clone(&session_traffic);
     let stats_cleanup = Arc::clone(&stats);
     let shard_senders_cleanup = shard_senders.clone();
@@ -1001,6 +1003,10 @@ pub(super) async fn run_datapath_v2(
             sessions_cleanup.retain(|session_id, session| {
                 if now.duration_since(session.last_activity) >= session_idle_limit {
                     session_traffic_cleanup.remove(session_id);
+                    super::decrement_source_session_count(
+                        &source_session_counts_cleanup,
+                        session.client_addr.ip(),
+                    );
                     sessions_removed += 1;
                     stats_cleanup
                         .active_sessions
@@ -1078,6 +1084,7 @@ pub(super) async fn run_datapath_v2(
     // RX thread.
     let auth_config_rx = auth_config.clone();
     let sessions_rx = Arc::clone(&sessions);
+    let source_session_counts_rx = Arc::clone(&source_session_counts);
     let session_traffic_rx = Arc::clone(&session_traffic);
     let stats_rx = Arc::clone(&stats);
     let pool_rx = Arc::clone(&pool);
@@ -1134,8 +1141,8 @@ pub(super) async fn run_datapath_v2(
                         stats_rx.drop_in(super::DropReason::Capacity);
                         continue;
                     }
-                    if super::active_sessions_for_source(&sessions_rx, client_addr.ip())
-                        >= super::MAX_SESSIONS_PER_SRC_IP
+                    if super::source_session_count(&source_session_counts_rx, client_addr.ip())
+                        >= super::MAX_SESSIONS_PER_SRC_IP as u64
                     {
                         stats_rx.drop_in(super::DropReason::Capacity);
                         continue;
@@ -1169,6 +1176,11 @@ pub(super) async fn run_datapath_v2(
                             || !session_authenticated
                             || session.client_addr.ip() == client_addr.ip()
                         {
+                            super::update_source_session_count_for_rebind(
+                                &source_session_counts_rx,
+                                session.client_addr.ip(),
+                                client_addr.ip(),
+                            );
                             session.client_addr = client_addr;
                             session.last_activity = now;
                             session.last_activity_unix = now_unix;
@@ -1183,6 +1195,10 @@ pub(super) async fn run_datapath_v2(
                             last_activity: now,
                             last_activity_unix: now_unix,
                         });
+                        super::increment_source_session_count(
+                            &source_session_counts_rx,
+                            client_addr.ip(),
+                        );
                         stats_rx.active_sessions.fetch_add(1, Ordering::Relaxed);
                     }
                 }

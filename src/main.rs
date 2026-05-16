@@ -430,15 +430,47 @@ impl RelayTicketReplayCache {
     }
 }
 
-fn active_sessions_for_source(
-    sessions: &DashMap<[u8; SESSION_ID_LEN], SessionEntry>,
+pub(crate) fn source_session_count(
+    source_session_counts: &DashMap<IpAddr, u64>,
     source_ip: IpAddr,
-) -> usize {
-    sessions
-        .iter()
-        .filter(|entry| entry.client_addr.ip() == source_ip)
-        .take(MAX_SESSIONS_PER_SRC_IP)
-        .count()
+) -> u64 {
+    source_session_counts
+        .get(&source_ip)
+        .map_or(0, |count| *count)
+}
+
+pub(crate) fn increment_source_session_count(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    source_ip: IpAddr,
+) {
+    let mut count = source_session_counts.entry(source_ip).or_insert(0);
+    *count += 1;
+}
+
+pub(crate) fn decrement_source_session_count(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    source_ip: IpAddr,
+) {
+    if let Some(mut count) = source_session_counts.get_mut(&source_ip) {
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+    }
+    source_session_counts.remove(&source_ip);
+}
+
+pub(crate) fn update_source_session_count_for_rebind(
+    source_session_counts: &DashMap<IpAddr, u64>,
+    old_ip: IpAddr,
+    new_ip: IpAddr,
+) {
+    if old_ip == new_ip {
+        return;
+    }
+
+    decrement_source_session_count(source_session_counts, old_ip);
+    increment_source_session_count(source_session_counts, new_ip);
 }
 
 fn indexed_session_flow_count(
@@ -468,6 +500,7 @@ pub(crate) fn allow_source_event(
 
 fn v1_session_capacity_available(
     sessions: &DashMap<[u8; SESSION_ID_LEN], SessionEntry>,
+    source_session_counts: &DashMap<IpAddr, u64>,
     stats: &Stats,
     source_ip: IpAddr,
 ) -> bool {
@@ -476,7 +509,7 @@ fn v1_session_capacity_available(
         return false;
     }
 
-    if active_sessions_for_source(sessions, source_ip) >= MAX_SESSIONS_PER_SRC_IP {
+    if source_session_count(source_session_counts, source_ip) >= MAX_SESSIONS_PER_SRC_IP as u64 {
         stats.drop_in(DropReason::Capacity);
         return false;
     }
@@ -1283,6 +1316,7 @@ async fn main() -> Result<()> {
 
     // Session tracking
     let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
+    let source_session_counts: Arc<DashMap<IpAddr, u64>> = Arc::new(DashMap::new());
 
     // Flow tracking: "session_hex:game_addr" -> FlowEntry
     let flows: Arc<DashMap<String, FlowEntry>> = Arc::new(DashMap::new());
@@ -1342,6 +1376,7 @@ async fn main() -> Result<()> {
 
     // Spawn cleanup task with soft-delete grace period
     let sessions_cleanup = Arc::clone(&sessions);
+    let source_session_counts_cleanup = Arc::clone(&source_session_counts);
     let flows_cleanup = Arc::clone(&flows);
     let session_flow_keys_cleanup = Arc::clone(&session_flow_keys);
     let stats_cleanup = Arc::clone(&stats);
@@ -1401,6 +1436,10 @@ async fn main() -> Result<()> {
             sessions_cleanup.retain(|session_id, session| {
                 if now.duration_since(session.last_activity) >= session_idle_limit {
                     session_traffic_cleanup.remove(session_id);
+                    decrement_source_session_count(
+                        &source_session_counts_cleanup,
+                        session.client_addr.ip(),
+                    );
                     sessions_removed += 1;
                     stats_cleanup
                         .active_sessions
@@ -1507,7 +1546,12 @@ async fn main() -> Result<()> {
         }
 
         if !sessions.contains_key(&session_id) {
-            if !v1_session_capacity_available(&sessions, &stats, client_addr.ip()) {
+            if !v1_session_capacity_available(
+                &sessions,
+                &source_session_counts,
+                &stats,
+                client_addr.ip(),
+            ) {
                 continue;
             }
             if !allow_source_event(
@@ -1540,6 +1584,11 @@ async fn main() -> Result<()> {
                     || !session_authenticated
                     || session.client_addr.ip() == client_addr.ip()
                 {
+                    update_source_session_count_for_rebind(
+                        &source_session_counts,
+                        session.client_addr.ip(),
+                        client_addr.ip(),
+                    );
                     session.client_addr = client_addr;
                     session.last_activity = now;
                     session.last_activity_unix = now_unix;
@@ -1554,6 +1603,7 @@ async fn main() -> Result<()> {
                     last_activity: now,
                     last_activity_unix: now_unix,
                 });
+                increment_source_session_count(&source_session_counts, client_addr.ip());
                 stats.active_sessions.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -3547,6 +3597,41 @@ mod auth_config_utility_tests {
             &session_flow_keys,
             &stats,
             session_id
+        ));
+        assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.drop_reasons.capacity.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_source_session_counts_track_rebind_and_removal() {
+        let source_session_counts = DashMap::new();
+        let old_ip: IpAddr = "198.51.100.10".parse().unwrap();
+        let new_ip: IpAddr = "198.51.100.11".parse().unwrap();
+
+        increment_source_session_count(&source_session_counts, old_ip);
+        assert_eq!(source_session_count(&source_session_counts, old_ip), 1);
+
+        update_source_session_count_for_rebind(&source_session_counts, old_ip, new_ip);
+        assert_eq!(source_session_count(&source_session_counts, old_ip), 0);
+        assert_eq!(source_session_count(&source_session_counts, new_ip), 1);
+
+        decrement_source_session_count(&source_session_counts, new_ip);
+        assert_eq!(source_session_count(&source_session_counts, new_ip), 0);
+    }
+
+    #[test]
+    fn test_v1_session_capacity_uses_source_session_counter() {
+        let sessions = DashMap::new();
+        let source_session_counts = DashMap::new();
+        let stats = Stats::new();
+        let source_ip: IpAddr = "198.51.100.10".parse().unwrap();
+        source_session_counts.insert(source_ip, MAX_SESSIONS_PER_SRC_IP as u64);
+
+        assert!(!v1_session_capacity_available(
+            &sessions,
+            &source_session_counts,
+            &stats,
+            source_ip
         ));
         assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
         assert_eq!(stats.drop_reasons.capacity.load(Ordering::Relaxed), 1);
