@@ -298,6 +298,10 @@ fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
     ip.octets()[0] >= 240
 }
 
+fn is_this_network_ipv4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceLimitKind {
     Packet,
@@ -354,14 +358,16 @@ impl SourceRateState {
 
 pub(crate) struct SourceRateLimiter {
     sources: DashMap<IpAddr, SourceRateState>,
-    last_prune: Mutex<Instant>,
+    created_at: Instant,
+    last_prune_ms: AtomicU64,
 }
 
 impl SourceRateLimiter {
     fn new() -> Self {
         Self {
             sources: DashMap::new(),
-            last_prune: Mutex::new(Instant::now()),
+            created_at: Instant::now(),
+            last_prune_ms: AtomicU64::new(0),
         }
     }
 
@@ -374,20 +380,28 @@ impl SourceRateLimiter {
     }
 
     fn prune_idle(&self, now: Instant) {
-        let mut last_prune = match self.last_prune.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if now.saturating_duration_since(*last_prune) < SOURCE_RATE_PRUNE_INTERVAL {
+        let now_ms = duration_millis_u64(now.saturating_duration_since(self.created_at));
+        let last_prune_ms = self.last_prune_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_prune_ms) < duration_millis_u64(SOURCE_RATE_PRUNE_INTERVAL) {
             return;
         }
-        *last_prune = now;
-        drop(last_prune);
+
+        if self
+            .last_prune_ms
+            .compare_exchange(last_prune_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
 
         self.sources.retain(|_, state| {
             now.saturating_duration_since(state.window_start) < SOURCE_RATE_IDLE_TTL
         });
     }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 struct RelayTicketReplayCache {
@@ -576,6 +590,7 @@ pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || ip.is_broadcast()
         || ip.is_unspecified()
+        || is_this_network_ipv4(ip)
         || is_reserved_ipv4(ip)
         || is_cgnat_ipv4(ip)
 }
@@ -3585,7 +3600,7 @@ mod auth_config_utility_tests {
     #[test]
     fn test_source_rate_limiter_prunes_idle_sources() {
         let limiter = SourceRateLimiter::new();
-        let now = Instant::now();
+        let now = limiter.created_at + SOURCE_RATE_PRUNE_INTERVAL + Duration::from_millis(1);
         let stale_ip: IpAddr = "203.0.113.10".parse().unwrap();
         let active_ip: IpAddr = "203.0.113.11".parse().unwrap();
 
@@ -3594,8 +3609,6 @@ mod auth_config_utility_tests {
             SourceRateState::new(now - SOURCE_RATE_IDLE_TTL - Duration::from_secs(1)),
         );
         limiter.sources.insert(active_ip, SourceRateState::new(now));
-        *limiter.last_prune.lock().unwrap() =
-            now - SOURCE_RATE_PRUNE_INTERVAL - Duration::from_secs(1);
 
         assert!(limiter.allow(active_ip, SourceLimitKind::Packet, now));
         assert!(!limiter.sources.contains_key(&stale_ip));
@@ -4397,6 +4410,7 @@ mod packet_construction_tests {
             Ipv4Addr::new(224, 0, 0, 251),
             Ipv4Addr::new(255, 255, 255, 255),
             Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(0, 1, 2, 3),
             Ipv4Addr::new(240, 0, 0, 1),
         ] {
             assert!(is_forbidden_dst(ip), "{ip} should be forbidden");
