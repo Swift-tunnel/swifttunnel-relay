@@ -84,6 +84,7 @@ const RELAY_ALLOW_INSECURE_ENV: &str = "RELAY_ALLOW_INSECURE";
 const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(1);
 const SOURCE_RATE_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const SOURCE_RATE_IDLE_TTL: Duration = Duration::from_secs(120);
+const REPLAY_CACHE_PRUNE_INTERVAL_SECS: u64 = 30;
 const MAX_PACKETS_PER_SOURCE_WINDOW: u32 = 50_000;
 const MAX_NEW_SESSIONS_PER_SOURCE_WINDOW: u32 = 256;
 const MAX_NEW_FLOWS_PER_SOURCE_WINDOW: u32 = 4096;
@@ -387,18 +388,19 @@ impl SourceRateLimiter {
 
 struct RelayTicketReplayCache {
     seen_jti: DashMap<String, u64>,
+    last_prune_unix: AtomicU64,
 }
 
 impl RelayTicketReplayCache {
     fn new() -> Self {
         Self {
             seen_jti: DashMap::new(),
+            last_prune_unix: AtomicU64::new(0),
         }
     }
 
     fn accept_once(&self, jti: &str, exp: u64, now_unix: u64) -> bool {
-        self.seen_jti
-            .retain(|_, seen_exp| now_unix <= seen_exp.saturating_add(AUTH_CLOCK_SKEW_SECS));
+        self.prune_expired(now_unix);
 
         match self.seen_jti.entry(jti.to_string()) {
             Entry::Occupied(_) => false,
@@ -407,6 +409,24 @@ impl RelayTicketReplayCache {
                 true
             }
         }
+    }
+
+    fn prune_expired(&self, now_unix: u64) {
+        let last_prune = self.last_prune_unix.load(Ordering::Relaxed);
+        if now_unix.saturating_sub(last_prune) < REPLAY_CACHE_PRUNE_INTERVAL_SECS {
+            return;
+        }
+
+        if self
+            .last_prune_unix
+            .compare_exchange(last_prune, now_unix, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.seen_jti
+            .retain(|_, seen_exp| now_unix <= seen_exp.saturating_add(AUTH_CLOCK_SKEW_SECS));
     }
 }
 
@@ -421,16 +441,13 @@ fn active_sessions_for_source(
         .count()
 }
 
-fn session_flow_count(
-    flows: &DashMap<String, FlowEntry>,
+fn indexed_session_flow_count(
+    session_flow_keys: &DashMap<[u8; SESSION_ID_LEN], Vec<String>>,
     session_id: [u8; SESSION_ID_LEN],
 ) -> usize {
-    let session_prefix = format!("{:016x}:", u64::from_be_bytes(session_id));
-    flows
-        .iter()
-        .filter(|entry| entry.key().starts_with(&session_prefix))
-        .take(MAX_FLOWS_PER_SESSION)
-        .count()
+    session_flow_keys
+        .get(&session_id)
+        .map_or(0, |keys| keys.len())
 }
 
 pub(crate) fn allow_source_event(
@@ -469,6 +486,7 @@ fn v1_session_capacity_available(
 
 fn v1_flow_capacity_available(
     flows: &DashMap<String, FlowEntry>,
+    session_flow_keys: &DashMap<[u8; SESSION_ID_LEN], Vec<String>>,
     stats: &Stats,
     session_id: [u8; SESSION_ID_LEN],
 ) -> bool {
@@ -477,7 +495,7 @@ fn v1_flow_capacity_available(
         return false;
     }
 
-    if session_flow_count(flows, session_id) >= MAX_FLOWS_PER_SESSION {
+    if indexed_session_flow_count(session_flow_keys, session_id) >= MAX_FLOWS_PER_SESSION {
         stats.drop_in(DropReason::Capacity);
         return false;
     }
@@ -1859,7 +1877,12 @@ async fn main() -> Result<()> {
                         }
                     }
                     Entry::Vacant(entry) => {
-                        if !v1_flow_capacity_available(&flows, &stats, session_id) {
+                        if !v1_flow_capacity_available(
+                            &flows,
+                            &session_flow_keys,
+                            &stats,
+                            session_id,
+                        ) {
                             continue;
                         }
                         if !allow_source_event(
@@ -3257,6 +3280,15 @@ mod tests {
     }
 
     #[test]
+    fn test_ticket_replay_cache_prunes_on_interval() {
+        let cache = RelayTicketReplayCache::new();
+
+        assert!(cache.accept_once("jti-stale", 50, 90));
+        assert!(!cache.accept_once("jti-stale", 50, 100));
+        assert!(cache.accept_once("jti-stale", 200, 121));
+    }
+
+    #[test]
     fn test_verify_relay_ticket_sid_mismatch() {
         let (key_pair, auth_config) = test_auth_materials();
         let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
@@ -3494,6 +3526,30 @@ mod auth_config_utility_tests {
         assert!(limiter.allow(active_ip, SourceLimitKind::Packet, now));
         assert!(!limiter.sources.contains_key(&stale_ip));
         assert!(limiter.sources.contains_key(&active_ip));
+    }
+
+    #[test]
+    fn test_v1_flow_capacity_uses_session_flow_index() {
+        let flows = DashMap::new();
+        let session_flow_keys = DashMap::new();
+        let stats = Stats::new();
+        let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+
+        session_flow_keys.insert(
+            session_id,
+            (0..MAX_FLOWS_PER_SESSION)
+                .map(|idx| format!("0123456789abcdef:203.0.113.1:{}", idx))
+                .collect(),
+        );
+
+        assert!(!v1_flow_capacity_available(
+            &flows,
+            &session_flow_keys,
+            &stats,
+            session_id
+        ));
+        assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.drop_reasons.capacity.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -224,7 +224,11 @@ deploy_to_server() {
             $sudo_prefix mv -f ${REMOTE_BIN}.new $REMOTE_BIN
             $sudo_prefix mv /tmp/$SERVICE_FILE $REMOTE_SERVICE
             $sudo_prefix install -m 0755 /tmp/setup-tun.sh /usr/local/sbin/swifttunnel-setup-tun
-            $sudo_prefix /usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log
+            if ! $sudo_prefix /usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log 2>&1; then
+                echo 'swifttunnel-setup-tun failed; refusing to start relay without TUN/firewall prerequisites' >&2
+                cat /tmp/swifttunnel-setup-tun.log >&2 || true
+                exit 1
+            fi
         fi
 
         # Ensure env + token for localhost stats exists (needed by status/observability)

@@ -75,7 +75,11 @@ $SSH_CMD "$SERVER" "
     $SUDO mv -f /usr/local/bin/swifttunnel-relay.new /usr/local/bin/swifttunnel-relay
     $SUDO cp v3-relay.service /etc/systemd/system/
     $SUDO install -m 0755 setup-tun.sh /usr/local/sbin/swifttunnel-setup-tun
-    $SUDO /usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log
+    if ! $SUDO /usr/local/sbin/swifttunnel-setup-tun >/tmp/swifttunnel-setup-tun.log 2>&1; then
+        echo 'swifttunnel-setup-tun failed; refusing to start relay without TUN/firewall prerequisites' >&2
+        cat /tmp/swifttunnel-setup-tun.log >&2 || true
+        exit 1
+    fi
 
     # Ensure env + TCP API tunneling + forced UDP-TUN rollback override exist
     $SUDO mkdir -p /etc/swifttunnel

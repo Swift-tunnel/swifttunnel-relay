@@ -109,7 +109,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart v3-relay
 ```
 
-`setup-tun.sh` installs the NAT/FORWARD prerequisites, forbidden-destination drops for private/link-local/loopback/multicast/CGNAT ranges, and persists the relay socket-buffer sysctls (`rmem_max`/`wmem_max` 16 MiB, defaults 8 MiB). The relay itself now re-applies `swifttun0` link-up state and `10.200.0.1/16` on every start, so a plain service restart should not leave the TUN device down/unaddressed anymore.
+`setup-tun.sh` installs the NAT/FORWARD prerequisites, forbidden-destination drops for private/link-local/loopback/multicast/CGNAT ranges, and persists the relay socket-buffer sysctls (`rmem_max`/`wmem_max` 16 MiB, defaults 8 MiB). The deploy helpers abort if this setup script fails and print `/tmp/swifttunnel-setup-tun.log`; do not start a relay that lacks those TUN/firewall prerequisites. The relay itself now re-applies `swifttun0` link-up state and `10.200.0.1/16` on every start, so a plain service restart should not leave the TUN device down/unaddressed anymore.
 
 ## Canary Verification Checklist
 
