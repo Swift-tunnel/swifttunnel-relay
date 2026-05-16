@@ -77,10 +77,13 @@ const AUTH_ACK_EXPIRED: u8 = 3;
 const AUTH_ACK_SID_MISMATCH: u8 = 4;
 const AUTH_ACK_SERVER_MISMATCH: u8 = 5;
 const AUTH_ACK_AUTH_DISABLED: u8 = 6;
+const AUTH_ACK_REPLAY: u8 = 7;
 const MAX_AUTH_TOKEN_LEN: usize = 4096;
 const AUTH_CLOCK_SKEW_SECS: u64 = 30;
 const RELAY_ALLOW_INSECURE_ENV: &str = "RELAY_ALLOW_INSECURE";
 const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(1);
+const SOURCE_RATE_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+const SOURCE_RATE_IDLE_TTL: Duration = Duration::from_secs(120);
 const MAX_PACKETS_PER_SOURCE_WINDOW: u32 = 50_000;
 const MAX_NEW_SESSIONS_PER_SOURCE_WINDOW: u32 = 256;
 const MAX_NEW_FLOWS_PER_SOURCE_WINDOW: u32 = 4096;
@@ -231,8 +234,22 @@ impl RelayAuthVerifyError {
             Self::Expired => AUTH_ACK_EXPIRED,
             Self::SidMismatch => AUTH_ACK_SID_MISMATCH,
             Self::ServerMismatch => AUTH_ACK_SERVER_MISMATCH,
-            Self::Replay => AUTH_ACK_BAD_SIGNATURE,
+            Self::Replay => AUTH_ACK_REPLAY,
         }
+    }
+}
+
+fn log_auth_verify_error(
+    err: RelayAuthVerifyError,
+    client_addr: SocketAddr,
+    session_id: [u8; SESSION_ID_LEN],
+) {
+    if err == RelayAuthVerifyError::Replay {
+        log::warn!(
+            "Rejected replayed relay ticket from {} for session {:016x}",
+            client_addr,
+            u64::from_be_bytes(session_id)
+        );
     }
 }
 
@@ -332,20 +349,39 @@ impl SourceRateState {
 
 pub(crate) struct SourceRateLimiter {
     sources: DashMap<IpAddr, SourceRateState>,
+    last_prune: Mutex<Instant>,
 }
 
 impl SourceRateLimiter {
     fn new() -> Self {
         Self {
             sources: DashMap::new(),
+            last_prune: Mutex::new(Instant::now()),
         }
     }
 
     pub(crate) fn allow(&self, ip: IpAddr, kind: SourceLimitKind, now: Instant) -> bool {
+        self.prune_idle(now);
         self.sources
             .entry(ip)
             .or_insert_with(|| SourceRateState::new(now))
             .allow(kind, now)
+    }
+
+    fn prune_idle(&self, now: Instant) {
+        let mut last_prune = match self.last_prune.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if now.saturating_duration_since(*last_prune) < SOURCE_RATE_PRUNE_INTERVAL {
+            return;
+        }
+        *last_prune = now;
+        drop(last_prune);
+
+        self.sources.retain(|_, state| {
+            now.saturating_duration_since(state.window_start) < SOURCE_RATE_IDLE_TTL
+        });
     }
 }
 
@@ -1541,6 +1577,7 @@ async fn main() -> Result<()> {
                     send_auth_ack(socket.as_ref(), client_addr, session_id, AUTH_ACK_OK).await;
                 }
                 Err(err) => {
+                    log_auth_verify_error(err, client_addr, session_id);
                     send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
                 }
             }
@@ -3440,6 +3477,26 @@ mod auth_config_utility_tests {
     }
 
     #[test]
+    fn test_source_rate_limiter_prunes_idle_sources() {
+        let limiter = SourceRateLimiter::new();
+        let now = Instant::now();
+        let stale_ip: IpAddr = "203.0.113.10".parse().unwrap();
+        let active_ip: IpAddr = "203.0.113.11".parse().unwrap();
+
+        limiter.sources.insert(
+            stale_ip,
+            SourceRateState::new(now - SOURCE_RATE_IDLE_TTL - Duration::from_secs(1)),
+        );
+        limiter.sources.insert(active_ip, SourceRateState::new(now));
+        *limiter.last_prune.lock().unwrap() =
+            now - SOURCE_RATE_PRUNE_INTERVAL - Duration::from_secs(1);
+
+        assert!(limiter.allow(active_ip, SourceLimitKind::Packet, now));
+        assert!(!limiter.sources.contains_key(&stale_ip));
+        assert!(limiter.sources.contains_key(&active_ip));
+    }
+
+    #[test]
     fn test_authenticated_session_source_rejects_forged_address() {
         let session = SessionEntry {
             user_id: "user".to_string(),
@@ -3571,6 +3628,12 @@ mod auth_config_utility_tests {
             RelayAuthVerifyError::ServerMismatch.ack_status(),
             AUTH_ACK_SERVER_MISMATCH
         );
+    }
+
+    #[test]
+    fn test_ack_status_replay() {
+        assert_eq!(RelayAuthVerifyError::Replay.ack_status(), AUTH_ACK_REPLAY);
+        assert_ne!(AUTH_ACK_REPLAY, AUTH_ACK_BAD_SIGNATURE);
     }
 
     // ---- decode_base64_flexible tests ----

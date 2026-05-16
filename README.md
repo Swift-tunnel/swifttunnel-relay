@@ -195,7 +195,7 @@ When `RELAY_STATS_TOKEN` is set, the localhost stats API exposes:
 
 Drop reasons currently include auth, rate limit, capacity, too-small frames, parse, fragment, forbidden destination, TCP-disabled, pool, stale queue, shard queue, TX queue, TUN queue, flow queue, flow create, flow send, and socket send failures. The public datapaths enforce per-source packet/new-session/new-flow buckets plus hard session/flow caps before allocating new relay state.
 
-Relay tickets are single-use per `jti` until their expiry window passes. Authenticated sessions only accept ordinary data/keepalive endpoint updates from the same source IP; a different source IP must present a fresh auth frame instead of rewriting `client_addr` with a bare session id.
+Relay tickets are single-use per `jti` until their expiry window passes; replayed tickets return auth ack status `7` and are logged at warning level. Authenticated sessions only accept ordinary data/keepalive endpoint updates from the same source IP; a different source IP must present a fresh auth frame instead of rewriting `client_addr` with a bare session id.
 
 ### systemd Service
 
@@ -339,7 +339,7 @@ When `RELAY_TCP_ENABLED=true`, the relay uses the same TUN device (`swifttun0`) 
 sudo ./setup-tun.sh
 ```
 
-This enables IP forwarding, raises relay UDP socket buffer sysctls, installs FORWARD drops for private, loopback, link-local, multicast, reserved, and CGNAT destinations, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping at 1340 bytes so large API/asset responses fit the relay's 1400-byte `swifttun0` MTU without relying on PMTU discovery. The relay handles the runtime `swifttun0` address/link setup itself on each start.
+This enables IP forwarding, raises relay UDP socket buffer sysctls, installs FORWARD drops for private, loopback, link-local, multicast, reserved, and CGNAT destinations ahead of the managed outbound ACCEPT rule, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping at 1340 bytes so large API/asset responses fit the relay's 1400-byte `swifttun0` MTU without relying on PMTU discovery. The relay handles the runtime `swifttun0` address/link setup itself on each start.
 
 **Enable:**
 ```bash
@@ -382,6 +382,7 @@ Auth ack status codes:
 - `4` sid_mismatch
 - `5` server_mismatch
 - `6` auth_disabled
+- `7` replay
 
 **Keepalive:** Send just the session ID (8 bytes, no payload) every 15-20 seconds to maintain NAT bindings.
 

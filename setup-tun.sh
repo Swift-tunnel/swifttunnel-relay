@@ -89,6 +89,12 @@ else
 fi
 
 # 7. FORWARD rules — needed when default FORWARD policy is DROP (e.g. UFW)
+while iptables -D FORWARD -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT 2>/dev/null; do
+    :
+done
+echo "[+] Adding managed FORWARD ACCEPT rule for $TUN_DEVICE → $PRIMARY_IF..."
+iptables -I FORWARD 1 -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT
+
 FORBIDDEN_FORWARD_DESTS=(
     "0.0.0.0/8"
     "10.0.0.0/8"
@@ -101,20 +107,12 @@ FORBIDDEN_FORWARD_DESTS=(
     "240.0.0.0/4"
 )
 for dst in "${FORBIDDEN_FORWARD_DESTS[@]}"; do
-    if ! iptables -C FORWARD -i "$TUN_DEVICE" -d "$dst" -j DROP 2>/dev/null; then
-        echo "[+] Adding FORWARD DROP rule for forbidden destination $dst..."
-        iptables -I FORWARD 1 -i "$TUN_DEVICE" -d "$dst" -j DROP
-    else
-        echo "[=] FORWARD DROP rule for $dst already exists"
-    fi
+    while iptables -D FORWARD -i "$TUN_DEVICE" -d "$dst" -j DROP 2>/dev/null; do
+        :
+    done
+    echo "[+] Adding FORWARD DROP rule for forbidden destination $dst..."
+    iptables -I FORWARD 1 -i "$TUN_DEVICE" -d "$dst" -j DROP
 done
-
-if ! iptables -C FORWARD -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT 2>/dev/null; then
-    echo "[+] Adding FORWARD ACCEPT rule for $TUN_DEVICE → $PRIMARY_IF..."
-    iptables -I FORWARD 1 -i "$TUN_DEVICE" -o "$PRIMARY_IF" -s "$TUN_SUBNET" -j ACCEPT
-else
-    echo "[=] FORWARD outbound rule already exists"
-fi
 
 if ! iptables -C FORWARD -i "$PRIMARY_IF" -o "$TUN_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
     echo "[+] Adding FORWARD ACCEPT rule for return traffic → $TUN_DEVICE..."

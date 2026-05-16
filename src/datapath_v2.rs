@@ -1246,6 +1246,7 @@ pub(super) async fn run_datapath_v2(
                             );
                         }
                         Err(err) => {
+                            super::log_auth_verify_error(err, client_addr, session_id);
                             send_small_control_frame(
                                 &tx_control_rx,
                                 &pool_rx,
