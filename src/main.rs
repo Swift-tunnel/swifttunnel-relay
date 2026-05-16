@@ -848,6 +848,9 @@ fn derive_user_id(session_id: [u8; SESSION_ID_LEN]) -> String {
 /// Original packet info needed to reconstruct responses
 #[derive(Clone, Copy)]
 struct OriginalPacketInfo {
+    /// Client packet DSCP/ECN byte. Used as the response default when the
+    /// upstream socket does not provide a received TOS control message.
+    tos: u8,
     /// Client's source IP (tunnel IP like 10.0.0.x)
     src_ip: std::net::Ipv4Addr,
     /// Client's source port
@@ -2087,7 +2090,7 @@ async fn run_flow_handler(
     }
 
     // Create socket for this flow
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    let socket = match bind_v1_flow_socket() {
         Ok(s) => s,
         Err(e) => {
             log::warn!("Failed to create flow socket: {}", e);
@@ -2221,6 +2224,21 @@ async fn run_flow_handler(
     flows.remove(&flow_key);
     remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
     log::trace!("Flow {} ended", flow_key);
+}
+
+fn bind_v1_flow_socket() -> std::io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if let Err(e) = socket.set_recv_tos(true) {
+        log::debug!("Failed to enable IP_RECVTOS on v1 flow socket: {}", e);
+    }
+    socket.bind(&std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    std_socket.set_nonblocking(true)?;
+    UdpSocket::from_std(std_socket)
 }
 
 async fn run_stats_http_server(
@@ -2976,6 +2994,7 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
             };
 
             let original_info = OriginalPacketInfo {
+                tos: packet[1],
                 src_ip,
                 src_port,
                 dst_ip,
@@ -3009,6 +3028,7 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
             }
 
             let original_info = OriginalPacketInfo {
+                tos: packet[1],
                 src_ip,
                 src_port,
                 dst_ip,
@@ -3031,6 +3051,14 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
 /// Build a response IP packet from game server response
 /// Swaps source/dest so response goes back to client
 fn build_response_ip_packet(udp_payload: &[u8], original: OriginalPacketInfo) -> Vec<u8> {
+    build_response_ip_packet_with_tos(udp_payload, original, original.tos)
+}
+
+fn build_response_ip_packet_with_tos(
+    udp_payload: &[u8],
+    original: OriginalPacketInfo,
+    tos: u8,
+) -> Vec<u8> {
     let udp_len = UDP_HEADER_SIZE + udp_payload.len();
     let total_len = IP_HEADER_MIN + udp_len;
 
@@ -3040,7 +3068,7 @@ fn build_response_ip_packet(udp_payload: &[u8], original: OriginalPacketInfo) ->
     // Version (4) + IHL (5 = 20 bytes)
     packet[0] = 0x45;
     // DSCP + ECN
-    packet[1] = 0;
+    packet[1] = tos;
     // Total length
     packet[2] = ((total_len >> 8) & 0xFF) as u8;
     packet[3] = (total_len & 0xFF) as u8;
@@ -3251,6 +3279,7 @@ mod tests {
     fn test_build_response_ip_packet() {
         let payload = &[0x01, 0x02, 0x03, 0x04];
         let original = OriginalPacketInfo {
+            tos: 0x2e,
             src_ip: "10.0.0.5".parse().unwrap(),
             src_port: 54321,
             dst_ip: "1.2.3.4".parse().unwrap(),
@@ -3264,6 +3293,7 @@ mod tests {
 
         // Check IP version
         assert_eq!((packet[0] >> 4) & 0x0F, 4);
+        assert_eq!(packet[1], 0x2e);
 
         // Check protocol is UDP
         assert_eq!(packet[9], 17);
@@ -3284,6 +3314,23 @@ mod tests {
 
         // Check payload
         assert_eq!(&packet[28..32], payload);
+    }
+
+    #[test]
+    fn test_build_response_can_use_received_tos_override() {
+        let original = OriginalPacketInfo {
+            tos: 0x00,
+            src_ip: "10.0.0.5".parse().unwrap(),
+            src_port: 54321,
+            dst_ip: "1.2.3.4".parse().unwrap(),
+            dst_port: 12345,
+        };
+
+        let packet = build_response_ip_packet_with_tos(&[0x01], original, 0x03);
+
+        assert_eq!(packet[1], 0x03);
+        let verify = calculate_ip_checksum(&packet[..IP_HEADER_MIN]);
+        assert!(verify == 0 || verify == 0xFFFF);
     }
 
     #[test]
@@ -4636,6 +4683,7 @@ mod packet_construction_tests {
     #[test]
     fn test_build_response_zero_length_payload() {
         let original = OriginalPacketInfo {
+            tos: 0,
             src_ip: "10.0.0.1".parse().unwrap(),
             src_port: 1234,
             dst_ip: "1.2.3.4".parse().unwrap(),
@@ -4654,6 +4702,7 @@ mod packet_construction_tests {
     fn test_build_response_normal_payload_field_check() {
         let payload = &[0xAA, 0xBB, 0xCC];
         let original = OriginalPacketInfo {
+            tos: 0,
             src_ip: "192.168.1.100".parse().unwrap(),
             src_port: 40000,
             dst_ip: "93.184.216.34".parse().unwrap(),
@@ -4689,6 +4738,7 @@ mod packet_construction_tests {
     #[test]
     fn test_build_response_ip_checksum_validity() {
         let original = OriginalPacketInfo {
+            tos: 0,
             src_ip: "8.8.8.8".parse().unwrap(),
             src_port: 54321,
             dst_ip: "1.2.3.4".parse().unwrap(),
@@ -4714,6 +4764,7 @@ mod packet_construction_tests {
     #[test]
     fn test_build_response_address_port_swapping() {
         let original = OriginalPacketInfo {
+            tos: 0,
             src_ip: "10.0.0.5".parse().unwrap(),
             src_port: 11111,
             dst_ip: "20.30.40.50".parse().unwrap(),
@@ -4805,6 +4856,7 @@ mod packet_construction_tests {
     #[test]
     fn test_roundtrip_build_then_parse() {
         let original = OriginalPacketInfo {
+            tos: 0,
             src_ip: "8.8.8.8".parse().unwrap(),
             src_port: 54321,
             dst_ip: "1.2.3.4".parse().unwrap(),

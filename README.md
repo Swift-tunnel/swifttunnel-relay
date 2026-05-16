@@ -197,6 +197,8 @@ Drop reasons currently include auth, rate limit, capacity, too-small frames, par
 
 Relay tickets are single-use per `jti` until their expiry window passes; replayed tickets return auth ack status `7` and are logged at warning level. Authenticated sessions only accept ordinary data/keepalive endpoint updates from the same source IP; a different source IP must present a fresh auth frame instead of rewriting `client_addr` with a bare session id.
 
+Reconstructed UDP response packets preserve the IPv4 DSCP/ECN byte from the client packet by default, and per-flow sockets enable `IP_RECVTOS` so future response-side TOS plumbing does not silently collapse QoS/ECN metadata to zero.
+
 ### systemd Service
 
 ```ini
