@@ -496,6 +496,7 @@ fn run_shard(
     sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>>,
     stats: Arc<super::Stats>,
     flow_counts: Arc<Vec<AtomicU64>>,
+    source_limiter: Arc<super::SourceRateLimiter>,
     waker_pub: crossbeam_channel::Sender<(usize, Arc<Waker>)>,
 ) -> Result<()> {
     const TOKEN_WAKE: Token = Token(0);
@@ -637,6 +638,33 @@ fn run_shard(
                     let flow = match flows.get_mut(&key) {
                         Some(existing) => existing,
                         None => {
+                            let total_flows: usize = flow_counts
+                                .iter()
+                                .map(|value| value.load(Ordering::Relaxed) as usize)
+                                .sum();
+                            if total_flows >= super::MAX_FLOWS_TOTAL {
+                                stats.drop_in(super::DropReason::Capacity);
+                                pool.release(payload_idx);
+                                continue;
+                            }
+                            if session_flows.get(&session_id).map_or(0, Vec::len)
+                                >= super::MAX_FLOWS_PER_SESSION
+                            {
+                                stats.drop_in(super::DropReason::Capacity);
+                                pool.release(payload_idx);
+                                continue;
+                            }
+                            if !super::allow_source_event(
+                                &source_limiter,
+                                &stats,
+                                client_addr,
+                                super::SourceLimitKind::NewFlow,
+                                Instant::now(),
+                            ) {
+                                pool.release(payload_idx);
+                                continue;
+                            }
+
                             let mut socket = match create_flow_socket(game_addr) {
                                 Ok(sock) => sock,
                                 Err(e) => {
@@ -820,6 +848,8 @@ pub(super) async fn run_datapath_v2(
     tun_udp_enabled: bool,
     tcp_enabled: bool,
     session_traffic: Arc<DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>>,
+    source_limiter: Arc<super::SourceRateLimiter>,
+    replay_cache: Arc<super::RelayTicketReplayCache>,
 ) -> Result<()> {
     let tuning = relay_v2_tuning();
     let shard_count = tuning.shard_count;
@@ -917,6 +947,7 @@ pub(super) async fn run_datapath_v2(
         let sessions = Arc::clone(&sessions);
         let stats = Arc::clone(&stats);
         let flow_counts = Arc::clone(&flow_counts);
+        let source_limiter = Arc::clone(&source_limiter);
         let waker_pub = waker_pub_s.clone();
 
         let shard_handle = std::thread::Builder::new()
@@ -931,6 +962,7 @@ pub(super) async fn run_datapath_v2(
                     sessions,
                     stats,
                     flow_counts,
+                    source_limiter,
                     waker_pub,
                 )
             })
@@ -1055,6 +1087,8 @@ pub(super) async fn run_datapath_v2(
     let tun_tx_sender_rx = tun_tx_sender;
     let tun_udp_enabled_rx = tun_udp_enabled;
     let tcp_enabled_rx = tcp_enabled;
+    let source_limiter_rx = Arc::clone(&source_limiter);
+    let replay_cache_rx = Arc::clone(&replay_cache);
     let rx_thread = std::thread::Builder::new()
         .name("relay-rx".to_string())
         .spawn(move || -> Result<()> {
@@ -1082,18 +1116,59 @@ pub(super) async fn run_datapath_v2(
 
                 let now = Instant::now();
                 let now_unix = super::unix_timestamp_secs();
+                let is_auth_hello = len >= super::SESSION_ID_LEN + 3
+                    && buf[super::SESSION_ID_LEN] == super::AUTH_HELLO_FRAME_TYPE;
+
+                if !super::allow_source_event(
+                    &source_limiter_rx,
+                    &stats_rx,
+                    client_addr,
+                    super::SourceLimitKind::Packet,
+                    now,
+                ) {
+                    continue;
+                }
+
+                if !sessions_rx.contains_key(&session_id) {
+                    if sessions_rx.len() >= super::MAX_SESSIONS_TOTAL {
+                        stats_rx.drop_in(super::DropReason::Capacity);
+                        continue;
+                    }
+                    if super::active_sessions_for_source(&sessions_rx, client_addr.ip())
+                        >= super::MAX_SESSIONS_PER_SRC_IP
+                    {
+                        stats_rx.drop_in(super::DropReason::Capacity);
+                        continue;
+                    }
+                    if !super::allow_source_event(
+                        &source_limiter_rx,
+                        &stats_rx,
+                        client_addr,
+                        super::SourceLimitKind::NewSession,
+                        now,
+                    ) {
+                        continue;
+                    }
+                }
 
                 let mut session_authenticated = false;
+                let mut session_source_allowed = true;
                 let auth_required = auth_config_rx.mode.requires_auth();
                 match sessions_rx.entry(session_id) {
                     dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                         let session = entry.get_mut();
                         session_authenticated =
                             matches!(session.auth_state, super::SessionAuthState::Authenticated);
-                        // Only trust client_addr updates from authenticated traffic when auth is
-                        // required; otherwise an unauthenticated attacker with a known session_id
-                        // can rewrite the session's observed client endpoint.
-                        if !auth_required || session_authenticated {
+                        session_source_allowed = super::authenticated_session_source_allowed(
+                            session,
+                            auth_required,
+                            client_addr,
+                            is_auth_hello,
+                        );
+                        if !auth_required
+                            || !session_authenticated
+                            || session.client_addr.ip() == client_addr.ip()
+                        {
                             session.client_addr = client_addr;
                             session.last_activity = now;
                             session.last_activity_unix = now_unix;
@@ -1115,9 +1190,7 @@ pub(super) async fn run_datapath_v2(
                 super::record_session_ingress(&session_traffic_rx, session_id, now_unix, len);
 
                 // Auth hello:
-                if len >= super::SESSION_ID_LEN + 3
-                    && buf[super::SESSION_ID_LEN] == super::AUTH_HELLO_FRAME_TYPE
-                {
+                if is_auth_hello {
                     if auth_config_rx.mode == super::RelayAuthMode::Off {
                         send_small_control_frame(
                             &tx_control_rx,
@@ -1147,11 +1220,20 @@ pub(super) async fn run_datapath_v2(
                         }
                     };
 
-                    match super::verify_relay_ticket(token, session_id, &auth_config_rx, now_unix) {
-                        Ok(user_id) => {
+                    match super::verify_relay_ticket_once(
+                        token,
+                        session_id,
+                        &auth_config_rx,
+                        now_unix,
+                        &replay_cache_rx,
+                    ) {
+                        Ok(ticket) => {
                             if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
-                                session_entry.user_id = user_id;
+                                session_entry.user_id = ticket.user_id;
                                 session_entry.auth_state = super::SessionAuthState::Authenticated;
+                                session_entry.client_addr = client_addr;
+                                session_entry.last_activity = now;
+                                session_entry.last_activity_unix = now_unix;
                             }
                             send_small_control_frame(
                                 &tx_control_rx,
@@ -1175,6 +1257,11 @@ pub(super) async fn run_datapath_v2(
                             );
                         }
                     }
+                    continue;
+                }
+
+                if !session_source_allowed {
+                    stats_rx.drop_in(super::DropReason::Auth);
                     continue;
                 }
 
@@ -1369,7 +1456,11 @@ pub(super) async fn run_datapath_v2(
                                 } else {
                                     stats_rx.tcp_forwarded.fetch_add(1, Ordering::Relaxed);
                                 }
+                            } else {
+                                stats_rx.drop_in(super::DropReason::TunQueue);
                             }
+                        } else {
+                            stats_rx.drop_in(super::DropReason::TcpDisabled);
                         }
                         if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
                             if !matches!(

@@ -308,8 +308,25 @@ mod platform {
                     Ipv4Addr::new(ip_packet[12], ip_packet[13], ip_packet[14], ip_packet[15]);
 
                 // Get or assign a TUN IP for this session.
-                let tun_ip = *session_to_ip.entry(pkt.session_id).or_insert_with(|| {
-                    let ip = assign_session_ip(&pkt.session_id, &ip_to_session);
+                let tun_ip = if let Some(existing) = session_to_ip.get(&pkt.session_id) {
+                    *existing
+                } else {
+                    let Some(ip) = assign_session_ip(&pkt.session_id, &ip_to_session) else {
+                        log::warn!(
+                            "TUN session {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} \
+                             has no collision-free TUN IP; dropping packet",
+                            pkt.session_id[0],
+                            pkt.session_id[1],
+                            pkt.session_id[2],
+                            pkt.session_id[3],
+                            pkt.session_id[4],
+                            pkt.session_id[5],
+                            pkt.session_id[6],
+                            pkt.session_id[7],
+                        );
+                        continue;
+                    };
+                    session_to_ip.insert(pkt.session_id, ip);
                     log::info!(
                         "TUN session {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} \
                              assigned TUN IP {}",
@@ -324,21 +341,33 @@ mod platform {
                         ip,
                     );
                     ip
-                });
+                };
 
                 // Update reverse mapping. Use entry API to avoid write-lock on
                 // the common case where only client_addr may change (NAT rebind).
+                let mut reverse_mapping_collision = false;
                 ip_to_session
                     .entry(tun_ip)
                     .and_modify(|m| {
-                        m.client_addr = pkt.client_addr;
-                        m.original_src_ip = original_src_ip;
+                        if m.session_id == pkt.session_id {
+                            m.client_addr = pkt.client_addr;
+                            m.original_src_ip = original_src_ip;
+                        } else {
+                            reverse_mapping_collision = true;
+                            log::warn!(
+                                "tun-writer: refusing to rewrite mapping for {} from another session",
+                                tun_ip
+                            );
+                        }
                     })
                     .or_insert_with(|| SessionMapping {
                         session_id: pkt.session_id,
                         client_addr: pkt.client_addr,
                         original_src_ip,
                     });
+                if reverse_mapping_collision {
+                    continue;
+                }
 
                 // Rewrite source IP to the assigned TUN IP.
                 rewrite_src_ip(&mut ip_packet, tun_ip);
@@ -491,14 +520,12 @@ pub use platform::TunHandler;
 /// Primary choice: `10.200.{session_id[0]}.{session_id[1]}`.
 /// On collision, fall back to successive byte pairs (2,3), (4,5), (6,7).
 /// If all valid candidates collide (astronomically unlikely with 8-byte random
-/// IDs), the last valid pair wins and overwrites. If every pair is reserved
-/// (`0.0` or `255.255`), fall back to `10.200.0.1`.
+/// IDs), return None so the packet is dropped instead of overwriting another
+/// session's reverse mapping.
 fn assign_session_ip(
     session_id: &[u8; 8],
     ip_to_session: &DashMap<Ipv4Addr, SessionMapping>,
-) -> Ipv4Addr {
-    let mut fallback = None;
-
+) -> Option<Ipv4Addr> {
     // Byte-pair candidates: (0,1), (2,3), (4,5), (6,7).
     for pair_idx in 0..4 {
         let a = session_id[pair_idx * 2];
@@ -510,7 +537,6 @@ fn assign_session_ip(
         }
 
         let candidate = Ipv4Addr::new(10, 200, a, b);
-        fallback = Some(candidate);
 
         // O(1) collision check via the reverse map instead of scanning session_to_ip.
         let collision = ip_to_session
@@ -518,11 +544,11 @@ fn assign_session_ip(
             .map_or(false, |m| m.session_id != *session_id);
 
         if !collision {
-            return candidate;
+            return Some(candidate);
         }
     }
 
-    fallback.unwrap_or(Ipv4Addr::new(10, 200, 0, 1))
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1195,7 @@ mod tests {
     fn test_assign_session_ip_basic() {
         let map: DashMap<Ipv4Addr, SessionMapping> = DashMap::new();
         let sid = [0x42, 0x07, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let ip = assign_session_ip(&sid, &map);
+        let ip = assign_session_ip(&sid, &map).unwrap();
         assert_eq!(ip, Ipv4Addr::new(10, 200, 0x42, 0x07));
     }
 
@@ -1179,13 +1205,13 @@ mod tests {
 
         // First session claims 10.200.42.7.
         let sid1 = [0x2A, 0x07, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-        let ip1 = assign_session_ip(&sid1, &map);
+        let ip1 = assign_session_ip(&sid1, &map).unwrap();
         map.insert(ip1, test_mapping(sid1));
         assert_eq!(ip1, Ipv4Addr::new(10, 200, 0x2A, 0x07));
 
         // Second session has same first two bytes but different remaining.
         let sid2 = [0x2A, 0x07, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC];
-        let ip2 = assign_session_ip(&sid2, &map);
+        let ip2 = assign_session_ip(&sid2, &map).unwrap();
         // Should fall back to bytes 2,3 since 0,1 collide.
         assert_eq!(ip2, Ipv4Addr::new(10, 200, 0x77, 0x88));
     }
@@ -1194,17 +1220,29 @@ mod tests {
     fn test_assign_session_ip_skips_zero() {
         let map: DashMap<Ipv4Addr, SessionMapping> = DashMap::new();
         let sid = [0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let ip = assign_session_ip(&sid, &map);
+        let ip = assign_session_ip(&sid, &map).unwrap();
         // First pair (0,0) is skipped, should use (0xAA, 0xBB).
         assert_eq!(ip, Ipv4Addr::new(10, 200, 0xAA, 0xBB));
     }
 
     #[test]
-    fn test_assign_session_ip_reserved_pairs_fallback() {
+    fn test_assign_session_ip_reserved_pairs_returns_none() {
         let map: DashMap<Ipv4Addr, SessionMapping> = DashMap::new();
         let sid = [0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF];
-        let ip = assign_session_ip(&sid, &map);
-        assert_eq!(ip, Ipv4Addr::new(10, 200, 0, 1));
+        assert_eq!(assign_session_ip(&sid, &map), None);
+    }
+
+    #[test]
+    fn test_assign_session_ip_full_collision_returns_none() {
+        let map: DashMap<Ipv4Addr, SessionMapping> = DashMap::new();
+        let sid: [u8; 8] = [0x2A, 0x07, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        for pair in [(0x2A, 0x07), (0x11, 0x22), (0x33, 0x44), (0x55, 0x66)] {
+            let ip = Ipv4Addr::new(10, 200, pair.0, pair.1);
+            let mut other = sid;
+            other[7] = other[7].wrapping_add(1);
+            map.insert(ip, test_mapping(other));
+        }
+        assert_eq!(assign_session_ip(&sid, &map), None);
     }
 
     #[test]

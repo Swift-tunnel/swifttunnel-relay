@@ -91,6 +91,9 @@ RELAY_STATS_TOKEN=change-me RELAY_STATS_PORT=51822 ./swifttunnel-relay
 
 # With debug logging
 RUST_LOG=debug ./swifttunnel-relay
+
+# Print version without binding relay ports
+./swifttunnel-relay --version
 ```
 
 ### Local Latency Probe
@@ -164,9 +167,10 @@ the harness does not create its own burst loss and falsely implicate the relay.
 | `RELAY_PORT` | `51821` | UDP port to listen on |
 | `RELAY_STATS_PORT` | `51822` | Localhost HTTP telemetry port (`127.0.0.1` only) |
 | `RELAY_STATS_TOKEN` | _(unset)_ | Enables/authenticates localhost telemetry API when set |
-| `RELAY_AUTH_MODE` | `off` | Relay auth mode: `off`, `optional`, `required` |
+| `RELAY_AUTH_MODE` | `required` | Relay auth mode. `optional` also gates forwarding on a valid ticket. `off` requires `RELAY_ALLOW_INSECURE=1` |
 | `RELAY_AUTH_PUBLIC_KEY_B64` | _(unset)_ | Ed25519 public key (required when auth mode is `optional`/`required`) |
 | `RELAY_SERVER_ID` | _(unset)_ | Server region identifier expected in ticket `srv` claim |
+| `RELAY_ALLOW_INSECURE` | _(unset)_ | Must be `1` before `RELAY_AUTH_MODE=off` is accepted |
 | `RELAY_DATAPATH` | `v2` | Datapath: `v1` (tokio per-flow tasks) or `v2` (sharded mio loop) |
 | `RELAY_SHARDS` | _(physical CPU count)_ | Shard count for `v2` (1..256) |
 | `RELAY_V2_POOL_SLOTS` | `8192` | Fixed buffer pool slots for `v2` (512..262144) |
@@ -177,7 +181,7 @@ the harness does not create its own burst loss and falsely implicate the relay.
 | `RELAY_FLOW_RCVBUF_BYTES` | `2097152` | `v2` per-flow socket SO_RCVBUF size |
 | `RELAY_FLOW_SNDBUF_BYTES` | `2097152` | `v2` per-flow socket SO_SNDBUF size |
 | `RELAY_FLOW_CHANNEL_CAPACITY` | `256` | `v1` only: bounded channel size per flow (clamped to 8..4096) |
-| `RELAY_TCP_ENABLED` | `false` | Enable TCP tunneling via TUN device (Linux only, requires `setup-tun.sh`) |
+| `RELAY_TCP_ENABLED` | `true` | Enable TCP tunneling via TUN device for client API tunneling (Linux only, requires `setup-tun.sh`) |
 | `RELAY_TUN_UDP` | `false` | Forward UDP IPv4 packets through the Linux TUN device instead of per-flow sockets (Linux only, requires `setup-tun.sh`) |
 | `RUST_LOG` | `info` | Log level (trace, debug, info, warn, error) |
 
@@ -189,7 +193,9 @@ When `RELAY_STATS_TOKEN` is set, the localhost stats API exposes:
 - `GET /v1/config`: relay version, datapath, auth mode, server ID, TUN flags, queue sizes, and requested/effective socket buffers.
 - `GET /v1/connections`: session-level connection snapshot.
 
-Drop reasons currently include auth, parse, fragment, pool, stale queue, shard queue, TX queue, TUN queue, flow queue, flow create, flow send, and socket send failures.
+Drop reasons currently include auth, rate limit, capacity, too-small frames, parse, fragment, forbidden destination, TCP-disabled, pool, stale queue, shard queue, TX queue, TUN queue, flow queue, flow create, flow send, and socket send failures. The public datapaths enforce per-source packet/new-session/new-flow buckets plus hard session/flow caps before allocating new relay state.
+
+Relay tickets are single-use per `jti` until their expiry window passes. Authenticated sessions only accept ordinary data/keepalive endpoint updates from the same source IP; a different source IP must present a fresh auth frame instead of rewriting `client_addr` with a bare session id.
 
 ### systemd Service
 
@@ -207,7 +213,7 @@ Environment=RELAY_PORT=51821
 Environment=RELAY_DATAPATH=v2
 Environment=RELAY_STATS_PORT=51822
 Environment=RELAY_STATS_TOKEN=replace-with-long-random-token
-Environment=RELAY_AUTH_MODE=optional
+Environment=RELAY_AUTH_MODE=required
 Environment=RELAY_AUTH_PUBLIC_KEY_B64=replace-with-ed25519-public-key
 Environment=RELAY_SERVER_ID=us-east-nj
 Environment=RELAY_TUN_UDP=false
@@ -333,7 +339,7 @@ When `RELAY_TCP_ENABLED=true`, the relay uses the same TUN device (`swifttun0`) 
 sudo ./setup-tun.sh
 ```
 
-This enables IP forwarding, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping. The relay handles the runtime `swifttun0` address/link setup itself on each start.
+This enables IP forwarding, raises relay UDP socket buffer sysctls, installs FORWARD drops for private, loopback, link-local, multicast, reserved, and CGNAT destinations, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping at 1340 bytes so large API/asset responses fit the relay's 1400-byte `swifttun0` MTU without relying on PMTU discovery. The relay handles the runtime `swifttun0` address/link setup itself on each start.
 
 **Enable:**
 ```bash
@@ -471,9 +477,11 @@ Use `/v1/connections` when you need exact per-session identity details. The stat
 For optimal performance on Linux:
 
 ```bash
-# Increase UDP buffer sizes
+# Increase UDP buffer sizes (setup-tun.sh persists these for deployed relays)
 sysctl -w net.core.rmem_max=16777216
 sysctl -w net.core.wmem_max=16777216
+sysctl -w net.core.rmem_default=8388608
+sysctl -w net.core.wmem_default=8388608
 
 # Enable BBR congestion control
 sysctl -w net.ipv4.tcp_congestion_control=bbr
