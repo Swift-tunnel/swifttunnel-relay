@@ -143,8 +143,8 @@ def test_relay(relay_host: str, relay_port: int = 51821):
 def main():
     if len(sys.argv) < 2:
         print("Usage: python test-relay.py <relay-host> [port]")
-        print("Example: python test-relay.py REDACTED-IP")
-        print("Example: python test-relay.py REDACTED-IP 51821")
+        print("Example: python test-relay.py 203.0.113.10")
+        print("Example: python test-relay.py 203.0.113.10 51821")
         sys.exit(1)
 
     host = sys.argv[1]

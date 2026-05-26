@@ -217,7 +217,7 @@ Environment=RELAY_STATS_PORT=51822
 Environment=RELAY_STATS_TOKEN=replace-with-long-random-token
 Environment=RELAY_AUTH_MODE=required
 Environment=RELAY_AUTH_PUBLIC_KEY_B64=replace-with-ed25519-public-key
-Environment=RELAY_SERVER_ID=us-east-nj
+Environment=RELAY_SERVER_ID=replace-with-server-id
 Environment=RELAY_TUN_UDP=false
 Restart=always
 RestartSec=5
@@ -343,7 +343,7 @@ sudo ./setup-tun.sh
 
 This enables IP forwarding, raises relay UDP socket buffer sysctls, installs FORWARD drops for private, loopback, link-local, multicast, reserved, and CGNAT destinations ahead of the managed outbound ACCEPT rule, configures NAT masquerade for the `10.200.0.0/16` TUN subnet, and adds TCP MSS clamping at 1340 bytes so large API/asset responses fit the relay's 1400-byte `swifttun0` MTU without relying on PMTU discovery. The relay handles the runtime `swifttun0` address/link setup itself on each start.
 
-`deploy.sh` and `deploy-single.sh` install and run this setup script before starting `v3-relay`; a setup failure aborts deployment and prints `/tmp/swifttunnel-setup-tun.log` so relays do not come online without the required TUN/firewall prerequisites.
+Run `setup-tun.sh` once per host before starting the relay. The script logs to `/tmp/swifttunnel-setup-tun.log` on failure — do not start the relay without successful TUN/firewall prerequisites.
 
 **Enable:**
 ```bash

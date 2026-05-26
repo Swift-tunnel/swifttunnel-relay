@@ -156,11 +156,6 @@ scp v3-relay.service                         root@SERVER:/tmp/
 ssh root@SERVER 'chmod +x /usr/local/bin/swifttunnel-relay /root/setup-tun.sh'
 ```
 
-> The repo's `deploy.sh` and `deploy-single.sh` scripts are intended for the
-> hosted multi-server fleet rollout — they hardcode the auth-enabled config.
-> For self-hosting, the manual `scp` + `systemctl` flow below is simpler and
-> easier to audit.
-
 ## Step 4 — Network setup (TUN + firewall + sysctls)
 
 SSH into the server and run the setup script. It's idempotent — re-running it
