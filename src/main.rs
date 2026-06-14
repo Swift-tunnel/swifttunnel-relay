@@ -99,6 +99,21 @@ const RTT_REPORT_FRAME_TYPE: u8 = 0xA5;
 /// [session_id:8][0xA5][rtt_us_be_u32] = 13 bytes
 const RTT_REPORT_FRAME_LEN: usize = SESSION_ID_LEN + 1 + 4;
 
+// Censorship-resistant DNS resolve (optional, backward-compatible). A client
+// behind a censor that blocks/poisons DNS asks the relay (which sits outside the
+// censorship) to resolve Roblox's real IPs, then pins them locally. Restricted
+// to Roblox-owned hostnames so the relay never becomes an open resolver.
+//
+// Request:  [session_id:8][0xA6][request_id_be_u16][host_count:1]
+//                                         [(host_len:1, host_utf8)]*
+// Response: [session_id:8][0xA7][request_id_be_u16][answer_count:1]
+//                       [(host_len:1, host_utf8, ip_count:1, (ipv4_be:4)*)]*
+const RESOLVE_REQUEST_FRAME_TYPE: u8 = 0xA6;
+const RESOLVE_RESPONSE_FRAME_TYPE: u8 = 0xA7;
+const RESOLVE_MAX_HOSTS_PER_REQUEST: usize = 16;
+const RESOLVE_MAX_HOSTNAME_LEN: usize = 64;
+const RESOLVE_MAX_IPS_PER_HOST: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayAuthMode {
     Off,
@@ -706,6 +721,96 @@ async fn send_auth_ack(
         log::debug!("Failed to send auth ack to {}: {}", client_addr, e);
     }
 }
+
+/// Roblox-owned hostname allowlist so the resolve frame can never turn the relay
+/// into an open resolver (abuse / amplification / SSRF surface).
+fn is_resolvable_roblox_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "roblox.com"
+        || h.ends_with(".roblox.com")
+        || h.ends_with(".rbxcdn.com")
+        || h.ends_with(".arkoselabs.com")
+}
+
+/// Parse a 0xA6 resolve request. Returns the request id and the allowlisted
+/// hostnames to resolve (non-Roblox names are silently dropped). `None` on a
+/// malformed frame.
+fn parse_resolve_request(frame: &[u8], len: usize) -> Option<(u16, Vec<String>)> {
+    let header = SESSION_ID_LEN + 1; // session id + frame type byte
+    if len < header + 3 {
+        return None;
+    }
+    let request_id = u16::from_be_bytes([frame[header], frame[header + 1]]);
+    let host_count = frame[header + 2] as usize;
+    if host_count > RESOLVE_MAX_HOSTS_PER_REQUEST {
+        return None;
+    }
+    let mut hosts = Vec::with_capacity(host_count);
+    let mut off = header + 3;
+    for _ in 0..host_count {
+        if off >= len {
+            return None;
+        }
+        let hlen = frame[off] as usize;
+        off += 1;
+        if hlen == 0 || hlen > RESOLVE_MAX_HOSTNAME_LEN || off + hlen > len {
+            return None;
+        }
+        let host = std::str::from_utf8(&frame[off..off + hlen])
+            .ok()?
+            .to_string();
+        off += hlen;
+        if is_resolvable_roblox_host(&host) {
+            hosts.push(host);
+        }
+    }
+    Some((request_id, hosts))
+}
+
+/// Build a 0xA7 resolve response from resolved (host, ipv4s) answers.
+fn build_resolve_response(
+    session_id: &[u8; SESSION_ID_LEN],
+    request_id: u16,
+    answers: &[(String, Vec<Ipv4Addr>)],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(session_id);
+    out.push(RESOLVE_RESPONSE_FRAME_TYPE);
+    out.extend_from_slice(&request_id.to_be_bytes());
+    let answer_count = answers.len().min(u8::MAX as usize);
+    out.push(answer_count as u8);
+    for (host, ips) in answers.iter().take(answer_count) {
+        let hbytes = host.as_bytes();
+        let hlen = hbytes.len().min(RESOLVE_MAX_HOSTNAME_LEN);
+        out.push(hlen as u8);
+        out.extend_from_slice(&hbytes[..hlen]);
+        let ip_count = ips.len().min(RESOLVE_MAX_IPS_PER_HOST);
+        out.push(ip_count as u8);
+        for ip in ips.iter().take(ip_count) {
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out
+}
+
+/// Resolve a hostname to IPv4 addresses from the relay's (uncensored) vantage.
+async fn resolve_roblox_host_ipv4(host: &str) -> Vec<Ipv4Addr> {
+    match tokio::net::lookup_host((host, 443u16)).await {
+        Ok(addrs) => {
+            let mut ips: Vec<Ipv4Addr> = addrs
+                .filter_map(|a| match a.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            ips.dedup();
+            ips.truncate(RESOLVE_MAX_IPS_PER_HOST);
+            ips
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Session timeout increased from 60s to 180s to survive network hiccups
 const SESSION_TIMEOUT: Duration = Duration::from_secs(180);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
@@ -1761,6 +1866,32 @@ async fn main() -> Result<()> {
                     .value()
                     .last_rtt_us
                     .store(rtt_us as u64, Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        // Roblox DNS resolve request: the client is behind a censor that
+        // blocks/poisons DNS, so it asks us (outside the censorship) for Roblox's
+        // real IPs. Resolve off the hot loop in a spawned task; restricted to
+        // Roblox-owned hostnames by parse_resolve_request.
+        if len > SESSION_ID_LEN && buf[SESSION_ID_LEN] == RESOLVE_REQUEST_FRAME_TYPE {
+            if auth_config.mode.requires_auth() && !session_authenticated {
+                stats.drop_in(DropReason::Auth);
+                continue;
+            }
+            if let Some((request_id, hosts)) = parse_resolve_request(&buf, len) {
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    let mut answers: Vec<(String, Vec<Ipv4Addr>)> = Vec::with_capacity(hosts.len());
+                    for host in hosts {
+                        let ips = resolve_roblox_host_ipv4(&host).await;
+                        if !ips.is_empty() {
+                            answers.push((host, ips));
+                        }
+                    }
+                    let response = build_resolve_response(&session_id, request_id, &answers);
+                    let _ = socket.send_to(&response, client_addr).await;
+                });
             }
             continue;
         }
@@ -5449,5 +5580,95 @@ mod async_stats_http_tests {
         let payload = render_connections_snapshot_payload(&ctx);
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["timestamp"], 9);
+    }
+}
+
+#[cfg(test)]
+mod resolve_frame_tests {
+    use super::*;
+
+    fn build_resolve_request_frame(
+        session_id: &[u8; SESSION_ID_LEN],
+        request_id: u16,
+        hosts: &[&str],
+    ) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(session_id);
+        f.push(RESOLVE_REQUEST_FRAME_TYPE);
+        f.extend_from_slice(&request_id.to_be_bytes());
+        f.push(hosts.len() as u8);
+        for h in hosts {
+            f.push(h.len() as u8);
+            f.extend_from_slice(h.as_bytes());
+        }
+        f
+    }
+
+    #[test]
+    fn allowlist_only_accepts_roblox_hosts() {
+        assert!(is_resolvable_roblox_host("roblox.com"));
+        assert!(is_resolvable_roblox_host("clientsettings.roblox.com"));
+        assert!(is_resolvable_roblox_host("c3.rbxcdn.com"));
+        assert!(is_resolvable_roblox_host("roblox-api.arkoselabs.com"));
+        assert!(is_resolvable_roblox_host("WWW.ROBLOX.COM"));
+        assert!(!is_resolvable_roblox_host("evil.com"));
+        assert!(!is_resolvable_roblox_host("roblox.com.evil.test"));
+        assert!(!is_resolvable_roblox_host("notroblox.com"));
+    }
+
+    #[test]
+    fn parse_keeps_roblox_and_drops_others() {
+        let sid = [9u8; SESSION_ID_LEN];
+        let frame = build_resolve_request_frame(
+            &sid,
+            0x1234,
+            &["clientsettings.roblox.com", "evil.com", "c0.rbxcdn.com"],
+        );
+        let (req_id, hosts) = parse_resolve_request(&frame, frame.len()).expect("valid frame");
+        assert_eq!(req_id, 0x1234);
+        assert_eq!(
+            hosts,
+            vec![
+                "clientsettings.roblox.com".to_string(),
+                "c0.rbxcdn.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_truncated_and_oversized() {
+        let sid = [0u8; SESSION_ID_LEN];
+        let mut frame = build_resolve_request_frame(&sid, 1, &["clientsettings.roblox.com"]);
+        let truncated = &frame[..frame.len() - 5];
+        assert!(parse_resolve_request(truncated, truncated.len()).is_none());
+        frame[SESSION_ID_LEN + 3] = (RESOLVE_MAX_HOSTS_PER_REQUEST + 1) as u8;
+        assert!(parse_resolve_request(&frame, frame.len()).is_none());
+    }
+
+    #[test]
+    fn build_response_lays_out_answers() {
+        let sid = [3u8; SESSION_ID_LEN];
+        let answers = vec![(
+            "clientsettings.roblox.com".to_string(),
+            vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)],
+        )];
+        let resp = build_resolve_response(&sid, 0xBEEF, &answers);
+        assert_eq!(&resp[..SESSION_ID_LEN], &sid);
+        assert_eq!(resp[SESSION_ID_LEN], RESOLVE_RESPONSE_FRAME_TYPE);
+        assert_eq!(
+            u16::from_be_bytes([resp[SESSION_ID_LEN + 1], resp[SESSION_ID_LEN + 2]]),
+            0xBEEF
+        );
+        assert_eq!(resp[SESSION_ID_LEN + 3], 1, "answer count");
+        let host_off = SESSION_ID_LEN + 4;
+        let hlen = resp[host_off] as usize;
+        assert_eq!(
+            &resp[host_off + 1..host_off + 1 + hlen],
+            b"clientsettings.roblox.com"
+        );
+        let ipc_off = host_off + 1 + hlen;
+        assert_eq!(resp[ipc_off], 2, "ip count");
+        assert_eq!(&resp[ipc_off + 1..ipc_off + 5], &[1, 2, 3, 4]);
+        assert_eq!(&resp[ipc_off + 5..ipc_off + 9], &[5, 6, 7, 8]);
     }
 }
