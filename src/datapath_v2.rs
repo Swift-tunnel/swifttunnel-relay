@@ -932,17 +932,37 @@ pub(super) async fn run_datapath_v2(
         Arc::new(DashMap::new());
     let source_session_counts: Arc<DashMap<std::net::IpAddr, u64>> = Arc::new(DashMap::new());
 
-    if let Some(token) = stats_token {
-        let ctx = Arc::new(super::StatsApiContext {
-            sessions: Arc::clone(&sessions),
-            session_traffic: Arc::clone(&session_traffic),
-            stats: Arc::clone(&stats),
-            runtime_config: runtime_config.clone(),
-            started_at,
-            rate_window: std::sync::Mutex::new(super::StatsRateWindow::new()),
-            connections_snapshot: std::sync::RwLock::new(super::empty_connections_payload()),
-        });
+    // Built unconditionally: the public health endpoint needs it even when no
+    // stats token is set, and the token gates the detailed stats API only.
+    //
+    // This mirrors the same block in main.rs on purpose. v2 is a separate
+    // startup path — main.rs's copy never runs while RELAY_DATAPATH=v2, which
+    // is the default and what every deployed relay uses. Anything that must
+    // exist on a running relay has to be started here as well as there.
+    let stats_ctx = Arc::new(super::StatsApiContext {
+        sessions: Arc::clone(&sessions),
+        session_traffic: Arc::clone(&session_traffic),
+        stats: Arc::clone(&stats),
+        runtime_config: runtime_config.clone(),
+        started_at,
+        rate_window: std::sync::Mutex::new(super::StatsRateWindow::new()),
+        connections_snapshot: std::sync::RwLock::new(super::empty_connections_payload()),
+    });
 
+    let health_port = std::env::var("RELAY_HEALTH_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(super::DEFAULT_HEALTH_PORT);
+    if health_port != 0 {
+        if let Err(e) = super::spawn_health_http_server(health_port, Arc::clone(&stats_ctx)) {
+            log::warn!("Health API unavailable: {}", e);
+        }
+    } else {
+        log::info!("Health API disabled (RELAY_HEALTH_PORT=0)");
+    }
+
+    if let Some(token) = stats_token {
+        let ctx = Arc::clone(&stats_ctx);
         super::spawn_connections_snapshot_updater(Arc::clone(&ctx));
         tokio::spawn(async move {
             if let Err(e) = super::run_stats_http_server(stats_port, token, ctx).await {

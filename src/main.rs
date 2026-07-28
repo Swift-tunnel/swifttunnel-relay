@@ -70,7 +70,7 @@ const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
 // Control plane: RTT/jitter pings (optional, backward-compatible).
 /// Public, unauthenticated health probe port. The hosted status page and the
 /// landing latency widget both expect `http://<relay>:8081/health`.
-const DEFAULT_HEALTH_PORT: u16 = 8081;
+pub(crate) const DEFAULT_HEALTH_PORT: u16 = 8081;
 const PING_FRAME_TYPE: u8 = 0xA3;
 const PONG_FRAME_TYPE: u8 = 0xA4;
 const AUTH_ACK_OK: u8 = 0;
@@ -2421,7 +2421,7 @@ async fn run_stats_http_server(
 /// surface. It exists so an external monitor can answer "is this relay
 /// alive", which is not sensitive; the detailed `/v1/stats` API stays bound
 /// to localhost behind its token.
-fn spawn_health_http_server(port: u16, context: Arc<StatsApiContext>) -> Result<()> {
+pub(crate) fn spawn_health_http_server(port: u16, context: Arc<StatsApiContext>) -> Result<()> {
     std::thread::Builder::new()
         .name(format!("health-http-{}", port))
         .spawn(move || {
