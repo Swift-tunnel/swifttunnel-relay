@@ -68,6 +68,9 @@ const RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTH_HELLO_FRAME_TYPE: u8 = 0xA1;
 const AUTH_ACK_FRAME_TYPE: u8 = 0xA2;
 // Control plane: RTT/jitter pings (optional, backward-compatible).
+/// Public, unauthenticated health probe port. The hosted status page and the
+/// landing latency widget both expect `http://<relay>:8081/health`.
+const DEFAULT_HEALTH_PORT: u16 = 8081;
 const PING_FRAME_TYPE: u8 = 0xA3;
 const PONG_FRAME_TYPE: u8 = 0xA4;
 const AUTH_ACK_OK: u8 = 0;
@@ -1451,17 +1454,34 @@ async fn main() -> Result<()> {
     let session_flow_keys: Arc<DashMap<[u8; SESSION_ID_LEN], Vec<String>>> =
         Arc::new(DashMap::new());
 
-    if let Some(token) = stats_token {
-        let ctx = Arc::new(StatsApiContext {
-            sessions: Arc::clone(&sessions),
-            session_traffic: Arc::clone(&session_traffic),
-            stats: Arc::clone(&stats),
-            runtime_config: runtime_config.clone(),
-            started_at,
-            rate_window: Mutex::new(StatsRateWindow::new()),
-            connections_snapshot: RwLock::new(empty_connections_payload()),
-        });
+    // Built unconditionally: the public health endpoint needs it even when no
+    // stats token is configured, and the detailed stats API is what the token
+    // actually gates.
+    let stats_ctx = Arc::new(StatsApiContext {
+        sessions: Arc::clone(&sessions),
+        session_traffic: Arc::clone(&session_traffic),
+        stats: Arc::clone(&stats),
+        runtime_config: runtime_config.clone(),
+        started_at,
+        rate_window: Mutex::new(StatsRateWindow::new()),
+        connections_snapshot: RwLock::new(empty_connections_payload()),
+    });
 
+    // Public health probe. Set RELAY_HEALTH_PORT=0 to disable.
+    let health_port = env::var("RELAY_HEALTH_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_HEALTH_PORT);
+    if health_port != 0 {
+        if let Err(e) = spawn_health_http_server(health_port, Arc::clone(&stats_ctx)) {
+            log::warn!("Health API unavailable: {}", e);
+        }
+    } else {
+        log::info!("Health API disabled (RELAY_HEALTH_PORT=0)");
+    }
+
+    if let Some(token) = stats_token {
+        let ctx = Arc::clone(&stats_ctx);
         spawn_connections_snapshot_updater(Arc::clone(&ctx));
         tokio::spawn(async move {
             if let Err(e) = run_stats_http_server(stats_port, token, ctx).await {
@@ -2387,6 +2407,94 @@ async fn run_stats_http_server(
         .context("Failed to spawn stats API server thread")?;
 
     Ok(())
+}
+
+/// Public health endpoint, distinct from the localhost stats API.
+///
+/// The hosted status page and the landing-page latency widget both probe
+/// `http://<relay>:8081/health`, and both had been silently broken since
+/// there was nothing listening there — every relay showed "down" and the
+/// widget spun on "Measuring" forever.
+///
+/// Deliberately unauthenticated and deliberately thin: uptime and whether the
+/// datapath is serving. No session data, no per-user counters, no control
+/// surface. It exists so an external monitor can answer "is this relay
+/// alive", which is not sensitive; the detailed `/v1/stats` API stays bound
+/// to localhost behind its token.
+fn spawn_health_http_server(port: u16, context: Arc<StatsApiContext>) -> Result<()> {
+    std::thread::Builder::new()
+        .name(format!("health-http-{}", port))
+        .spawn(move || {
+            if let Err(e) = run_health_http_server_blocking(port, context) {
+                log::error!("Health API server error: {}", e);
+            }
+        })
+        .context("Failed to spawn health API server thread")?;
+    Ok(())
+}
+
+fn run_health_http_server_blocking(port: u16, context: Arc<StatsApiContext>) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+        .context("Failed to bind health API listener")?;
+    log::info!("Health API listening on 0.0.0.0:{}", port);
+
+    loop {
+        let (mut stream, _addr) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::debug!("Health API accept error: {}", e);
+                continue;
+            }
+        };
+
+        let context = Arc::clone(&context);
+        // Short timeouts: a monitor that stalls must not hold a thread open.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+        std::thread::Builder::new()
+            .name("health-http-client".into())
+            .spawn(move || {
+                let mut buf = [0u8; 1024];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+
+                let (status, body) = if path.starts_with("/health") {
+                    let uptime = context.started_at.elapsed().as_secs();
+                    (
+                        "200 OK",
+                        format!(
+                            "{{\"status\":\"ok\",\"server_id\":{},\"uptime_seconds\":{},\"version\":\"{}\"}}",
+                            serde_json::to_string(
+                                context.runtime_config.server_id.as_deref().unwrap_or("")
+                            )
+                            .unwrap_or_else(|_| "\"\"".to_string()),
+                            uptime,
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    )
+                } else {
+                    ("404 Not Found", "{\"error\":\"not found\"}".to_string())
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            })
+            .ok();
+    }
 }
 
 fn run_stats_http_server_blocking(
