@@ -496,25 +496,6 @@ sysctl -w net.netfilter.nf_conntrack_udp_timeout=30
 sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=60
 ```
 
-## Self-Hosting with SwiftTunnel Client
-
-See **[SELF_HOSTING.md](SELF_HOSTING.md)** for a complete end-to-end guide:
-server provisioning, build, deploy, TUN/firewall setup, the self-host
-systemd unit (`RELAY_AUTH_MODE=off`), pointing the desktop app at your
-relay via `%APPDATA%\SwiftTunnel\settings.json`, multi-region setup,
-hardening, troubleshooting, and how to handle the app's remaining
-dependencies on the hosted swifttunnel.net web API.
-
-Quick version:
-
-1. Build the relay (`cargo build --release`) and copy the binary to your server.
-2. Run `setup-tun.sh` once for NAT/firewall/sysctl setup.
-3. Install the [self-host systemd unit](SELF_HOSTING.md#step-5--systemd-unit-open-relay)
-   — uses `RELAY_AUTH_MODE=off` + `RELAY_ALLOW_INSECURE=1`.
-4. Open UDP/51821 in the host firewall and cloud security group.
-5. Set `"custom_relay_server": "your-host:51821"` in
-   `%APPDATA%\SwiftTunnel\settings.json` and restart the app.
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
