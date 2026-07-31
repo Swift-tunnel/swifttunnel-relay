@@ -1178,6 +1178,13 @@ pub(super) async fn run_datapath_v2(
     let tcp_enabled_rx = tcp_enabled;
     let source_limiter_rx = Arc::clone(&source_limiter);
     let replay_cache_rx = Arc::clone(&replay_cache);
+    // The RX loop runs on a plain OS thread, so it has no ambient tokio
+    // context. Resolve answers need one (the lookup is async), so capture a
+    // handle here while we are still inside the async entry point.
+    let resolve_rt = tokio::runtime::Handle::current();
+    // Separate handle for resolve replies: the RX socket is read on this
+    // thread, and a reply is sent from a spawned task after the lookup.
+    let resolve_socket = rx_socket.try_clone().ok().map(Arc::new);
     let rx_thread = std::thread::Builder::new()
         .name("relay-rx".to_string())
         .spawn(move || -> Result<()> {
@@ -1455,6 +1462,60 @@ pub(super) async fn run_datapath_v2(
                             .value()
                             .last_rtt_us
                             .store(rtt_us as u64, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+
+                // Roblox DNS resolve request: [session_id:8][0xA6][...]. The
+                // client is behind a censor that poisons DNS and asks us, from
+                // outside the censorship, for Roblox's real IPs.
+                // parse_resolve_request restricts this to Roblox-owned names so
+                // the relay can never become an open resolver.
+                //
+                // This must exist HERE as well as in main.rs. v2 is the datapath
+                // every relay actually runs, so a handler that lives only in
+                // main.rs never executes — which is exactly how this silently did
+                // nothing: clients sent their requests, v2 did not recognise
+                // 0xA6 and dropped the frame, and players in censored countries
+                // were left with unpinned clientsettings hosts and Roblox's
+                // "Failed to download or apply critical settings".
+                if len > super::SESSION_ID_LEN
+                    && buf[super::SESSION_ID_LEN] == super::RESOLVE_REQUEST_FRAME_TYPE
+                {
+                    if auth_config_rx.mode.requires_auth() && !session_authenticated {
+                        stats_rx.drop_in(super::DropReason::Auth);
+                        continue;
+                    }
+                    if let Some((request_id, hosts)) = super::parse_resolve_request(&buf, len) {
+                        // Logged on purpose. The original handler was silent,
+                        // so neither side could tell whether a request had ever
+                        // arrived, and the failure hid for weeks.
+                        log::info!(
+                            "Resolve request {} for {} host(s) from session {:016x}",
+                            request_id,
+                            hosts.len(),
+                            u64::from_be_bytes(session_id)
+                        );
+                        if let Some(reply_socket) = resolve_socket.as_ref() {
+                            let reply_socket = Arc::clone(reply_socket);
+                            let addr = client_addr.clone();
+                            resolve_rt.spawn(async move {
+                                let mut answers: Vec<(String, Vec<std::net::Ipv4Addr>)> =
+                                    Vec::with_capacity(hosts.len());
+                                for host in hosts {
+                                    let ips = super::resolve_roblox_host_ipv4(&host).await;
+                                    if !ips.is_empty() {
+                                        answers.push((host, ips));
+                                    }
+                                }
+                                let response = super::build_resolve_response(
+                                    &session_id,
+                                    request_id,
+                                    &answers,
+                                );
+                                let _ = reply_socket.send_to(&response, &addr);
+                            });
+                        }
                     }
                     continue;
                 }
@@ -1752,6 +1813,47 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::net::SocketAddr;
+
+    /// Every client-to-relay control frame must be handled by the v2 datapath,
+    /// because v2 is what relays actually run. A frame handled only in main.rs
+    /// is dead code in production.
+    ///
+    /// This has now bitten twice: the health endpoint, and the Roblox DNS
+    /// resolve frame (0xA6). In both cases the feature existed, tests passed,
+    /// and it silently did nothing on every deployed relay. This test reads the
+    /// v2 source and fails if a control frame constant is never mentioned in
+    /// it, so the next one is caught at build time rather than by a user in a
+    /// censored country.
+    #[test]
+    fn v2_datapath_handles_every_client_control_frame() {
+        let v2 = include_str!("datapath_v2.rs");
+
+        // Relay-to-client frames are produced elsewhere and are not dispatched
+        // on the RX path, so they are not expected here.
+        let client_to_relay = [
+            "AUTH_HELLO_FRAME_TYPE",
+            "PING_FRAME_TYPE",
+            "RTT_REPORT_FRAME_TYPE",
+            "RESOLVE_REQUEST_FRAME_TYPE",
+        ];
+
+        // Look for the qualified `super::NAME` dispatch form, not the bare
+        // name. The bare name appears in this test's own list above, so a
+        // `contains(name)` check would always match its own source and could
+        // never fail — which is worse than no test at all.
+        let missing: Vec<&str> = client_to_relay
+            .iter()
+            .copied()
+            .filter(|name| !v2.contains(&format!("super::{name}")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "v2 datapath ignores client control frame(s): {missing:?}. \
+             Frames handled only in main.rs never run, because RELAY_DATAPATH=v2 \
+             is the default every relay uses."
+        );
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────
 
