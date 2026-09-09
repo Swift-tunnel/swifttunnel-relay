@@ -81,6 +81,9 @@ const AUTH_ACK_SID_MISMATCH: u8 = 4;
 const AUTH_ACK_SERVER_MISMATCH: u8 = 5;
 const AUTH_ACK_AUTH_DISABLED: u8 = 6;
 const AUTH_ACK_REPLAY: u8 = 7;
+/// A valid ticket, for a different account than the one that already holds this
+/// session. See [`RelayAuthVerifyError::OwnerMismatch`].
+const AUTH_ACK_OWNER_MISMATCH: u8 = 8;
 const MAX_AUTH_TOKEN_LEN: usize = 4096;
 const AUTH_CLOCK_SKEW_SECS: u64 = 30;
 const RELAY_ALLOW_INSECURE_ENV: &str = "RELAY_ALLOW_INSECURE";
@@ -246,6 +249,14 @@ enum RelayAuthVerifyError {
     SidMismatch,
     ServerMismatch,
     Replay,
+    /// The session already belongs to somebody else.
+    ///
+    /// Session ids are chosen by the client and the issuer does not reserve
+    /// them, so anybody who learns one can ask for a perfectly valid ticket
+    /// naming it. Before this, authenticating simply overwrote the owner and
+    /// the client address, which handed the attacker the victim's live
+    /// session: their flows keyed by that id, and their return traffic.
+    OwnerMismatch,
 }
 
 impl RelayAuthVerifyError {
@@ -257,6 +268,7 @@ impl RelayAuthVerifyError {
             Self::SidMismatch => AUTH_ACK_SID_MISMATCH,
             Self::ServerMismatch => AUTH_ACK_SERVER_MISMATCH,
             Self::Replay => AUTH_ACK_REPLAY,
+            Self::OwnerMismatch => AUTH_ACK_OWNER_MISMATCH,
         }
     }
 }
@@ -1795,6 +1807,33 @@ async fn main() -> Result<()> {
             match verify_relay_ticket_once(token, session_id, &auth_config, now_unix, &replay_cache)
             {
                 Ok(ticket) => {
+                    // Ownership does not transfer. See
+                    // `RelayAuthVerifyError::OwnerMismatch`: a valid signature
+                    // says who asked, not what they may have, and a session id
+                    // is a name the client picked rather than a claim we
+                    // reserved for them.
+                    // Scoped so the read guard is released before the write
+                    // below takes one on the same shard.
+                    let owner_conflict = sessions.get(&session_id).is_some_and(|existing| {
+                        existing.auth_state == SessionAuthState::Authenticated
+                            && existing.user_id != ticket.user_id
+                    });
+                    if owner_conflict {
+                        log_auth_verify_error(
+                            RelayAuthVerifyError::OwnerMismatch,
+                            client_addr,
+                            session_id,
+                        );
+                        send_auth_ack(
+                            socket.as_ref(),
+                            client_addr,
+                            session_id,
+                            AUTH_ACK_OWNER_MISMATCH,
+                        )
+                        .await;
+                        continue;
+                    }
+
                     if let Some(mut session_entry) = sessions.get_mut(&session_id) {
                         update_source_session_count_for_rebind(
                             &source_session_counts,

@@ -1333,6 +1333,38 @@ pub(super) async fn run_datapath_v2(
                         &replay_cache_rx,
                     ) {
                         Ok(ticket) => {
+                            // Ownership does not transfer. Same rule as the v1
+                            // path: see `RelayAuthVerifyError::OwnerMismatch`.
+                            // A signature says who asked, not what they may
+                            // have, and the session id is a name the client
+                            // picked rather than one we reserved for them.
+                            //
+                            // Scoped so the read guard is released before the
+                            // write below takes one on the same shard.
+                            let owner_conflict =
+                                sessions_rx.get(&session_id).is_some_and(|existing| {
+                                    existing.auth_state
+                                        == super::SessionAuthState::Authenticated
+                                        && existing.user_id != ticket.user_id
+                                });
+                            if owner_conflict {
+                                super::log_auth_verify_error(
+                                    super::RelayAuthVerifyError::OwnerMismatch,
+                                    client_addr,
+                                    session_id,
+                                );
+                                send_small_control_frame(
+                                    &tx_control_rx,
+                                    &pool_rx,
+                                    client_addr,
+                                    session_id,
+                                    super::AUTH_ACK_FRAME_TYPE,
+                                    super::AUTH_ACK_OWNER_MISMATCH,
+                                    &stats_rx,
+                                );
+                                continue;
+                            }
+
                             if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
                                 super::update_source_session_count_for_rebind(
                                     &source_session_counts_rx,
