@@ -1253,8 +1253,7 @@ pub(super) async fn run_datapath_v2(
                 match sessions_rx.entry(session_id) {
                     dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                         let session = entry.get_mut();
-                        session_authenticated =
-                            matches!(session.auth_state, super::SessionAuthState::Authenticated);
+                        session_authenticated = super::session_auth_is_current(session, now_unix);
                         session_source_allowed = super::authenticated_session_source_allowed(
                             session,
                             auth_required,
@@ -1279,6 +1278,7 @@ pub(super) async fn run_datapath_v2(
                         entry.insert(super::SessionEntry {
                             user_id: super::derive_user_id(session_id),
                             auth_state: super::SessionAuthState::Legacy,
+                            lease_expires_at_unix: None,
                             client_addr,
                             created_at_unix: now_unix,
                             last_activity: now,
@@ -1341,6 +1341,8 @@ pub(super) async fn run_datapath_v2(
                                 );
                                 session_entry.user_id = ticket.user_id;
                                 session_entry.auth_state = super::SessionAuthState::Authenticated;
+                                session_entry.lease_expires_at_unix =
+                                    ticket.lease.then_some(ticket.exp);
                                 session_entry.client_addr = client_addr;
                                 session_entry.last_activity = now;
                                 session_entry.last_activity_unix = now_unix;

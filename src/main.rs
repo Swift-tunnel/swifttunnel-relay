@@ -226,6 +226,8 @@ struct RelayTicketClaims {
     iat: u64,
     exp: u64,
     jti: String,
+    #[serde(default)]
+    lease: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +235,7 @@ struct VerifiedRelayTicket {
     user_id: String,
     jti: String,
     exp: u64,
+    lease: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,6 +604,13 @@ pub(crate) fn authenticated_session_source_allowed(
     is_auth_hello || session.client_addr.ip() == client_addr.ip()
 }
 
+pub(crate) fn session_auth_is_current(session: &SessionEntry, now_unix: u64) -> bool {
+    matches!(session.auth_state, SessionAuthState::Authenticated)
+        && session
+            .lease_expires_at_unix
+            .map_or(true, |expires_at| now_unix < expires_at)
+}
+
 pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
     ip.is_private()
         || ip.is_loopback()
@@ -675,6 +685,7 @@ fn verify_relay_ticket(
         user_id: claims.sub,
         jti: claims.jti,
         exp: claims.exp,
+        lease: claims.lease,
     })
 }
 
@@ -973,6 +984,7 @@ struct OriginalPacketInfo {
 struct SessionEntry {
     user_id: String,
     auth_state: SessionAuthState,
+    lease_expires_at_unix: Option<u64>,
     client_addr: SocketAddr,
     created_at_unix: u64,
     last_activity: Instant,
@@ -1720,8 +1732,7 @@ async fn main() -> Result<()> {
         match sessions.entry(session_id) {
             Entry::Occupied(mut entry) => {
                 let session = entry.get_mut();
-                session_authenticated =
-                    matches!(session.auth_state, SessionAuthState::Authenticated);
+                session_authenticated = session_auth_is_current(session, now_unix);
                 session_source_allowed = authenticated_session_source_allowed(
                     session,
                     auth_required,
@@ -1746,6 +1757,7 @@ async fn main() -> Result<()> {
                 entry.insert(SessionEntry {
                     user_id: derive_user_id(session_id),
                     auth_state: SessionAuthState::Legacy,
+                    lease_expires_at_unix: None,
                     client_addr,
                     created_at_unix: now_unix,
                     last_activity: now,
@@ -1791,6 +1803,7 @@ async fn main() -> Result<()> {
                         );
                         session_entry.user_id = ticket.user_id;
                         session_entry.auth_state = SessionAuthState::Authenticated;
+                        session_entry.lease_expires_at_unix = ticket.lease.then_some(ticket.exp);
                         session_entry.client_addr = client_addr;
                         session_entry.last_activity = now;
                         session_entry.last_activity_unix = now_unix;
@@ -3961,10 +3974,56 @@ mod auth_config_utility_tests {
     }
 
     #[test]
+    fn test_authenticated_session_without_lease_remains_current() {
+        let session = SessionEntry {
+            user_id: "legacy-client".to_string(),
+            auth_state: SessionAuthState::Authenticated,
+            lease_expires_at_unix: None,
+            client_addr: "198.51.100.10:40000".parse().unwrap(),
+            created_at_unix: 1,
+            last_activity: Instant::now(),
+            last_activity_unix: 1,
+        };
+
+        assert!(session_auth_is_current(&session, 10_000));
+    }
+
+    #[test]
+    fn test_authenticated_session_with_live_lease_is_current() {
+        let session = SessionEntry {
+            user_id: "lease-client".to_string(),
+            auth_state: SessionAuthState::Authenticated,
+            lease_expires_at_unix: Some(101),
+            client_addr: "198.51.100.10:40000".parse().unwrap(),
+            created_at_unix: 1,
+            last_activity: Instant::now(),
+            last_activity_unix: 1,
+        };
+
+        assert!(session_auth_is_current(&session, 100));
+    }
+
+    #[test]
+    fn test_authenticated_session_with_expired_lease_is_not_current() {
+        let session = SessionEntry {
+            user_id: "lease-client".to_string(),
+            auth_state: SessionAuthState::Authenticated,
+            lease_expires_at_unix: Some(100),
+            client_addr: "198.51.100.10:40000".parse().unwrap(),
+            created_at_unix: 1,
+            last_activity: Instant::now(),
+            last_activity_unix: 1,
+        };
+
+        assert!(!session_auth_is_current(&session, 100));
+    }
+
+    #[test]
     fn test_authenticated_session_source_rejects_forged_address() {
         let session = SessionEntry {
             user_id: "user".to_string(),
             auth_state: SessionAuthState::Authenticated,
+            lease_expires_at_unix: None,
             client_addr: "198.51.100.10:40000".parse().unwrap(),
             created_at_unix: 1,
             last_activity: Instant::now(),
@@ -5208,6 +5267,7 @@ mod async_stats_http_tests {
                 SessionEntry {
                     user_id: "user-aaa".to_string(),
                     auth_state: SessionAuthState::Authenticated,
+                    lease_expires_at_unix: None,
                     client_addr: "127.0.0.1:1000".parse().unwrap(),
                     created_at_unix: now_unix,
                     last_activity: Instant::now(),
@@ -5220,6 +5280,7 @@ mod async_stats_http_tests {
                 SessionEntry {
                     user_id: "user-aaa".to_string(), // same user
                     auth_state: SessionAuthState::Authenticated,
+                    lease_expires_at_unix: None,
                     client_addr: "127.0.0.1:2000".parse().unwrap(),
                     created_at_unix: now_unix,
                     last_activity: Instant::now(),
@@ -5232,6 +5293,7 @@ mod async_stats_http_tests {
                 SessionEntry {
                     user_id: "user-bbb".to_string(), // different user
                     auth_state: SessionAuthState::Legacy,
+                    lease_expires_at_unix: None,
                     client_addr: "127.0.0.1:3000".parse().unwrap(),
                     created_at_unix: now_unix,
                     last_activity: Instant::now(),
@@ -5296,6 +5358,7 @@ mod async_stats_http_tests {
             SessionEntry {
                 user_id: "test-user".to_string(),
                 auth_state: SessionAuthState::Authenticated,
+                lease_expires_at_unix: None,
                 client_addr: "1.2.3.4:5678".parse().unwrap(),
                 created_at_unix: now_unix,
                 last_activity: Instant::now(),
@@ -5327,6 +5390,7 @@ mod async_stats_http_tests {
                 SessionEntry {
                     user_id: "older".to_string(),
                     auth_state: SessionAuthState::Legacy,
+                    lease_expires_at_unix: None,
                     client_addr: "1.1.1.1:1000".parse().unwrap(),
                     created_at_unix: now_unix - 100,
                     last_activity: Instant::now(),
@@ -5339,6 +5403,7 @@ mod async_stats_http_tests {
                 SessionEntry {
                     user_id: "newer".to_string(),
                     auth_state: SessionAuthState::Legacy,
+                    lease_expires_at_unix: None,
                     client_addr: "2.2.2.2:2000".parse().unwrap(),
                     created_at_unix: now_unix,
                     last_activity: Instant::now(),
@@ -5367,6 +5432,7 @@ mod async_stats_http_tests {
             SessionEntry {
                 user_id: "user\"with\\special\nchars".to_string(),
                 auth_state: SessionAuthState::Legacy,
+                lease_expires_at_unix: None,
                 client_addr: "1.1.1.1:1000".parse().unwrap(),
                 created_at_unix: now_unix,
                 last_activity: Instant::now(),
