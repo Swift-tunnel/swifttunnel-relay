@@ -623,6 +623,68 @@ pub(crate) fn session_auth_is_current(session: &SessionEntry, now_unix: u64) -> 
             .map_or(true, |expires_at| now_unix < expires_at)
 }
 
+/// Ports a game never talks to, and an attacker very much wants to.
+///
+/// The relay forwards to whatever address the client names, which is the point
+/// of it, and until now that meant any public address on any port. The address
+/// filter below already keeps it off private networks. It says nothing about
+/// what the destination is, and a handful of well known services answer a small
+/// request with a large reply sent to whoever the sender claims to be.
+///
+/// Pointed at those, a relay stops being a relay and becomes an amplifier: the
+/// account holder spends a trickle of upload and the target receives a flood
+/// from our address, not theirs. What we would see is abuse reports, provider
+/// complaints, and relay IPs acquiring the kind of reputation that already
+/// costs this product real gameplay failures.
+///
+/// Deliberately a blocklist of services rather than an allowlist of game ports.
+/// An allowlist is stronger and needs to know every port Roblox, voice chat and
+/// Route Assist will ever use, which is a promise nobody can keep; getting it
+/// wrong silently breaks players.
+///
+/// UDP only. Amplification needs a connectionless, source-spoofable protocol,
+/// and TCP is neither, so applying this to TCP would restrict traffic without
+/// buying any safety. This relay carries HTTPS for Route Assist, so that would
+/// be a real cost for nothing.
+///
+/// Not a complete answer to relay abuse, and not free either. It closes the
+/// reflectors worth having and does nothing about an account simply sending a
+/// lot of traffic at one address, which needs per-account rate limits. Game
+/// ports are kept off this list even when they amplify, Source query on 27015
+/// being the example: a gaming VPN blocking a game's port is a trap for
+/// whoever adds the second game.
+const FORBIDDEN_DST_PORTS: &[u16] = &[
+    7,     // echo
+    17,    // qotd
+    19,    // chargen, one of the worst amplifiers there is
+    53,    // DNS
+    69,    // TFTP
+    111,   // portmap/rpcbind
+    123,   // NTP
+    137,   // NetBIOS name service
+    161,   // SNMP
+    162,   // SNMP trap
+    389,   // LDAP/CLDAP
+    520,   // RIP
+    623,   // IPMI
+    1434,  // MSSQL browser
+    1900,  // SSDP
+    3702,  // WS-Discovery
+    5093,  // Sentinel
+    5351,  // NAT-PMP
+    5353,  // mDNS
+    10001, // Ubiquiti discovery
+    11211, // memcached
+    32414, // Plex discovery
+];
+
+/// A destination port we refuse to forward to. See [`FORBIDDEN_DST_PORTS`].
+pub(crate) fn is_forbidden_dst_port(port: u16) -> bool {
+    // Port 0 is not a real destination and only turns up in malformed or
+    // probing traffic.
+    port == 0 || FORBIDDEN_DST_PORTS.contains(&port)
+}
+
 pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
     ip.is_private()
         || ip.is_loopback()
@@ -2279,7 +2341,7 @@ async fn run_flow_handler(
     stats: Arc<Stats>,
 ) {
     if let std::net::IpAddr::V4(dst_ip) = game_addr.ip() {
-        if is_forbidden_dst(dst_ip) {
+        if is_forbidden_dst(dst_ip) || is_forbidden_dst_port(game_addr.port()) {
             log::warn!(
                 "Dropping flow {} to forbidden destination {}",
                 flow_key,
@@ -3292,7 +3354,7 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_port,
             };
 
-            if is_forbidden_dst(dst_ip) {
+            if is_forbidden_dst(dst_ip) || is_forbidden_dst_port(dst_port) {
                 return Some(ParsedPacket::ForbiddenDst);
             }
 
@@ -3326,6 +3388,11 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_port,
             };
 
+            // Addresses only. The port blocklist is a UDP rule and does not
+            // belong here: amplification needs a connectionless, spoofable
+            // protocol, and TCP has neither property, so refusing these ports
+            // over TCP buys no safety and only breaks traffic. This relay
+            // carries HTTPS for Route Assist, so that is a live cost.
             if is_forbidden_dst(dst_ip) {
                 return Some(ParsedPacket::ForbiddenDst);
             }
@@ -4800,6 +4867,43 @@ mod packet_construction_tests {
             assert!(is_forbidden_dst(ip), "{ip} should be forbidden");
         }
         assert!(!is_forbidden_dst(Ipv4Addr::new(128, 116, 50, 10)));
+    }
+
+    /// The relay must not be usable as an amplifier.
+    ///
+    /// The address filter keeps it off private networks and says nothing about
+    /// what it is talking to. Pointed at one of these services, a client spends
+    /// a trickle of upload and the target receives a flood carrying our address
+    /// rather than theirs.
+    #[test]
+    fn amplification_ports_are_refused() {
+        for port in [
+            19,    // chargen
+            53,    // DNS
+            123,   // NTP
+            161,   // SNMP
+            389,   // CLDAP
+            1900,  // SSDP
+            11211, // memcached
+        ] {
+            assert!(
+                is_forbidden_dst_port(port),
+                "udp/{port} is a known amplifier and must not be forwarded"
+            );
+        }
+
+        // Port 0 is never a real destination.
+        assert!(is_forbidden_dst_port(0));
+
+        // Roblox lives in the high ephemeral range, and normal game traffic
+        // must be untouched by this. A blocklist that catches gameplay is worse
+        // than no blocklist, because the failure is invisible and blamed on us.
+        for port in [443, 49152, 53640, 61337, 65535] {
+            assert!(
+                !is_forbidden_dst_port(port),
+                "udp/{port} carries real traffic and must still be forwarded"
+            );
+        }
     }
 
     #[test]
