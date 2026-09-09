@@ -606,6 +606,22 @@ fn run_shard(
                 match recv_flow_response(&flow.socket, &mut recv_buf) {
                     Ok((len, response_tos)) => {
                         let received_at = Instant::now();
+
+                        // Paid coverage decides whether this is carried, and it
+                        // is decided before the activity refresh below, not
+                        // after. See `session_lease_is_current`: refreshing
+                        // first is what let inbound traffic from the far end
+                        // hold a dead session open, so the idle cleanup never
+                        // reached it and an expired lease kept returning data.
+                        let now_unix = super::unix_timestamp_secs();
+                        let lease_current =
+                            sessions.get(&flow_key.session_id).is_some_and(|session| {
+                                super::session_lease_is_current(&session, now_unix)
+                            });
+                        if !lease_current {
+                            break;
+                        }
+
                         flow.last_activity = received_at;
                         flow.marked_for_removal = None;
 
@@ -1081,9 +1097,31 @@ pub(super) async fn run_datapath_v2(
             let now = Instant::now();
             let session_idle_limit = super::SESSION_TIMEOUT + super::FLOW_GRACE_PERIOD;
 
+            // Expiry is grounds for removal on its own, not only silence.
+            //
+            // Forwarding already stops the moment a lease lapses, at both ends,
+            // but the session itself lingered until the idle timer noticed, and
+            // it holds a TUN address and a slot in the per-source session count
+            // the whole time. Traffic from the far end also refreshed that
+            // timer, so a session nobody was paying for could be kept resident
+            // by somebody else entirely.
+            //
+            // Given a grace, because the clock is the only thing being trusted
+            // here. Clients renew at 120s into a 300s lease, so reaching expiry
+            // already means several missed renewals; the margin only stops a
+            // session being torn down in the instant a late renewal lands.
+            let now_unix = super::unix_timestamp_secs();
+            let lease_grace_secs = super::FLOW_GRACE_PERIOD.as_secs() + super::AUTH_CLOCK_SKEW_SECS;
+
             let mut sessions_removed = 0u32;
             sessions_cleanup.retain(|session_id, session| {
-                if now.duration_since(session.last_activity) >= session_idle_limit {
+                let lease_long_over = session.lease_expires_at_unix.is_some_and(|expires_at| {
+                    now_unix >= expires_at.saturating_add(lease_grace_secs)
+                });
+
+                if lease_long_over
+                    || now.duration_since(session.last_activity) >= session_idle_limit
+                {
                     session_traffic_cleanup.remove(session_id);
                     super::decrement_source_session_count(
                         &source_session_counts_cleanup,
@@ -1343,8 +1381,7 @@ pub(super) async fn run_datapath_v2(
                             // write below takes one on the same shard.
                             let owner_conflict =
                                 sessions_rx.get(&session_id).is_some_and(|existing| {
-                                    existing.auth_state
-                                        == super::SessionAuthState::Authenticated
+                                    existing.auth_state == super::SessionAuthState::Authenticated
                                         && existing.user_id != ticket.user_id
                                 });
                             if owner_conflict {

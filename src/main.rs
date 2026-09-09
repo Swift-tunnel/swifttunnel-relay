@@ -616,6 +616,28 @@ pub(crate) fn authenticated_session_source_allowed(
     is_auth_hello || session.client_addr.ip() == client_addr.ip()
 }
 
+/// Whether this session's paid coverage still runs.
+///
+/// Deliberately not [`session_auth_is_current`], which also demands
+/// `Authenticated`. This is asked on the return path, where that extra
+/// condition would drop every flow the moment relay auth is `off` or
+/// `optional`, since those sessions are `Legacy` by design.
+///
+/// A session with no lease has `None` here and is unaffected, so switching auth
+/// modes cannot silently start severing traffic. A leased one is carried
+/// exactly as long as it was paid for.
+///
+/// This is checked on the way out because checking it only on the way in is not
+/// enforcement. An expired lease stopped new client-to-server packets while the
+/// mapping stayed open, so a cooperating server could keep pushing data back
+/// through it indefinitely: unpaid egress on our bill, and the reservation the
+/// quota rewrite depends on quietly not meaning anything.
+pub(crate) fn session_lease_is_current(session: &SessionEntry, now_unix: u64) -> bool {
+    session
+        .lease_expires_at_unix
+        .is_none_or(|expires_at| now_unix < expires_at)
+}
+
 pub(crate) fn session_auth_is_current(session: &SessionEntry, now_unix: u64) -> bool {
     matches!(session.auth_state, SessionAuthState::Authenticated)
         && session
@@ -2420,6 +2442,24 @@ async fn run_flow_handler(
                     Ok(len) => {
                         consecutive_recv_errors = 0;
 
+                        // Paid coverage decides whether this is carried, and it
+                        // is decided here rather than only at ingress. See
+                        // `session_lease_is_current`: without this an expired
+                        // lease still returned traffic for as long as the far
+                        // end kept sending.
+                        let now_unix = unix_timestamp_secs();
+                        let lease_current = sessions
+                            .get(&session_id)
+                            .is_some_and(|session| session_lease_is_current(&session, now_unix));
+                        if !lease_current {
+                            log::debug!(
+                                "Flow {} closing: session {:016x} lease has expired",
+                                flow_key,
+                                u64::from_be_bytes(session_id)
+                            );
+                            break;
+                        }
+
                         // Look up current client address and original packet info
                         let (client_addr, original_info) = match flows.get(&flow_key) {
                             Some(entry) => (entry.client_addr, entry.original_info),
@@ -4077,6 +4117,65 @@ mod auth_config_utility_tests {
         ));
         assert_eq!(stats.dropped_in.load(Ordering::Relaxed), 1);
         assert_eq!(stats.drop_reasons.capacity.load(Ordering::Relaxed), 1);
+    }
+
+    /// The return path asks about the lease, never the auth state.
+    ///
+    /// Using `session_auth_is_current` there would have dropped every flow the
+    /// moment relay auth was set to `off` or `optional`, because those sessions
+    /// are `Legacy` by design. That would have been a total outage introduced by
+    /// a fix for unpaid traffic, and it would have looked like the relay was
+    /// broken rather than like a policy change.
+    #[test]
+    fn a_legacy_session_is_still_carried_on_the_return_path() {
+        let session = SessionEntry {
+            user_id: derive_user_id([1, 2, 3, 4, 5, 6, 7, 8]),
+            auth_state: SessionAuthState::Legacy,
+            lease_expires_at_unix: None,
+            client_addr: "198.51.100.10:40000".parse().unwrap(),
+            created_at_unix: 1,
+            last_activity: Instant::now(),
+            last_activity_unix: 1,
+        };
+
+        assert!(
+            session_lease_is_current(&session, 10_000),
+            "an unauthenticated session has no lease to expire and must keep flowing"
+        );
+        assert!(
+            !session_auth_is_current(&session, 10_000),
+            "and this is exactly why the return path must not ask that question"
+        );
+    }
+
+    /// An expired lease stops returning traffic.
+    ///
+    /// The gap this closes: expiry was enforced on the way in only, so the
+    /// mapping stayed open and a cooperating server could keep pushing data
+    /// back through it for as long as it liked. Unpaid egress, and the
+    /// reservation the quota accounting depends on meaning nothing.
+    #[test]
+    fn an_expired_lease_stops_being_carried() {
+        let mut session = SessionEntry {
+            user_id: "lease-client".to_string(),
+            auth_state: SessionAuthState::Authenticated,
+            lease_expires_at_unix: Some(1_000),
+            client_addr: "198.51.100.10:40000".parse().unwrap(),
+            created_at_unix: 1,
+            last_activity: Instant::now(),
+            last_activity_unix: 1,
+        };
+
+        assert!(session_lease_is_current(&session, 999), "still paid for");
+        assert!(
+            !session_lease_is_current(&session, 1_000),
+            "expiry is the last instant, not the first unpaid one"
+        );
+        assert!(!session_lease_is_current(&session, 5_000));
+
+        // A renewal puts it back, without the session being rebuilt.
+        session.lease_expires_at_unix = Some(6_000);
+        assert!(session_lease_is_current(&session, 5_000));
     }
 
     #[test]
