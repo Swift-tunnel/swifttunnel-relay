@@ -60,7 +60,10 @@ if [ "$cloudfront_count" -lt 50 ]; then
     exit 1
 fi
 
-tmp=$(mktemp)
+mkdir -p "$(dirname -- "$OUT")"
+# Publish with one rename on the destination filesystem. A relay starting
+# during an update must see either complete generation, never a partial file.
+tmp=$(mktemp "$(dirname -- "$OUT")/.dest-allowlist.XXXXXXXX")
 trap 'rm -f "$tmp"' EXIT
 {
     echo "# SwiftTunnel relay destination allowlist"
@@ -71,7 +74,7 @@ trap 'rm -f "$tmp"' EXIT
     printf '%s\n' "$cloudfront" | sed 's/^/tcp /'
 } > "$tmp"
 
-mkdir -p "$(dirname "$OUT")"
-install -m 0644 "$tmp" "$OUT"
+chmod 0644 "$tmp"
+mv -f -- "$tmp" "$OUT"
 echo "[+] Wrote $OUT: $roblox_count Roblox prefixes, $cloudfront_count CloudFront prefixes (TCP only)"
 echo "    Set RELAY_DEST_ALLOWLIST_FILE=$OUT and restart the relay to load it."
