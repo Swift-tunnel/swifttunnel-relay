@@ -53,6 +53,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::interval;
 
+mod account_budget;
 mod datapath_v2;
 mod tcp_tun;
 
@@ -1460,6 +1461,7 @@ async fn main() -> Result<()> {
     let datapath = datapath_v2::get_relay_datapath();
 
     let stats = Arc::new(Stats::new());
+    account_budget::start_maintenance();
     let started_at = Instant::now();
     let session_traffic: Arc<DashMap<[u8; SESSION_ID_LEN], Arc<SessionTraffic>>> =
         Arc::new(DashMap::new());
@@ -1527,6 +1529,15 @@ async fn main() -> Result<()> {
                                 ) else {
                                     continue;
                                 };
+                                if !account_budget::allow(
+                                    &sessions_tun_resp,
+                                    tx_pkt.session_id,
+                                    true,
+                                    &tx_pkt.ip_packet,
+                                ) {
+                                    stats_tun_resp.drop_out(DropReason::RateLimit);
+                                    continue;
+                                }
                                 // Build relay frame: [session_id][ip_packet]
                                 let mut frame =
                                     Vec::with_capacity(SESSION_ID_LEN + tx_pkt.ip_packet.len());
@@ -1699,6 +1710,10 @@ async fn main() -> Result<()> {
             ) else {
                 continue;
             };
+            if !account_budget::allow(&sessions_out, session_id, true, &data[SESSION_ID_LEN..]) {
+                stats_out.drop_out(DropReason::RateLimit);
+                continue;
+            }
             if let Err(e) = socket_sender.send_to(&data, addr).await {
                 log::warn!("Failed to send response to {}: {}", addr, e);
             } else {
@@ -2228,6 +2243,12 @@ async fn main() -> Result<()> {
             }
         };
 
+        if !matches!(parsed, ParsedPacket::ForbiddenDst)
+            && !account_budget::allow(&sessions, session_id, false, ip_packet)
+        {
+            stats.drop_in(DropReason::RateLimit);
+            continue;
+        }
         match parsed {
             ParsedPacket::ForbiddenDst => {
                 stats.drop_in(DropReason::ForbiddenDst);
@@ -2928,6 +2949,9 @@ fn handle_stats_http_client_blocking(
         }
 
         match path {
+            "/v1/account-budgets" => {
+                write_http_response_blocking(&mut stream, 200, "OK", &account_budget::snapshot())?;
+            }
             "/v1/stats" => {
                 let body = render_stats_payload(&context);
                 write_http_response_blocking(&mut stream, 200, "OK", &body)?;
@@ -3079,6 +3103,9 @@ async fn handle_stats_http_client(
     }
 
     match path {
+        "/v1/account-budgets" => {
+            write_http_response(&mut stream, 200, "OK", &account_budget::snapshot()).await?;
+        }
         "/v1/stats" => {
             let body = render_stats_payload(&context);
             write_http_response(&mut stream, 200, "OK", &body).await?;

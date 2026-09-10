@@ -1676,6 +1676,12 @@ pub(super) async fn run_datapath_v2(
                     }
                 };
 
+                if !matches!(parsed, super::ParsedPacket::ForbiddenDst)
+                    && !super::account_budget::allow(&sessions_rx, session_id, false, ip_packet)
+                {
+                    stats_rx.drop_in(super::DropReason::RateLimit);
+                    continue;
+                }
                 match parsed {
                     super::ParsedPacket::ForbiddenDst => {
                         stats_rx.drop_in(super::DropReason::ForbiddenDst);
@@ -1874,6 +1880,18 @@ fn send_tx_packet(
         packet.addr = addr;
     }
     let bytes = unsafe { pool.buffer(packet.buf_idx) };
+    if packet.kind == QueuedPacketKind::Data
+        && !super::account_budget::allow(
+            sessions,
+            packet.session_id,
+            true,
+            &bytes[super::SESSION_ID_LEN..packet.len],
+        )
+    {
+        stats.drop_out(super::DropReason::RateLimit);
+        pool.release(packet.buf_idx);
+        return;
+    }
     if let Err(e) = socket.send_to(&bytes[..packet.len], packet.addr) {
         log::trace!("TX send error to {}: {}", packet.addr, e);
         stats.drop_out(super::DropReason::SocketSend);

@@ -16,14 +16,19 @@ impl Drop for LocalRelay {
     }
 }
 fn stats(port: u16) -> Option<serde_json::Value> {
+    api_payload(port, "/v1/stats")
+}
+fn api_payload(port: u16, path: &str) -> Option<serde_json::Value> {
     let mut s = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().ok()?,
         Duration::from_millis(100),
     )
     .ok()?;
     s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    s.write_all(b"GET /v1/stats HTTP/1.1\r\nAuthorization: Bearer local-regression\r\n\r\n")
-        .ok()?;
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer local-regression\r\n\r\n").as_bytes(),
+    )
+    .ok()?;
     let mut response = String::new();
     s.read_to_string(&mut response).ok()?;
     serde_json::from_str(response.split_once("\r\n\r\n")?.1).ok()
@@ -85,6 +90,8 @@ fn both_datapaths_require_the_owner_before_changing_the_endpoint() {
             .env("RELAY_TCP_ENABLED", "false")
             .env("RELAY_TUN_UDP", "false")
             .env("RELAY_SHARDS", "1")
+            .env("RELAY_ACCOUNT_BUDGET_MODE", "enforce")
+            .env("RELAY_ACCOUNT_BYTES_PER_SECOND", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
@@ -146,5 +153,35 @@ fn both_datapaths_require_the_owner_before_changing_the_endpoint() {
             "old endpoint still owns session"
         );
         assert_ne!(exchange(&changed, port, &ping()).get(9), Some(&9));
+
+        // TCP is disabled, so this stays local even if the budget hook regresses.
+        // A valid IP frame must hit account policy before the disabled TUN path.
+        let mut ip = [0u8; 40];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&40u16.to_be_bytes());
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        ip[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        ip[22..24].copy_from_slice(&443u16.to_be_bytes());
+        ip[32] = 0x50;
+        let mut frame = 1u64.to_be_bytes().to_vec();
+        frame.extend_from_slice(&ip);
+        changed.send_to(&frame, ("127.0.0.1", port)).unwrap();
+        let mut measured = None;
+        for _ in 0..50 {
+            let payload = api_payload(api, "/v1/account-budgets").unwrap();
+            if payload["accounts"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                measured = Some(payload);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let measured = measured.expect("accepted IP traffic never reached account budgets");
+        assert_eq!(measured["accounts"][0]["account"], "owner", "{datapath}");
+        assert_eq!(measured["accounts"][0]["dropped_packets"], 1, "{datapath}");
+        assert_eq!(measured["accounts"][0]["totals"][1], 40, "{datapath}");
     }
 }
