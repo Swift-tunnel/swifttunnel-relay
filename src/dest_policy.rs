@@ -750,7 +750,13 @@ mod tests {
             let base = Ipv4Addr::from(u32::from(ip(13, 0, 0, 0)) + (n << 8));
             file.push_str(&format!("tcp {base}/24\n"));
         }
-        let observe = policy(Mode::Observe, &file);
+        // The unit-test helper samples every unlisted packet. Measure the
+        // production sampling interval here instead.
+        let observe = DestPolicy::build(
+            Mode::Observe,
+            Some(("benchmark".to_string(), Ok(file))),
+            DEFAULT_TCP_PORTS.to_vec(),
+        );
         let iterations = 10_000_000u32;
         let cases: [(&str, u8, Ipv4Addr, u16); 4] = [
             ("udp listed (gameplay)", 17, ip(128, 116, 50, 10), 55000),
