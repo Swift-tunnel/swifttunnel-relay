@@ -86,6 +86,7 @@ const AUTH_ACK_REPLAY: u8 = 7;
 const AUTH_ACK_OWNER_MISMATCH: u8 = 8;
 const MAX_AUTH_TOKEN_LEN: usize = 4096;
 const AUTH_CLOCK_SKEW_SECS: u64 = 30;
+const AUTH_ACK_REAUTH_REQUIRED: u8 = 9;
 const RELAY_ALLOW_INSECURE_ENV: &str = "RELAY_ALLOW_INSECURE";
 const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(1);
 const SOURCE_RATE_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
@@ -642,7 +643,7 @@ pub(crate) fn authenticated_session_source_allowed(
         return true;
     }
 
-    is_auth_hello || session.client_addr.ip() == client_addr.ip()
+    is_auth_hello || session.client_addr == client_addr
 }
 
 /// Whether this session's paid coverage still runs.
@@ -672,6 +673,23 @@ pub(crate) fn session_auth_is_current(session: &SessionEntry, now_unix: u64) -> 
         && session
             .lease_expires_at_unix
             .is_some_and(|expires_at| now_unix < expires_at)
+}
+
+/// Resolve the validated endpoint at the final send, including queued and TUN
+/// responses. Old flow-local endpoints are not authority after a NAT rebind.
+pub(crate) fn forwarding_addr(
+    sessions: &DashMap<[u8; SESSION_ID_LEN], SessionEntry>,
+    session_id: [u8; SESSION_ID_LEN],
+    auth_required: bool,
+    now_unix: u64,
+) -> Option<SocketAddr> {
+    let session = sessions.get(&session_id)?;
+    let current = if auth_required {
+        session_auth_is_current(&session, now_unix)
+    } else {
+        session_lease_is_current(&session, now_unix)
+    };
+    current.then_some(session.client_addr)
 }
 
 /// Ports a game never talks to, and an attacker very much wants to.
@@ -1437,6 +1455,8 @@ async fn main() -> Result<()> {
     let stats_port = get_stats_port();
     let stats_token = get_stats_token();
     let auth_config = RelayAuthConfig::from_env()?;
+    let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
+
     let datapath = datapath_v2::get_relay_datapath();
 
     let stats = Arc::new(Stats::new());
@@ -1492,17 +1512,27 @@ async fn main() -> Result<()> {
                     // Spawn a thread that drains TUN response packets and sends
                     // them back to clients via the main relay socket.
                     let stats_tun_resp = Arc::clone(&stats);
+                    let sessions_tun_resp = Arc::clone(&sessions);
+                    let auth_required_tun_resp = auth_config.mode.requires_auth();
                     let session_traffic_tun_resp = Arc::clone(&session_traffic);
                     std::thread::Builder::new()
                         .name("relay-tun-resp".into())
                         .spawn(move || {
                             while let Ok(tx_pkt) = tcp_response_rx.recv() {
+                                let Some(client_addr) = forwarding_addr(
+                                    &sessions_tun_resp,
+                                    tx_pkt.session_id,
+                                    auth_required_tun_resp,
+                                    unix_timestamp_secs(),
+                                ) else {
+                                    continue;
+                                };
                                 // Build relay frame: [session_id][ip_packet]
                                 let mut frame =
                                     Vec::with_capacity(SESSION_ID_LEN + tx_pkt.ip_packet.len());
                                 frame.extend_from_slice(&tx_pkt.session_id);
                                 frame.extend_from_slice(&tx_pkt.ip_packet);
-                                if let Err(e) = resp_socket.send_to(&frame, tx_pkt.client_addr) {
+                                if let Err(e) = resp_socket.send_to(&frame, client_addr) {
                                     log::trace!(
                                         "TCP response send error to {}: {}",
                                         tx_pkt.client_addr,
@@ -1574,6 +1604,7 @@ async fn main() -> Result<()> {
             session_traffic,
             Arc::clone(&source_limiter),
             Arc::clone(&replay_cache),
+            Arc::clone(&sessions),
         )
         .await;
     }
@@ -1605,7 +1636,6 @@ async fn main() -> Result<()> {
     let socket = Arc::new(socket);
 
     // Session tracking
-    let sessions: Arc<DashMap<[u8; SESSION_ID_LEN], SessionEntry>> = Arc::new(DashMap::new());
     let source_session_counts: Arc<DashMap<IpAddr, u64>> = Arc::new(DashMap::new());
 
     // Flow tracking: "session_hex:game_addr" -> FlowEntry
@@ -1655,10 +1685,20 @@ async fn main() -> Result<()> {
 
     // Spawn response sender task
     let socket_sender = Arc::clone(&socket);
+    let sessions_out = Arc::clone(&sessions);
+    let auth_required_out = auth_config.mode.requires_auth();
     let stats_out = Arc::clone(&stats);
     let session_traffic_out = Arc::clone(&session_traffic);
     tokio::spawn(async move {
-        while let Some((addr, session_id, data)) = response_rx.recv().await {
+        while let Some((_addr, session_id, data)) = response_rx.recv().await {
+            let Some(addr) = forwarding_addr(
+                &sessions_out,
+                session_id,
+                auth_required_out,
+                unix_timestamp_secs(),
+            ) else {
+                continue;
+            };
             if let Err(e) = socket_sender.send_to(&data, addr).await {
                 log::warn!("Failed to send response to {}: {}", addr, e);
             } else {
@@ -1863,6 +1903,21 @@ async fn main() -> Result<()> {
         };
         if auth_config.mode.requires_auth()
             && verified_ticket.is_none()
+            && sessions
+                .get(&session_id)
+                .is_some_and(|session| session.client_addr != client_addr)
+            && pending_auth.allow(client_addr.ip(), now)
+        {
+            send_auth_ack(
+                socket.as_ref(),
+                client_addr,
+                session_id,
+                AUTH_ACK_REAUTH_REQUIRED,
+            )
+            .await;
+        }
+        if auth_config.mode.requires_auth()
+            && verified_ticket.is_none()
             && !sessions.get(&session_id).is_some_and(|session| {
                 session_auth_is_current(&session, now_unix)
                     && authenticated_session_source_allowed(&session, true, client_addr, false)
@@ -1916,10 +1971,7 @@ async fn main() -> Result<()> {
                     client_addr,
                     is_auth_hello,
                 );
-                if !auth_required
-                    || !session_authenticated
-                    || session.client_addr.ip() == client_addr.ip()
-                {
+                if !auth_required || (!is_auth_hello && session.client_addr == client_addr) {
                     update_source_session_count_for_rebind(
                         &source_session_counts,
                         session.client_addr.ip(),
@@ -4325,7 +4377,7 @@ mod auth_config_utility_tests {
             last_activity_unix: 1,
         };
 
-        assert!(authenticated_session_source_allowed(
+        assert!(!authenticated_session_source_allowed(
             &session,
             true,
             "198.51.100.10:40001".parse().unwrap(),
@@ -4343,6 +4395,41 @@ mod auth_config_utility_tests {
             "203.0.113.55:40000".parse().unwrap(),
             true
         ));
+    }
+
+    #[test]
+    fn queued_returns_follow_only_the_validated_endpoint_and_expiry() {
+        let sessions = DashMap::new();
+        let sid = 1u64.to_be_bytes();
+        let old = "198.51.100.10:40000".parse().unwrap();
+        let new = "198.51.100.10:40001".parse().unwrap();
+        sessions.insert(
+            sid,
+            SessionEntry {
+                user_id: "owner".into(),
+                auth_state: SessionAuthState::Authenticated,
+                lease_expires_at_unix: Some(200),
+                client_addr: old,
+                created_at_unix: 100,
+                last_activity: Instant::now(),
+                last_activity_unix: 100,
+            },
+        );
+        assert_eq!(forwarding_addr(&sessions, sid, true, 199), Some(old));
+        assert!(!authenticated_session_source_allowed(
+            &sessions.get(&sid).unwrap(),
+            true,
+            new,
+            false
+        ));
+        assert_eq!(forwarding_addr(&sessions, sid, true, 199), Some(old));
+        sessions.get_mut(&sid).unwrap().client_addr = new;
+        assert_eq!(forwarding_addr(&sessions, sid, true, 199), Some(new));
+        assert_eq!(forwarding_addr(&sessions, sid, true, 200), None);
+        sessions.get_mut(&sid).unwrap().lease_expires_at_unix = None;
+        assert_eq!(forwarding_addr(&sessions, sid, true, 100), None);
+        sessions.get_mut(&sid).unwrap().auth_state = SessionAuthState::Legacy;
+        assert_eq!(forwarding_addr(&sessions, sid, false, 100), Some(new));
     }
 
     #[test]

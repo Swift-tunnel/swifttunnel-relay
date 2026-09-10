@@ -928,6 +928,7 @@ pub(super) async fn run_datapath_v2(
     session_traffic: Arc<DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>>,
     source_limiter: Arc<super::SourceRateLimiter>,
     replay_cache: Arc<super::RelayTicketReplayCache>,
+    sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>>,
 ) -> Result<()> {
     let tuning = relay_v2_tuning();
     let shard_count = tuning.shard_count;
@@ -944,8 +945,6 @@ pub(super) async fn run_datapath_v2(
     );
     log::info!("  TX queue: {} (env RELAY_V2_TX_QUEUE)", tx_queue_cap);
 
-    let sessions: Arc<DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>> =
-        Arc::new(DashMap::new());
     let source_session_counts: Arc<DashMap<std::net::IpAddr, u64>> = Arc::new(DashMap::new());
 
     // Built unconditionally: the public health endpoint needs it even when no
@@ -1008,6 +1007,8 @@ pub(super) async fn run_datapath_v2(
     let stats_out = Arc::clone(&stats);
     let session_traffic_out = Arc::clone(&session_traffic);
     let pool_out = Arc::clone(&pool);
+    let sessions_out = Arc::clone(&sessions);
+    let auth_required_out = auth_config.mode.requires_auth();
     let tx_thread = std::thread::Builder::new()
         .name("relay-tx".to_string())
         .spawn(move || -> Result<()> {
@@ -1018,14 +1019,14 @@ pub(super) async fn run_datapath_v2(
                             Ok(value) => value,
                             Err(_) => break,
                         };
-                        send_tx_packet(&tx_socket, &pool_out, &stats_out, &session_traffic_out, packet);
+                        send_tx_packet(&tx_socket, &pool_out, &stats_out, &session_traffic_out, &sessions_out, auth_required_out, packet);
                     }
                     recv(tx_data_r) -> msg => {
                         let packet = match msg {
                             Ok(value) => value,
                             Err(_) => break,
                         };
-                        send_tx_packet(&tx_socket, &pool_out, &stats_out, &session_traffic_out, packet);
+                        send_tx_packet(&tx_socket, &pool_out, &stats_out, &session_traffic_out, &sessions_out, auth_required_out, packet);
                     }
                 }
             }
@@ -1288,6 +1289,23 @@ pub(super) async fn run_datapath_v2(
                 };
                 if auth_config_rx.mode.requires_auth()
                     && verified_ticket.is_none()
+                    && sessions_rx
+                        .get(&session_id)
+                        .is_some_and(|session| session.client_addr != client_addr)
+                    && pending_auth.allow(client_addr.ip(), now)
+                {
+                    send_small_control_frame(
+                        &tx_control_rx,
+                        &pool_rx,
+                        client_addr,
+                        session_id,
+                        super::AUTH_ACK_FRAME_TYPE,
+                        super::AUTH_ACK_REAUTH_REQUIRED,
+                        &stats_rx,
+                    );
+                }
+                if auth_config_rx.mode.requires_auth()
+                    && verified_ticket.is_none()
                     && !sessions_rx.get(&session_id).is_some_and(|session| {
                         super::session_auth_is_current(&session, now_unix)
                             && super::authenticated_session_source_allowed(
@@ -1347,9 +1365,7 @@ pub(super) async fn run_datapath_v2(
                             client_addr,
                             is_auth_hello,
                         );
-                        if !auth_required
-                            || !session_authenticated
-                            || session.client_addr.ip() == client_addr.ip()
+                        if !auth_required || (!is_auth_hello && session.client_addr == client_addr)
                         {
                             super::update_source_session_count_for_rebind(
                                 &source_session_counts_rx,
@@ -1835,7 +1851,9 @@ fn send_tx_packet(
     pool: &BufferPool,
     stats: &super::Stats,
     session_traffic: &DashMap<[u8; super::SESSION_ID_LEN], Arc<super::SessionTraffic>>,
-    packet: TxPacket,
+    sessions: &DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>,
+    auth_required: bool,
+    mut packet: TxPacket,
 ) {
     if should_drop_stale_queued_packet(packet.kind, packet.enqueued_at, Instant::now()) {
         stats.drop_out(super::DropReason::StaleQueue);
@@ -1843,6 +1861,19 @@ fn send_tx_packet(
         return;
     }
 
+    if packet.kind == QueuedPacketKind::Data {
+        let Some(addr) = super::forwarding_addr(
+            sessions,
+            packet.session_id,
+            auth_required,
+            super::unix_timestamp_secs(),
+        ) else {
+            stats.drop_out(super::DropReason::Auth);
+            pool.release(packet.buf_idx);
+            return;
+        };
+        packet.addr = addr;
+    }
     let bytes = unsafe { pool.buffer(packet.buf_idx) };
     if let Err(e) = socket.send_to(&bytes[..packet.len], packet.addr) {
         log::trace!("TX send error to {}: {}", packet.addr, e);
