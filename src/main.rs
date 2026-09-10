@@ -229,7 +229,6 @@ struct RelayTicketClaims {
     iat: u64,
     exp: u64,
     jti: String,
-    #[serde(default)]
     lease: bool,
 }
 
@@ -642,7 +641,7 @@ pub(crate) fn session_auth_is_current(session: &SessionEntry, now_unix: u64) -> 
     matches!(session.auth_state, SessionAuthState::Authenticated)
         && session
             .lease_expires_at_unix
-            .map_or(true, |expires_at| now_unix < expires_at)
+            .is_some_and(|expires_at| now_unix < expires_at)
 }
 
 /// Ports a game never talks to, and an attacker very much wants to.
@@ -749,7 +748,28 @@ fn verify_relay_ticket(
 
     let claims: RelayTicketClaims =
         serde_json::from_slice(&payload).map_err(|_| RelayAuthVerifyError::BadFormat)?;
-    if claims.v != 1 {
+    // Deserialize directly into the typed struct: recognised duplicate fields,
+    // strings in numeric fields, fractional timestamps and missing claims fail.
+    // key_id is not used to choose a key; the configured public key verified
+    // the actual payload above. Unknown informational fields have no authority.
+    if claims.v != 1
+        || !claims.lease
+        || claims.sub.len() > 64
+        || claims.jti.is_empty()
+        || claims.jti.len() > 128
+        || !claims
+            .sub
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        || !claims
+            .jti
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        || claims.srv.is_empty()
+        || claims.srv.len() > 64
+        || claims.exp <= claims.iat
+        || claims.exp - claims.iat > 900
+    {
         return Err(RelayAuthVerifyError::BadFormat);
     }
     if claims.iss != "swifttunnel-web" || claims.aud != "swifttunnel-relay" || claims.sub.is_empty()
@@ -773,7 +793,7 @@ fn verify_relay_ticket(
     if claims.iat > now_unix.saturating_add(AUTH_CLOCK_SKEW_SECS) {
         return Err(RelayAuthVerifyError::BadFormat);
     }
-    if now_unix > claims.exp.saturating_add(AUTH_CLOCK_SKEW_SECS) {
+    if now_unix >= claims.exp {
         return Err(RelayAuthVerifyError::Expired);
     }
 
@@ -3593,6 +3613,7 @@ mod tests {
             "srv": server,
             "iat": now,
             "exp": exp,
+            "lease": true,
             "jti": "22222222-2222-2222-2222-222222222222",
         });
         let payload_bytes = serde_json::to_vec(&payload).expect("json serialization must work");
@@ -3925,6 +3946,7 @@ mod auth_config_utility_tests {
             "srv": server,
             "iat": now,
             "exp": exp,
+            "lease": true,
             "jti": "22222222-2222-2222-2222-222222222222",
         });
         let payload_bytes = serde_json::to_vec(&payload).expect("json serialization must work");
@@ -4179,7 +4201,7 @@ mod auth_config_utility_tests {
     }
 
     #[test]
-    fn test_authenticated_session_without_lease_remains_current() {
+    fn test_authenticated_session_without_lease_is_not_current() {
         let session = SessionEntry {
             user_id: "legacy-client".to_string(),
             auth_state: SessionAuthState::Authenticated,
@@ -4190,7 +4212,7 @@ mod auth_config_utility_tests {
             last_activity_unix: 1,
         };
 
-        assert!(session_auth_is_current(&session, 10_000));
+        assert!(!session_auth_is_current(&session, 10_000));
     }
 
     #[test]
@@ -4489,6 +4511,7 @@ mod auth_config_utility_tests {
                 "srv": "us-east-nj",
                 "iat": now,
                 "exp": now + 300,
+                "lease": true,
                 "jti": "jti-1",
             }),
         );
@@ -4513,6 +4536,7 @@ mod auth_config_utility_tests {
                 "srv": "us-east-nj",
                 "iat": now,
                 "exp": now + 300,
+                "lease": true,
                 "jti": "jti-1",
             }),
         );
@@ -4537,6 +4561,7 @@ mod auth_config_utility_tests {
                 "srv": "us-east-nj",
                 "iat": now,
                 "exp": now + 300,
+                "lease": true,
                 "jti": "jti-1",
             }),
         );
@@ -4561,6 +4586,7 @@ mod auth_config_utility_tests {
                 "srv": "us-east-nj",
                 "iat": now,
                 "exp": now + 300,
+                "lease": true,
                 "jti": "jti-1",
             }),
         );
@@ -4585,20 +4611,78 @@ mod auth_config_utility_tests {
     }
 
     #[test]
-    fn test_verify_ticket_exp_at_exact_clock_skew_boundary_passes() {
+    fn test_verify_ticket_exp_at_clock_skew_boundary_is_expired() {
         let (key_pair, auth_config) = test_auth_materials();
         let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
         let sid = format!("{:016x}", u64::from_be_bytes(session_id));
         let iat = 1_739_789_000_u64;
         let exp = 1_739_789_500_u64;
-        // now = exp + AUTH_CLOCK_SKEW_SECS exactly should pass
+        // Clock tolerance for iat never extends paid coverage beyond exp.
         let now = exp + AUTH_CLOCK_SKEW_SECS;
         let token = make_ticket_token(&key_pair, &sid, "us-east-nj", iat, exp);
         let result = verify_relay_ticket(&token, session_id, &auth_config, now);
+        assert!(matches!(result, Err(RelayAuthVerifyError::Expired)));
+    }
+
+    #[test]
+    fn signed_tickets_require_finite_strict_claims() {
+        let (key, auth) = test_auth_materials();
+        let sid = 1u64.to_be_bytes();
+        let valid = serde_json::json!({"v":1,"iss":"swifttunnel-web","aud":"swifttunnel-relay",
+            "sub":"account","sid":"0000000000000001","srv":"us-east-nj",
+            "iat":1000,"exp":1300,"jti":"request","lease":true});
+        for (field, value) in [
+            ("lease", serde_json::json!(false)),
+            ("lease", serde_json::json!("true")),
+            ("exp", serde_json::json!(1000)),
+            ("exp", serde_json::json!(999)),
+            ("exp", serde_json::json!(1901)),
+            ("iat", serde_json::json!(1000.5)),
+            ("exp", serde_json::json!("1300")),
+            ("iat", serde_json::json!(-1)),
+            ("sub", serde_json::json!("a".repeat(65))),
+            ("jti", serde_json::json!("")),
+            ("jti", serde_json::json!("b".repeat(129))),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            let token = make_custom_ticket_token(&key, invalid);
+            assert!(
+                matches!(
+                    verify_relay_ticket(&token, sid, &auth, 1000),
+                    Err(RelayAuthVerifyError::BadFormat)
+                ),
+                "{field}"
+            );
+        }
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("lease");
         assert!(
-            result.is_ok(),
-            "exp at exact clock skew boundary should pass"
+            verify_relay_ticket(&make_custom_ticket_token(&key, missing), sid, &auth, 1000)
+                .is_err()
         );
+        for field in [
+            "v", "iss", "aud", "sub", "sid", "srv", "iat", "exp", "jti", "lease",
+        ] {
+            let mut raw = serde_json::to_string(&valid).unwrap();
+            raw.pop();
+            raw.push_str(&format!(",\"{field}\":{}}}", valid[field]));
+            let token = format!(
+                "{}.{}",
+                BASE64_URL_SAFE_NO_PAD.encode(raw.as_bytes()),
+                BASE64_URL_SAFE_NO_PAD.encode(key.sign(raw.as_bytes()).as_ref())
+            );
+            assert!(
+                verify_relay_ticket(&token, sid, &auth, 1000).is_err(),
+                "duplicate {field}"
+            );
+        }
+        let token = make_custom_ticket_token(&key, valid);
+        assert!(verify_relay_ticket(&token, sid, &auth, 1299).is_ok());
+        assert!(matches!(
+            verify_relay_ticket(&token, sid, &auth, 1300),
+            Err(RelayAuthVerifyError::Expired)
+        ));
     }
 
     // ---- parse_auth_hello_token edge cases ----
