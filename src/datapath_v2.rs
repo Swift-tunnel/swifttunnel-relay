@@ -64,13 +64,12 @@ pub(super) enum RelayDatapath {
 
 /// Read `RELAY_DATAPATH` and select datapath implementation.
 pub(super) fn get_relay_datapath() -> RelayDatapath {
-    match env::var("RELAY_DATAPATH")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+    parse_relay_datapath(env::var("RELAY_DATAPATH").ok().as_deref())
+}
+
+/// Map a `RELAY_DATAPATH` value to a datapath. Unset or unrecognised means V2.
+fn parse_relay_datapath(raw: Option<&str>) -> RelayDatapath {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("v1") | Some("tokio") => RelayDatapath::V1,
         Some("v2") | Some("sharded") => RelayDatapath::V2,
         _ => RelayDatapath::V2,
@@ -2036,31 +2035,42 @@ mod tests {
     }
 
     // ── get_relay_datapath ──────────────────────────────────────────────
-    // NOTE: These tests read the RELAY_DATAPATH environment variable directly.
-    // They are NOT safe to run in parallel with each other because they
-    // mutate shared process-global state. Run with `--test-threads=1` to
-    // avoid flakiness, or rely on CI running `cargo test` with the env unset.
+    // These cover the parser, not the environment read. They used to set and
+    // clear RELAY_DATAPATH, which is process-global, so under the default
+    // parallel test runner they raced each other and failed about one run in
+    // three: whichever test cleared the variable decided what the others saw.
 
     #[test]
     fn test_get_relay_datapath_default_is_v2() {
-        // When RELAY_DATAPATH is unset the default must be V2.
-        // This test is safe as long as the env var is not set externally.
-        std::env::remove_var("RELAY_DATAPATH");
-        assert_eq!(get_relay_datapath(), RelayDatapath::V2);
+        assert_eq!(parse_relay_datapath(None), RelayDatapath::V2);
     }
 
     #[test]
     fn test_get_relay_datapath_v1_literal() {
-        std::env::set_var("RELAY_DATAPATH", "v1");
-        assert_eq!(get_relay_datapath(), RelayDatapath::V1);
-        std::env::remove_var("RELAY_DATAPATH");
+        assert_eq!(parse_relay_datapath(Some("v1")), RelayDatapath::V1);
     }
 
     #[test]
     fn test_get_relay_datapath_tokio_alias() {
-        std::env::set_var("RELAY_DATAPATH", "tokio");
-        assert_eq!(get_relay_datapath(), RelayDatapath::V1);
-        std::env::remove_var("RELAY_DATAPATH");
+        assert_eq!(parse_relay_datapath(Some("tokio")), RelayDatapath::V1);
+    }
+
+    #[test]
+    fn test_get_relay_datapath_v2_aliases() {
+        assert_eq!(parse_relay_datapath(Some("v2")), RelayDatapath::V2);
+        assert_eq!(parse_relay_datapath(Some("sharded")), RelayDatapath::V2);
+    }
+
+    #[test]
+    fn test_get_relay_datapath_trims_and_ignores_case() {
+        assert_eq!(parse_relay_datapath(Some("  V1  ")), RelayDatapath::V1);
+        assert_eq!(parse_relay_datapath(Some("Sharded")), RelayDatapath::V2);
+    }
+
+    #[test]
+    fn test_get_relay_datapath_unknown_value_falls_back_to_v2() {
+        assert_eq!(parse_relay_datapath(Some("nonsense")), RelayDatapath::V2);
+        assert_eq!(parse_relay_datapath(Some("")), RelayDatapath::V2);
     }
 
     // ── clamp_usize ────────────────────────────────────────────────────

@@ -6076,18 +6076,35 @@ mod async_stats_http_tests {
 
         let client_task = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            // Send a request larger than MAX_HTTP_REQUEST_SIZE (8192)
-            // Use a huge header to exceed the limit.
-            let mut request = String::from("GET /v1/stats HTTP/1.1\r\n");
-            // Add a header that pushes us past MAX_HTTP_REQUEST_SIZE without \r\n\r\n terminator
-            request.push_str(&format!("X-Padding: {}\r\n", "A".repeat(8200)));
-            // The server may close the connection before we finish writing,
-            // so ignore write/shutdown errors.
+
+            // Fill the header buffer to the cap and never terminate the
+            // headers, so the server gives up and answers 431.
+            //
+            // Exactly MAX_HTTP_REQUEST_SIZE and not a byte more, on purpose.
+            // The server stops reading at the cap, so anything past it is still
+            // sitting unread in its receive buffer when it drops the socket.
+            // Closing with unread data is an abortive close: Windows lets the
+            // resulting RST discard the 431 this side had already been sent,
+            // while Linux hands the buffered bytes over anyway, which is why
+            // this only ever failed on one platform. Sending exactly the cap
+            // leaves nothing unread, the close is an ordinary FIN, and the
+            // response survives on both.
+            let head = "GET /v1/stats HTTP/1.1\r\nX-Padding: ";
+            let padding = MAX_HTTP_REQUEST_SIZE - head.len() - "\r\n".len();
+            let request = format!("{head}{}\r\n", "A".repeat(padding));
+            assert_eq!(request.len(), MAX_HTTP_REQUEST_SIZE);
+            // The server may close before we finish writing, so ignore errors.
             let _ = stream.write_all(request.as_bytes()).await;
-            let _ = stream.shutdown().await;
+
+            // Bounded so a regression fails the assertion instead of hanging.
             let mut response = Vec::new();
-            // read_to_end may also get ConnectionReset on some platforms
-            let _ = stream.read_to_end(&mut response).await;
+            let mut chunk = [0u8; 1024];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+                }
+            }
             String::from_utf8_lossy(&response).to_string()
         });
 

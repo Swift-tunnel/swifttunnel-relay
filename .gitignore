@@ -4,3 +4,6 @@ Cargo.lock
 # Local agent notes - never publish (this repo is public)
 CLAUDE.md
 .claude/
+
+# Local build config: target-dir outside OneDrive
+.cargo/
