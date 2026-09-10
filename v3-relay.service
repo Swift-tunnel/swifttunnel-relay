@@ -14,6 +14,11 @@ Environment=RUST_LOG=info
 Environment=RELAY_AUTH_MODE=required
 Environment=RELAY_TCP_ENABLED=true
 Environment=RELAY_TUN_UDP=false
+# Destination policy (src/dest_policy.rs): observe counts traffic outside the
+# allowlist without dropping it, enforce drops it. Enforce needs the file
+# written by update-dest-allowlist.sh.
+Environment=RELAY_DEST_POLICY_MODE=observe
+#Environment=RELAY_DEST_ALLOWLIST_FILE=/etc/swifttunnel/dest-allowlist.txt
 
 # Security hardening
 NoNewPrivileges=true

@@ -55,6 +55,7 @@ use tokio::time::interval;
 
 mod account_budget;
 mod datapath_v2;
+mod dest_policy;
 mod tcp_tun;
 
 const SESSION_ID_LEN: usize = 8;
@@ -1470,6 +1471,9 @@ async fn main() -> Result<()> {
     log::info!("║     SwiftTunnel V3 UDP Relay v{}        ║", RELAY_VERSION);
     log::info!("║     Low Latency Game Packet Forwarding     ║");
     log::info!("╚════════════════════════════════════════════╝");
+    // Before the datapaths split, so both report it; this also loads the
+    // policy, so a bad allowlist file shows up at startup.
+    log::info!("{}", dest_policy::describe());
 
     // Bind the main UDP socket early so the TUN response thread can share it.
     // Reuse the existing datapath-v2 helper so RELAY_SOCKET_RCVBUF_BYTES /
@@ -2962,6 +2966,9 @@ fn handle_stats_http_client_blocking(
             "/v1/account-budgets" => {
                 write_http_response_blocking(&mut stream, 200, "OK", &account_budget::snapshot())?;
             }
+            "/v1/dest-policy" => {
+                write_http_response_blocking(&mut stream, 200, "OK", &dest_policy::snapshot())?;
+            }
             "/v1/stats" => {
                 let body = render_stats_payload(&context);
                 write_http_response_blocking(&mut stream, 200, "OK", &body)?;
@@ -3115,6 +3122,9 @@ async fn handle_stats_http_client(
     match path {
         "/v1/account-budgets" => {
             write_http_response(&mut stream, 200, "OK", &account_budget::snapshot()).await?;
+        }
+        "/v1/dest-policy" => {
+            write_http_response(&mut stream, 200, "OK", &dest_policy::snapshot()).await?;
         }
         "/v1/stats" => {
             let body = render_stats_payload(&context);
@@ -3508,7 +3518,7 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     let more_fragments = (fragment_bits & 0x2000) != 0;
     let fragment_offset = fragment_bits & 0x1FFF;
     if more_fragments || fragment_offset != 0 {
-        if is_forbidden_dst(dst_ip) {
+        if is_forbidden_dst(dst_ip) || !dest_policy::permits(protocol, dst_ip, None) {
             return Some(ParsedPacket::ForbiddenDst);
         }
         return Some(ParsedPacket::Fragment {
@@ -3555,7 +3565,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
                 dst_port,
             };
 
-            if is_forbidden_dst(dst_ip) || is_forbidden_dst_port(dst_port) {
+            if is_forbidden_dst(dst_ip)
+                || is_forbidden_dst_port(dst_port)
+                || !dest_policy::permits(protocol, dst_ip, Some(dst_port))
+            {
                 return Some(ParsedPacket::ForbiddenDst);
             }
 
@@ -3593,8 +3606,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
             // belong here: amplification needs a connectionless, spoofable
             // protocol, and TCP has neither property, so refusing these ports
             // over TCP buys no safety and only breaks traffic. This relay
-            // carries HTTPS for Route Assist, so that is a live cost.
-            if is_forbidden_dst(dst_ip) {
+            // carries HTTPS for Route Assist, so that is a live cost. The
+            // destination policy's TCP port list is a separate rule: it keeps
+            // TCP to the web ports Roblox serves its front doors on.
+            if is_forbidden_dst(dst_ip) || !dest_policy::permits(protocol, dst_ip, Some(dst_port)) {
                 return Some(ParsedPacket::ForbiddenDst);
             }
 
@@ -5279,6 +5294,26 @@ mod packet_construction_tests {
                 "udp/{port} carries real traffic and must still be forwarded"
             );
         }
+    }
+
+    /// Observe is the default policy, and observing must not change what is
+    /// forwarded: an address outside Roblox's networks still parses as an
+    /// ordinary UDP packet. Enforcement itself is covered in dest_policy.
+    #[test]
+    fn unlisted_destinations_still_forward_under_the_default_policy() {
+        let mut packet = vec![0u8; 36];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        packet[20..22].copy_from_slice(&50000u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&50001u16.to_be_bytes());
+        stamp_ipv4_lengths(&mut packet);
+
+        assert!(matches!(
+            parse_ip_packet_full(&packet),
+            Some(ParsedPacket::Udp { .. })
+        ));
     }
 
     #[test]
