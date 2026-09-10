@@ -2362,6 +2362,25 @@ async fn main() -> Result<()> {
                 // Create flow key
                 let flow_key = format!("{:016x}:{}", u64::from_be_bytes(session_id), game_addr);
 
+                // Admit a new flow before taking its entry. The capacity check
+                // reads flows.len(), which locks every shard of the map, and an
+                // entry holds its own shard's lock, so checking under the entry
+                // deadlocked this loop on the first new flow. Only this loop
+                // inserts flows, so a key absent here is still absent below.
+                let new_flow = !flows.contains_key(&flow_key);
+                if new_flow
+                    && (!v1_flow_capacity_available(&flows, &session_flow_keys, &stats, session_id)
+                        || !allow_source_event(
+                            &source_limiter,
+                            &stats,
+                            client_addr,
+                            SourceLimitKind::NewFlow,
+                            now,
+                        ))
+                {
+                    continue;
+                }
+
                 // Atomic get-or-create using entry() API to prevent race conditions
                 match flows.entry(flow_key.clone()) {
                     Entry::Occupied(mut entry) => {
@@ -2391,21 +2410,12 @@ async fn main() -> Result<()> {
                         }
                     }
                     Entry::Vacant(entry) => {
-                        if !v1_flow_capacity_available(
-                            &flows,
-                            &session_flow_keys,
-                            &stats,
-                            session_id,
-                        ) {
-                            continue;
-                        }
-                        if !allow_source_event(
-                            &source_limiter,
-                            &stats,
-                            client_addr,
-                            SourceLimitKind::NewFlow,
-                            now,
-                        ) {
+                        if !new_flow {
+                            // Cleanup removed it after the check above. Drop
+                            // this packet rather than create a flow that was
+                            // never admitted; the next one will be.
+                            drop(entry);
+                            stats.drop_in(DropReason::FlowCreate);
                             continue;
                         }
 
