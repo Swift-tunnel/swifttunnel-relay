@@ -2,7 +2,8 @@
 # setup-tun.sh — Configure TUN device and iptables for relay TUN forwarding
 #
 # Run once on each relay server before enabling RELAY_TCP_ENABLED=true and/or
-# RELAY_TUN_UDP=true.
+# RELAY_TUN_UDP=true. Safe to rerun, and rerun it after changing any of the
+# TUN_TCP_LIMIT_MODE / TUN_*_PER_DST settings in section 8.
 # Requires root privileges.
 
 set -euo pipefail
@@ -121,7 +122,68 @@ else
     echo "[=] FORWARD return traffic rule already exists"
 fi
 
-# 8. Persist iptables rules
+# 8. Per-destination TCP limits on traffic leaving the TUN
+#
+# Client TCP goes out through the kernel as raw packets, so without a limit one
+# client could aim a SYN flood at any address through this box. Observe is the
+# default: the rules only count, and their packet counters show how often real
+# traffic would have been limited. Read them with
+#     iptables -nvL FORWARD | grep swifttunnel-tcp
+# Once the counters show the thresholds clear real traffic, rerun with
+# TUN_TCP_LIMIT_MODE=enforce. TUN_TCP_LIMIT_MODE=off removes the rules.
+TUN_TCP_LIMIT_MODE="${TUN_TCP_LIMIT_MODE:-observe}"
+TUN_SYN_PER_DST_PER_SEC="${TUN_SYN_PER_DST_PER_SEC:-50}"
+TUN_SYN_PER_DST_BURST="${TUN_SYN_PER_DST_BURST:-100}"
+TUN_CONN_PER_DST="${TUN_CONN_PER_DST:-1024}"
+
+case "$TUN_TCP_LIMIT_MODE" in
+    off|observe|enforce) ;;
+    *)
+        echo "[!] TUN_TCP_LIMIT_MODE must be off, observe or enforce (got '$TUN_TCP_LIMIT_MODE')" >&2
+        exit 1
+        ;;
+esac
+for value in "$TUN_SYN_PER_DST_PER_SEC" "$TUN_SYN_PER_DST_BURST" "$TUN_CONN_PER_DST"; do
+    case "$value" in
+        ''|*[!0-9]*|0)
+            echo "[!] TUN_SYN_PER_DST_PER_SEC, TUN_SYN_PER_DST_BURST and TUN_CONN_PER_DST must be positive integers" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Remove whatever a previous run added, in any mode and with any thresholds,
+# highest rule number first so the numbers stay valid while deleting.
+iptables -L FORWARD -n --line-numbers \
+    | awk '/\/\* swifttunnel-tcp-/ {print $1}' \
+    | sort -rn \
+    | while read -r number; do
+        iptables -D FORWARD "$number"
+    done
+
+if [ "$TUN_TCP_LIMIT_MODE" = "off" ]; then
+    echo "[=] Per-destination TCP limits off"
+else
+    action=()
+    if [ "$TUN_TCP_LIMIT_MODE" = "enforce" ]; then
+        action=(-j DROP)
+    fi
+    echo "[+] Adding per-destination TCP limits ($TUN_TCP_LIMIT_MODE): ${TUN_SYN_PER_DST_PER_SEC} SYN/s (burst ${TUN_SYN_PER_DST_BURST}) and ${TUN_CONN_PER_DST} open connections per destination"
+    # New connections per second to any one address, across every client.
+    iptables -I FORWARD 1 -i "$TUN_DEVICE" -s "$TUN_SUBNET" -p tcp --syn \
+        -m comment --comment swifttunnel-tcp-syn-rate \
+        -m hashlimit --hashlimit-name st_syn_dst --hashlimit-mode dstip \
+        --hashlimit-above "${TUN_SYN_PER_DST_PER_SEC}/second" \
+        --hashlimit-burst "$TUN_SYN_PER_DST_BURST" \
+        ${action[@]+"${action[@]}"}
+    # Open connections to any one address, across every client.
+    iptables -I FORWARD 1 -i "$TUN_DEVICE" -s "$TUN_SUBNET" -p tcp --syn \
+        -m comment --comment swifttunnel-tcp-conn-count \
+        -m connlimit --connlimit-above "$TUN_CONN_PER_DST" --connlimit-mask 32 --connlimit-daddr \
+        ${action[@]+"${action[@]}"}
+fi
+
+# 9. Persist iptables rules
 if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
     echo "[+] Saved iptables rules via netfilter-persistent"
@@ -137,3 +199,4 @@ echo "Next steps:"
 echo "  1. Set RELAY_TCP_ENABLED=true and/or RELAY_TUN_UDP=true in the relay service environment"
 echo "  2. Restart the relay: sudo systemctl restart v3-relay"
 echo "  3. Verify the relay brought swifttun0 up with 10.200.0.1/16 assigned"
+echo "  4. After a week of real traffic, read the TCP limit counters: iptables -nvL FORWARD | grep swifttunnel-tcp"
