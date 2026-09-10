@@ -80,6 +80,23 @@ fn both_datapaths_refuse_unlisted_destinations_only_when_enforcing() {
             let refused = api(stats_port, "/v1/stats").unwrap()["drops"]["forbidden_dst"].clone();
             assert_eq!(policy["dropped_packets"], expected, "{context}");
             assert_eq!(refused, expected, "{context}");
+
+            // First fragments still contain the destination port. Fragmenting
+            // TCP must not evade port observation/enforcement, and fragmenting
+            // UDP must not bypass the existing forbidden-port rule.
+            for (protocol, dst_port) in [(6, 22), (17, 53)] {
+                let mut frame = udp_frame([198, 51, 100, 10], dst_port);
+                frame.truncate(8 + 28);
+                frame[8 + 2..8 + 4].copy_from_slice(&28u16.to_be_bytes());
+                frame[8 + 6] = 0x20;
+                frame[8 + 9] = protocol;
+                client.send_to(&frame, ("127.0.0.1", port)).unwrap();
+            }
+            wait_for_pong(&client, port, &context);
+            let policy = api(stats_port, "/v1/dest-policy").unwrap();
+            assert_eq!(policy["unlisted_packets"]["tcp_port"], 1, "{context}");
+            let refused = api(stats_port, "/v1/stats").unwrap()["drops"]["forbidden_dst"].clone();
+            assert_eq!(refused, 1 + 2 * expected, "{context}");
         }
     }
 }

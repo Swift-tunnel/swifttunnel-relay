@@ -3561,7 +3561,21 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     let more_fragments = (fragment_bits & 0x2000) != 0;
     let fragment_offset = fragment_bits & 0x1FFF;
     if more_fragments || fragment_offset != 0 {
-        if is_forbidden_dst(dst_ip) || !dest_policy::permits(protocol, dst_ip, None) {
+        // The first fragment carries the ports, even when the full transport
+        // header spans fragments. Later fragments have only an IP-level check;
+        // without an accepted first fragment they cannot form a datagram.
+        let dst_port = if fragment_offset == 0 && matches!(protocol, 6 | 17) {
+            if packet.len() < ihl + 4 {
+                return None;
+            }
+            Some(u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+        } else {
+            None
+        };
+        if is_forbidden_dst(dst_ip)
+            || (protocol == 17 && dst_port.is_some_and(is_forbidden_dst_port))
+            || !dest_policy::permits(protocol, dst_ip, dst_port)
+        {
             return Some(ParsedPacket::ForbiddenDst);
         }
         return Some(ParsedPacket::Fragment {
@@ -5545,6 +5559,7 @@ mod packet_construction_tests {
         packet[19] = 8;
         stamp_ipv4_lengths(&mut packet);
         packet[6] = 0x20; // more-fragments flag
+        packet[22..24].copy_from_slice(&50000u16.to_be_bytes());
 
         let result = parse_ip_packet_full(&packet);
         assert!(result.is_some());
