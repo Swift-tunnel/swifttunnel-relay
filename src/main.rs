@@ -619,19 +619,30 @@ fn v1_flow_capacity_available(
     true
 }
 
-fn remove_v1_session_flow_key(
+fn remove_v1_flow(
+    flows: &DashMap<String, FlowEntry>,
     session_flow_keys: &DashMap<[u8; SESSION_ID_LEN], Vec<String>>,
     session_id: [u8; SESSION_ID_LEN],
     flow_key: &str,
+    generation: &Arc<()>,
 ) {
-    if let Some(mut keys) = session_flow_keys.get_mut(&session_id) {
-        keys.retain(|key| key != flow_key);
-    }
-    if session_flow_keys
-        .get(&session_id)
-        .is_some_and(|keys| keys.is_empty())
+    // Match cleanup's index-before-flow lock order. Insertion releases the
+    // flow guard before updating the index. A replacement inserted after our
+    // removal therefore adds its index key after we release this guard.
+    let index = session_flow_keys.entry(session_id);
+    if flows
+        .remove_if(flow_key, |_, flow| {
+            Arc::ptr_eq(&flow.generation, generation)
+        })
+        .is_none()
     {
-        session_flow_keys.remove(&session_id);
+        return;
+    }
+    if let Entry::Occupied(mut entry) = index {
+        entry.get_mut().retain(|key| key != flow_key);
+        if entry.get().is_empty() {
+            entry.remove();
+        }
     }
 }
 
@@ -1214,6 +1225,8 @@ fn record_session_ingress(
 /// Flow entry in the flow map
 struct FlowEntry {
     tx: FlowTx,
+    /// Identifies this lifetime of a tuple, including after cleanup and reuse.
+    generation: Arc<()>,
     client_addr: SocketAddr,
     last_activity: Instant,
     /// Original packet info for response reconstruction
@@ -2403,12 +2416,14 @@ async fn main() -> Result<()> {
                             }
                             Err(TrySendError::Closed(_)) => {
                                 // Flow task died, remove entry so it can be recreated
+                                let generation = Arc::clone(&flow.generation);
                                 drop(entry);
-                                flows.remove(&flow_key);
-                                remove_v1_session_flow_key(
+                                remove_v1_flow(
+                                    &flows,
                                     &session_flow_keys,
                                     session_id,
                                     &flow_key,
+                                    &generation,
                                 );
                             }
                         }
@@ -2433,8 +2448,10 @@ async fn main() -> Result<()> {
                         }
 
                         // Insert atomically
+                        let generation = Arc::new(());
                         entry.insert(FlowEntry {
                             tx,
+                            generation: Arc::clone(&generation),
                             client_addr,
                             last_activity: Instant::now(),
                             original_info,
@@ -2455,6 +2472,7 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             run_flow_handler(
                                 flow_key,
+                                generation,
                                 game_addr,
                                 session_id,
                                 rx,
@@ -2512,6 +2530,7 @@ fn handle_cli_args() -> Result<bool> {
 /// Handle a flow: receive packets from main loop, send to game server, receive responses
 async fn run_flow_handler(
     flow_key: String,
+    generation: Arc<()>,
     game_addr: SocketAddr,
     session_id: [u8; SESSION_ID_LEN],
     mut rx: mpsc::Receiver<Vec<u8>>,
@@ -2529,8 +2548,13 @@ async fn run_flow_handler(
                 game_addr
             );
             stats.drop_in(DropReason::ForbiddenDst);
-            flows.remove(&flow_key);
-            remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
+            remove_v1_flow(
+                &flows,
+                &session_flow_keys,
+                session_id,
+                &flow_key,
+                &generation,
+            );
             return;
         }
     }
@@ -2540,8 +2564,13 @@ async fn run_flow_handler(
         Ok(s) => s,
         Err(e) => {
             log::warn!("Failed to create flow socket: {}", e);
-            flows.remove(&flow_key);
-            remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
+            remove_v1_flow(
+                &flows,
+                &session_flow_keys,
+                session_id,
+                &flow_key,
+                &generation,
+            );
             return;
         }
     };
@@ -2549,8 +2578,13 @@ async fn run_flow_handler(
     // Connect to game server (for recv filtering)
     if let Err(e) = socket.connect(game_addr).await {
         log::warn!("Failed to connect to {}: {}", game_addr, e);
-        flows.remove(&flow_key);
-        remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
+        remove_v1_flow(
+            &flows,
+            &session_flow_keys,
+            session_id,
+            &flow_key,
+            &generation,
+        );
         return;
     }
 
@@ -2621,7 +2655,9 @@ async fn run_flow_handler(
 
                         // Look up current client address and original packet info
                         let (client_addr, original_info) = match flows.get(&flow_key) {
-                            Some(entry) => (entry.client_addr, entry.original_info),
+                            Some(entry) if Arc::ptr_eq(&entry.generation, &generation) =>
+                                (entry.client_addr, entry.original_info),
+                            Some(_) => break,
                             None => {
                                 // Flow removed, try session fallback
                                 if sessions.contains_key(&session_id) {
@@ -2651,8 +2687,10 @@ async fn run_flow_handler(
 
                         // Update flow activity
                         if let Some(mut entry) = flows.get_mut(&flow_key) {
-                            entry.last_activity = Instant::now();
-                            entry.marked_for_removal = None; // Keep alive
+                            if Arc::ptr_eq(&entry.generation, &generation) {
+                                entry.last_activity = Instant::now();
+                                entry.marked_for_removal = None; // Keep alive
+                            }
                         }
                         if let Some(mut session_entry) = sessions.get_mut(&session_id) {
                             session_entry.last_activity = Instant::now();
@@ -2677,7 +2715,7 @@ async fn run_flow_handler(
             // Idle timeout check
             _ = tokio::time::sleep(Duration::from_secs(30)) => {
                 // Check if flow is still in map (cleanup task may have removed it)
-                if !flows.contains_key(&flow_key) {
+                if !flows.get(&flow_key).is_some_and(|entry| Arc::ptr_eq(&entry.generation, &generation)) {
                     break;
                 }
             }
@@ -2685,8 +2723,13 @@ async fn run_flow_handler(
     }
 
     // Cleanup
-    flows.remove(&flow_key);
-    remove_v1_session_flow_key(&session_flow_keys, session_id, &flow_key);
+    remove_v1_flow(
+        &flows,
+        &session_flow_keys,
+        session_id,
+        &flow_key,
+        &generation,
+    );
     log::trace!("Flow {} ended", flow_key);
 }
 
@@ -4485,9 +4528,33 @@ mod auth_config_utility_tests {
     }
 
     #[test]
-    fn test_v1_session_flow_index_removes_only_target_flow() {
+    fn test_v1_cleanup_preserves_replacement_flow_and_index() {
+        let flows = DashMap::new();
         let index = DashMap::new();
         let session_id = 0x0123_4567_89ab_cdef_u64.to_be_bytes();
+        let key = "0123456789abcdef:1.1.1.1:1000";
+        let old_generation = Arc::new(());
+        let generation = Arc::new(());
+        let (tx, _rx) = mpsc::channel(1);
+        // Cleanup removed the old entry and the receive loop reused its tuple
+        // before the old handler finished. This is the replacement entry.
+        flows.insert(
+            key.to_string(),
+            FlowEntry {
+                tx,
+                generation: Arc::clone(&generation),
+                client_addr: "127.0.0.1:12345".parse().unwrap(),
+                last_activity: Instant::now(),
+                original_info: OriginalPacketInfo {
+                    tos: 0,
+                    src_ip: "10.0.0.2".parse().unwrap(),
+                    src_port: 12345,
+                    dst_ip: "1.1.1.1".parse().unwrap(),
+                    dst_port: 1000,
+                },
+                marked_for_removal: None,
+            },
+        );
         index.insert(
             session_id,
             vec![
@@ -4496,7 +4563,15 @@ mod auth_config_utility_tests {
             ],
         );
 
-        remove_v1_session_flow_key(&index, session_id, "0123456789abcdef:1.1.1.1:1000");
+        remove_v1_flow(&flows, &index, session_id, key, &old_generation);
+        assert!(Arc::ptr_eq(
+            &flows.get(key).unwrap().generation,
+            &generation
+        ));
+        assert_eq!(index.get(&session_id).unwrap().len(), 2);
+
+        remove_v1_flow(&flows, &index, session_id, key, &generation);
+        assert!(!flows.contains_key(key));
 
         let keys = index.get(&session_id).unwrap();
         assert_eq!(keys.as_slice(), ["0123456789abcdef:2.2.2.2:2000"]);
