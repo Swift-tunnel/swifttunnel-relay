@@ -394,6 +394,33 @@ pub(crate) struct SourceRateLimiter {
     last_prune_ms: AtomicU64,
 }
 
+/// Fixed memory before signature verification. Randomized buckets prevent a
+/// stream of invented source addresses from growing the authenticated maps.
+/// Colliding sources share a bucket for one second; there is no eviction churn.
+struct PendingAuthLimiter {
+    hash: std::collections::hash_map::RandomState,
+    buckets: Vec<std::sync::Mutex<SourceRateState>>,
+}
+
+impl PendingAuthLimiter {
+    fn new() -> Self {
+        Self {
+            hash: std::collections::hash_map::RandomState::new(),
+            buckets: (0..4096)
+                .map(|_| std::sync::Mutex::new(SourceRateState::new(Instant::now())))
+                .collect(),
+        }
+    }
+
+    fn allow(&self, ip: IpAddr, now: Instant) -> bool {
+        use std::hash::BuildHasher;
+        let index = self.hash.hash_one(ip) as usize % self.buckets.len();
+        self.buckets[index]
+            .lock()
+            .is_ok_and(|mut bucket| bucket.allow(SourceLimitKind::NewSession, now))
+    }
+}
+
 impl SourceRateLimiter {
     fn new() -> Self {
         Self {
@@ -405,6 +432,9 @@ impl SourceRateLimiter {
 
     pub(crate) fn allow(&self, ip: IpAddr, kind: SourceLimitKind, now: Instant) -> bool {
         self.prune_idle(now);
+        if !self.sources.contains_key(&ip) && self.sources.len() >= MAX_SESSIONS_TOTAL {
+            return false;
+        }
         self.sources
             .entry(ip)
             .or_insert_with(|| SourceRateState::new(now))
@@ -1526,6 +1556,7 @@ async fn main() -> Result<()> {
     );
     let source_limiter = Arc::new(SourceRateLimiter::new());
     let replay_cache = Arc::new(RelayTicketReplayCache::new());
+    let pending_auth = PendingAuthLimiter::new();
 
     if matches!(datapath, datapath_v2::RelayDatapath::V2) {
         return datapath_v2::run_datapath_v2(
@@ -1811,6 +1842,36 @@ async fn main() -> Result<()> {
         let is_auth_hello =
             len >= SESSION_ID_LEN + 3 && buf[SESSION_ID_LEN] == AUTH_HELLO_FRAME_TYPE;
 
+        // Unknown senders use fixed pending buckets, never authenticated capacity.
+        let verified_ticket = if auth_config.mode.requires_auth() && is_auth_hello {
+            if !pending_auth.allow(client_addr.ip(), now) {
+                stats.drop_in(DropReason::RateLimit);
+                continue;
+            }
+            let result = parse_auth_hello_token(&buf, len).and_then(|token| {
+                verify_relay_ticket_once(token, session_id, &auth_config, now_unix, &replay_cache)
+            });
+            match result {
+                Ok(ticket) => Some(ticket),
+                Err(err) => {
+                    send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if auth_config.mode.requires_auth()
+            && verified_ticket.is_none()
+            && !sessions.get(&session_id).is_some_and(|session| {
+                session_auth_is_current(&session, now_unix)
+                    && authenticated_session_source_allowed(&session, true, client_addr, false)
+            })
+        {
+            stats.drop_in(DropReason::Auth);
+            continue;
+        }
+
         if !allow_source_event(
             &source_limiter,
             &stats,
@@ -1900,16 +1961,7 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            let token = match parse_auth_hello_token(&buf, len) {
-                Ok(value) => value,
-                Err(err) => {
-                    send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
-                    continue;
-                }
-            };
-
-            match verify_relay_ticket_once(token, session_id, &auth_config, now_unix, &replay_cache)
-            {
+            match verified_ticket.ok_or(RelayAuthVerifyError::BadFormat) {
                 Ok(ticket) => {
                     // Ownership does not transfer. See
                     // `RelayAuthVerifyError::OwnerMismatch`: a valid signature
@@ -3595,6 +3647,22 @@ mod tests {
             server_id: Some("us-east-nj".to_string()),
         };
         (key_pair, auth_config)
+    }
+
+    #[test]
+    fn pending_sources_have_fixed_memory_and_recover_after_the_window() {
+        let limiter = PendingAuthLimiter::new();
+        let now = Instant::now();
+        for value in 0..100_000u32 {
+            let _ = limiter.allow(IpAddr::V4(Ipv4Addr::from(value)), now);
+        }
+        assert_eq!(limiter.buckets.len(), 4096);
+        let ip = "198.51.100.1".parse().unwrap();
+        for _ in 0..MAX_NEW_SESSIONS_PER_SOURCE_WINDOW {
+            let _ = limiter.allow(ip, now);
+        }
+        assert!(!limiter.allow(ip, now));
+        assert!(limiter.allow(ip, now + SOURCE_RATE_WINDOW));
     }
 
     fn make_ticket_token(

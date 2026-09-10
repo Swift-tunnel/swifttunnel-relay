@@ -1227,6 +1227,7 @@ pub(super) async fn run_datapath_v2(
         .name("relay-rx".to_string())
         .spawn(move || -> Result<()> {
             let mut buf = [0u8; super::MAX_PACKET_SIZE];
+            let pending_auth = super::PendingAuthLimiter::new();
 
             loop {
                 let (len, client_addr) = match rx_socket.recv_from(&mut buf) {
@@ -1252,6 +1253,54 @@ pub(super) async fn run_datapath_v2(
                 let now_unix = super::unix_timestamp_secs();
                 let is_auth_hello = len >= super::SESSION_ID_LEN + 3
                     && buf[super::SESSION_ID_LEN] == super::AUTH_HELLO_FRAME_TYPE;
+
+                let verified_ticket = if auth_config_rx.mode.requires_auth() && is_auth_hello {
+                    if !pending_auth.allow(client_addr.ip(), now) {
+                        stats_rx.drop_in(super::DropReason::RateLimit);
+                        continue;
+                    }
+                    let result = super::parse_auth_hello_token(&buf, len).and_then(|token| {
+                        super::verify_relay_ticket_once(
+                            token,
+                            session_id,
+                            &auth_config_rx,
+                            now_unix,
+                            &replay_cache_rx,
+                        )
+                    });
+                    match result {
+                        Ok(ticket) => Some(ticket),
+                        Err(err) => {
+                            send_small_control_frame(
+                                &tx_control_rx,
+                                &pool_rx,
+                                client_addr,
+                                session_id,
+                                super::AUTH_ACK_FRAME_TYPE,
+                                err.ack_status(),
+                                &stats_rx,
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if auth_config_rx.mode.requires_auth()
+                    && verified_ticket.is_none()
+                    && !sessions_rx.get(&session_id).is_some_and(|session| {
+                        super::session_auth_is_current(&session, now_unix)
+                            && super::authenticated_session_source_allowed(
+                                &session,
+                                true,
+                                client_addr,
+                                false,
+                            )
+                    })
+                {
+                    stats_rx.drop_in(super::DropReason::Auth);
+                    continue;
+                }
 
                 if !super::allow_source_event(
                     &source_limiter_rx,
@@ -1347,29 +1396,7 @@ pub(super) async fn run_datapath_v2(
                         continue;
                     }
 
-                    let token = match super::parse_auth_hello_token(&buf, len) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            send_small_control_frame(
-                                &tx_control_rx,
-                                &pool_rx,
-                                client_addr,
-                                session_id,
-                                super::AUTH_ACK_FRAME_TYPE,
-                                err.ack_status(),
-                                &stats_rx,
-                            );
-                            continue;
-                        }
-                    };
-
-                    match super::verify_relay_ticket_once(
-                        token,
-                        session_id,
-                        &auth_config_rx,
-                        now_unix,
-                        &replay_cache_rx,
-                    ) {
+                    match verified_ticket.ok_or(super::RelayAuthVerifyError::BadFormat) {
                         Ok(ticket) => {
                             // Ownership does not transfer. Same rule as the v1
                             // path: see `RelayAuthVerifyError::OwnerMismatch`.
