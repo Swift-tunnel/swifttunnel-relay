@@ -2985,8 +2985,28 @@ pub(crate) fn spawn_health_http_server(port: u16, context: Arc<StatsApiContext>)
     Ok(())
 }
 
+/// Health requests served at once. The endpoint is public and each request
+/// gets its own thread, so without a ceiling anybody could open connections
+/// and leave them idle until there were thousands of threads, each holding a
+/// descriptor from the headroom flow sockets rely on and competing with the
+/// forwarding threads for CPU. The relay runs as root, so `LimitNPROC` does
+/// not stop it. A monitor makes one request at a time.
+const MAX_HEALTH_CLIENTS: usize = 32;
+const HEALTH_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Releases a health client slot when the client's thread ends.
+struct HealthClientSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for HealthClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn run_health_http_server_blocking(port: u16, context: Arc<StatsApiContext>) -> Result<()> {
     use std::io::{Read, Write};
+
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
         .context("Failed to bind health API listener")?;
@@ -3001,14 +3021,23 @@ fn run_health_http_server_blocking(port: u16, context: Arc<StatsApiContext>) -> 
             }
         };
 
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_HEALTH_CLIENTS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            drop(stream);
+            continue;
+        }
+        let slot = HealthClientSlot(Arc::clone(&active));
+
         let context = Arc::clone(&context);
         // Short timeouts: a monitor that stalls must not hold a thread open.
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_read_timeout(Some(HEALTH_HTTP_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(HEALTH_HTTP_TIMEOUT));
 
-        std::thread::Builder::new()
+        // A failed spawn drops the closure, and with it the slot.
+        let _ = std::thread::Builder::new()
             .name("health-http-client".into())
             .spawn(move || {
+                let _slot = slot;
                 let mut buf = [0u8; 1024];
                 let read = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..read]);
@@ -3044,8 +3073,7 @@ fn run_health_http_server_blocking(port: u16, context: Arc<StatsApiContext>) -> 
                 );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
-            })
-            .ok();
+            });
     }
 }
 

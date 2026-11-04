@@ -13,6 +13,12 @@ use std::{
 
 pub struct LocalRelay(Child);
 
+impl LocalRelay {
+    pub fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
 impl Drop for LocalRelay {
     fn drop(&mut self) {
         let _ = self.0.kill();

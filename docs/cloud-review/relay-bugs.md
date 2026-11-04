@@ -192,3 +192,17 @@ Line numbers refer to the code before the fix landed.
   other reuse is still `AUTH_ACK_REPLAY`, so a captured hello sent from
   somewhere else gains nothing. Wire format and ack codes are unchanged.
 - Test: `tests/auth_retransmit.rs` (both datapaths); fails before the fix.
+
+### 12. The public health endpoint spawned a thread per idle connection (fixed)
+
+- `src/main.rs:2988` (`run_health_http_server_blocking`), public on 8081.
+- Each accepted connection got its own OS thread, which then waited up to
+  5 s for a request, with no limit on how many. The relay runs as root, so
+  `LimitNPROC` does not apply. Anyone could open idle connections faster than
+  they time out: measured, 300 idle connections took the relay from 15 to 315
+  threads. Each also holds a descriptor from the 4096 kept spare for
+  everything that is not a flow socket, and thousands of threads compete with
+  the RX, shard and TX threads for CPU.
+- Fix: at most 32 health clients at once (extra connections are closed at
+  accept), and a 2 s timeout instead of 5 s.
+- Test: `tests/health.rs` (Linux), fails before the fix.
