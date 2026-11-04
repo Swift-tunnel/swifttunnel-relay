@@ -3080,62 +3080,86 @@ pub(crate) fn spawn_health_http_server(port: u16, context: Arc<StatsApiContext>)
 const MAX_HEALTH_CLIENTS: usize = 32;
 const HEALTH_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Releases a health client slot when the client's thread ends.
-struct HealthClientSlot(Arc<std::sync::atomic::AtomicUsize>);
+/// Local stats API clients served at once.
+const MAX_STATS_CLIENTS: usize = 16;
 
-impl Drop for HealthClientSlot {
+/// Releases a client slot when the client's thread ends.
+struct ClientSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ClientSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Accept connections forever and serve each on its own thread, at most
+/// `max_clients` at once; connections over the limit are closed at accept.
+///
+/// Accept errors are never fatal. They come mostly from running out of file
+/// descriptors, which a flood of flows can do and which clears; the stats API
+/// used to exit on the first one and stay down until the relay restarted. The
+/// pause matters too: a connection that cannot be accepted stays queued, and
+/// retrying at once spun the health thread at full CPU next to the forwarding
+/// threads.
+fn serve_bounded<F>(
+    listener: std::net::TcpListener,
+    max_clients: usize,
+    thread_name: &'static str,
+    handler: F,
+) -> !
+where
+    F: Fn(std::net::TcpStream) + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                log::debug!("{} accept error: {}", thread_name, e);
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        if active.fetch_add(1, Ordering::AcqRel) >= max_clients {
+            active.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        let slot = ClientSlot(Arc::clone(&active));
+        let handler = Arc::clone(&handler);
+        // A failed spawn drops the closure, and with it the slot and stream.
+        let _ = std::thread::Builder::new()
+            .name(thread_name.into())
+            .spawn(move || {
+                let _slot = slot;
+                handler(stream);
+            });
     }
 }
 
 fn run_health_http_server_blocking(port: u16, context: Arc<StatsApiContext>) -> Result<()> {
     use std::io::{Read, Write};
 
-    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
     let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
         .context("Failed to bind health API listener")?;
     log::info!("Health API listening on 0.0.0.0:{}", port);
 
-    loop {
-        let (mut stream, _addr) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::debug!("Health API accept error: {}", e);
-                continue;
-            }
-        };
+    serve_bounded(
+        listener,
+        MAX_HEALTH_CLIENTS,
+        "health-http-client",
+        move |mut stream| {
+            // Short timeouts: a monitor that stalls must not hold a thread open.
+            let _ = stream.set_read_timeout(Some(HEALTH_HTTP_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(HEALTH_HTTP_TIMEOUT));
+            let mut buf = [0u8; 1024];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
 
-        if active.fetch_add(1, Ordering::AcqRel) >= MAX_HEALTH_CLIENTS {
-            active.fetch_sub(1, Ordering::AcqRel);
-            drop(stream);
-            continue;
-        }
-        let slot = HealthClientSlot(Arc::clone(&active));
-
-        let context = Arc::clone(&context);
-        // Short timeouts: a monitor that stalls must not hold a thread open.
-        let _ = stream.set_read_timeout(Some(HEALTH_HTTP_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(HEALTH_HTTP_TIMEOUT));
-
-        // A failed spawn drops the closure, and with it the slot.
-        let _ = std::thread::Builder::new()
-            .name("health-http-client".into())
-            .spawn(move || {
-                let _slot = slot;
-                let mut buf = [0u8; 1024];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..read]);
-                let path = request
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("/")
-                    .to_string();
-
-                let (status, body) = if path.starts_with("/health") {
-                    let uptime = context.started_at.elapsed().as_secs();
-                    (
+            let (status, body) = if path.starts_with("/health") {
+                let uptime = context.started_at.elapsed().as_secs();
+                (
                         "200 OK",
                         format!(
                             "{{\"status\":\"ok\",\"server_id\":{},\"uptime_seconds\":{},\"version\":\"{}\"}}",
@@ -3147,20 +3171,20 @@ fn run_health_http_server_blocking(port: u16, context: Arc<StatsApiContext>) -> 
                             env!("CARGO_PKG_VERSION"),
                         ),
                     )
-                } else {
-                    ("404 Not Found", "{\"error\":\"not found\"}".to_string())
-                };
+            } else {
+                ("404 Not Found", "{\"error\":\"not found\"}".to_string())
+            };
 
-                let response = format!(
+            let response = format!(
                     "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
                     status,
                     body.len(),
                     body
                 );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            });
-    }
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        },
+    )
 }
 
 fn run_stats_http_server_blocking(
@@ -3176,22 +3200,17 @@ fn run_stats_http_server_blocking(
 
     log::info!("Stats API listening on 127.0.0.1:{}", port);
 
-    loop {
-        let (stream, addr) = listener
-            .accept()
-            .context("Failed to accept stats API client")?;
-        let token = token.clone();
-        let context = Arc::clone(&context);
-
-        std::thread::Builder::new()
-            .name("stats-http-client".into())
-            .spawn(move || {
-                if let Err(e) = handle_stats_http_client_blocking(stream, &token, context) {
-                    log::debug!("Stats API client {} error: {}", addr, e);
-                }
-            })
-            .context("Failed to spawn stats API client thread")?;
-    }
+    serve_bounded(
+        listener,
+        MAX_STATS_CLIENTS,
+        "stats-http-client",
+        move |stream| {
+            if let Err(e) = handle_stats_http_client_blocking(stream, &token, Arc::clone(&context))
+            {
+                log::debug!("Stats API client error: {}", e);
+            }
+        },
+    )
 }
 
 fn handle_stats_http_client_blocking(
@@ -4213,6 +4232,36 @@ mod tests {
         assert!(limiter.try_admit(next, later).is_none());
         drop(held);
         assert!(limiter.try_admit(next, later).is_some());
+    }
+
+    #[test]
+    fn bounded_server_never_runs_more_clients_than_its_limit() {
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (running_h, peak_h) = (Arc::clone(&running), Arc::clone(&peak));
+        std::thread::spawn(move || {
+            serve_bounded(listener, 2, "test-bounded", move |mut stream| {
+                let now = running_h.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_h.fetch_max(now, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                let _ = stream.read(&mut [0u8; 1]);
+                running_h.fetch_sub(1, Ordering::SeqCst);
+            })
+        });
+        let idle: Vec<_> = (0..10)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        drop(idle);
+        // Slots come back once clients finish.
+        std::thread::sleep(Duration::from_millis(400));
+        let _again = std::net::TcpStream::connect(addr).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(running.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -251,3 +251,19 @@ Line numbers refer to the code before the fix landed.
   every 30 s, and kept in a fixed array of atomics so the per-packet check
   takes no lock.
 - Test: `the_relay_host_is_never_a_destination`.
+
+### 15. One accept error killed the stats API; the health loop could spin (fixed)
+
+- `src/main.rs:3179` (`run_stats_http_server_blocking`) and `:3101`
+  (`run_health_http_server_blocking`).
+- The stats API used `?` on `accept()` and on thread spawn, so the first
+  error ended its thread and the API stayed down until the relay restarted.
+  The likeliest error is `EMFILE`, which is exactly what a flood of flows
+  produces, so the API went away at the moment it was needed to see why. It
+  also spawned a thread per connection with no limit.
+- The health loop retried a failed accept immediately. A connection that
+  cannot be accepted stays queued, so under `EMFILE` that is a thread at
+  full CPU beside the forwarding threads.
+- Fix: both run on `serve_bounded`, which never exits on accept errors, pauses
+  50 ms after one, and caps concurrent clients (health 32, stats 16).
+- Test: `bounded_server_never_runs_more_clients_than_its_limit`.
