@@ -1354,6 +1354,7 @@ pub(super) async fn run_datapath_v2(
         .spawn(move || -> Result<()> {
             let mut buf = [0u8; super::MAX_PACKET_SIZE];
             let pending_auth = super::PendingAuthLimiter::new();
+            let resolve_limiter = super::ResolveLimiter::new();
 
             loop {
                 let (len, client_addr) = match rx_socket.recv_from(&mut buf) {
@@ -1726,6 +1727,10 @@ pub(super) async fn run_datapath_v2(
                         continue;
                     }
                     if let Some((request_id, hosts)) = super::parse_resolve_request(&buf, len) {
+                        let Some(permit) = resolve_limiter.try_admit(session_id, now) else {
+                            stats_rx.drop_in(super::DropReason::RateLimit);
+                            continue;
+                        };
                         // Logged on purpose. The original handler was silent,
                         // so neither side could tell whether a request had ever
                         // arrived, and the failure hid for weeks.
@@ -1739,6 +1744,7 @@ pub(super) async fn run_datapath_v2(
                             let reply_socket = Arc::clone(reply_socket);
                             let addr = client_addr.clone();
                             resolve_rt.spawn(async move {
+                                let _permit = permit;
                                 let mut answers: Vec<(String, Vec<std::net::Ipv4Addr>)> =
                                     Vec::with_capacity(hosts.len());
                                 for host in hosts {

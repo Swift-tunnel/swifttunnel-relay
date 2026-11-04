@@ -1020,6 +1020,83 @@ fn build_resolve_response(
     out
 }
 
+/// Resolve requests one session may make per second (sessions are hashed into
+/// fixed buckets, so memory does not grow with sessions). A client asks for a
+/// handful of hosts when it connects.
+const RESOLVE_REQUESTS_PER_SESSION_WINDOW: u32 = 8;
+/// Resolve requests the whole relay answers per second.
+const RESOLVE_REQUESTS_PER_WINDOW: u32 = 256;
+/// Resolve requests being looked up at once. Each holds a blocking resolver
+/// thread for as long as `getaddrinfo` takes, which is seconds when an
+/// upstream resolver is slow.
+const MAX_RESOLVES_IN_FLIGHT: usize = 64;
+
+/// Bounds the work a resolve frame can start.
+///
+/// Every request used to spawn a task doing up to 16 lookups, with nothing
+/// limiting how many, and logged a line from the receive thread first. One
+/// authenticated client sending resolve frames at the per-source packet limit
+/// (50k a second) could pile up tasks without bound, tie up every blocking
+/// thread the runtime has, and make the forwarding thread spend its time
+/// writing log lines.
+struct ResolveLimiter {
+    hash: std::collections::hash_map::RandomState,
+    buckets: Vec<Mutex<(Instant, u32)>>,
+    global: Mutex<(Instant, u32)>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Held by a running resolve; frees its in-flight slot when dropped.
+struct ResolvePermit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ResolvePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn take_from_window(window: &Mutex<(Instant, u32)>, limit: u32, now: Instant) -> bool {
+    let Ok(mut window) = window.lock() else {
+        return false;
+    };
+    if now.saturating_duration_since(window.0) >= SOURCE_RATE_WINDOW {
+        *window = (now, 0);
+    }
+    if window.1 >= limit {
+        return false;
+    }
+    window.1 += 1;
+    true
+}
+
+impl ResolveLimiter {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            hash: std::collections::hash_map::RandomState::new(),
+            buckets: (0..4096).map(|_| Mutex::new((now, 0))).collect(),
+            global: Mutex::new((now, 0)),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn try_admit(&self, session_id: [u8; SESSION_ID_LEN], now: Instant) -> Option<ResolvePermit> {
+        use std::hash::BuildHasher;
+        let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let permit = ResolvePermit(Arc::clone(&self.in_flight));
+        if in_flight >= MAX_RESOLVES_IN_FLIGHT {
+            return None;
+        }
+        let bucket = &self.buckets[self.hash.hash_one(session_id) as usize % self.buckets.len()];
+        if !take_from_window(bucket, RESOLVE_REQUESTS_PER_SESSION_WINDOW, now)
+            || !take_from_window(&self.global, RESOLVE_REQUESTS_PER_WINDOW, now)
+        {
+            return None;
+        }
+        Some(permit)
+    }
+}
+
 /// Resolve a hostname to IPv4 addresses from the relay's (uncensored) vantage.
 async fn resolve_roblox_host_ipv4(host: &str) -> Vec<Ipv4Addr> {
     match tokio::net::lookup_host((host, 443u16)).await {
@@ -1687,6 +1764,7 @@ async fn main() -> Result<()> {
     let source_limiter = Arc::new(SourceRateLimiter::new());
     let replay_cache = Arc::new(RelayTicketReplayCache::new());
     let pending_auth = PendingAuthLimiter::new();
+    let resolve_limiter = ResolveLimiter::new();
 
     if matches!(datapath, datapath_v2::RelayDatapath::V2) {
         return datapath_v2::run_datapath_v2(
@@ -2264,8 +2342,13 @@ async fn main() -> Result<()> {
                 continue;
             }
             if let Some((request_id, hosts)) = parse_resolve_request(&buf, len) {
+                let Some(permit) = resolve_limiter.try_admit(session_id, now) else {
+                    stats.drop_in(DropReason::RateLimit);
+                    continue;
+                };
                 let socket = Arc::clone(&socket);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let mut answers: Vec<(String, Vec<Ipv4Addr>)> = Vec::with_capacity(hosts.len());
                     for host in hosts {
                         let ips = resolve_roblox_host_ipv4(&host).await;
@@ -3927,6 +4010,45 @@ mod tests {
         }
         assert!(!limiter.allow(ip, now));
         assert!(limiter.allow(ip, now + SOURCE_RATE_WINDOW));
+    }
+
+    #[test]
+    fn resolve_requests_are_bounded_per_session_globally_and_in_flight() {
+        let limiter = ResolveLimiter::new();
+        let now = Instant::now();
+        let sid = [1u8; SESSION_ID_LEN];
+        let mut held = Vec::new();
+        for _ in 0..RESOLVE_REQUESTS_PER_SESSION_WINDOW {
+            held.push(
+                limiter
+                    .try_admit(sid, now)
+                    .expect("within the session budget"),
+            );
+        }
+        assert!(limiter.try_admit(sid, now).is_none(), "session budget");
+        drop(held);
+
+        // Many sessions: the relay-wide rate holds, permits released at once.
+        let admitted = (0..10_000u64)
+            .filter(|n| limiter.try_admit(n.to_be_bytes(), now).is_some())
+            .count();
+        assert_eq!(
+            admitted as u32,
+            RESOLVE_REQUESTS_PER_WINDOW - RESOLVE_REQUESTS_PER_SESSION_WINDOW
+        );
+        assert_eq!(limiter.in_flight.load(Ordering::Relaxed), 0);
+
+        // Slow lookups: in-flight requests are capped, and a finished one
+        // frees its slot.
+        let later = now + SOURCE_RATE_WINDOW;
+        let held: Vec<_> = (0..1000u64)
+            .filter_map(|n| limiter.try_admit(n.to_be_bytes(), later))
+            .collect();
+        assert_eq!(held.len(), MAX_RESOLVES_IN_FLIGHT);
+        let next = (1000u64).to_be_bytes();
+        assert!(limiter.try_admit(next, later).is_none());
+        drop(held);
+        assert!(limiter.try_admit(next, later).is_some());
     }
 
     #[test]

@@ -146,3 +146,18 @@ Line numbers refer to the code before the fix landed.
   (`SWIFTTUNNEL_ETC_DIR`, defaults to `/etc`). It checks both rules, that a
   rerun changes nothing, and that limit modes replace each other. It fails
   against the previous script.
+
+### 9. Resolve frames could start unbounded lookups from the RX thread (fixed)
+
+- `src/datapath_v2.rs:1688` and `src/main.rs:2216` (0xA6 handlers).
+- Every resolve frame from an authenticated session spawned a task doing up
+  to 16 sequential `getaddrinfo` calls, with no limit on how many, and the v2
+  receive thread logged a line at info for each one first. One client sending
+  resolve frames at the per-source packet limit (50k a second) could pile up
+  tasks without bound, hold every blocking thread the runtime has (512) on
+  slow lookups, and keep the forwarding thread busy writing log lines.
+- Fix: `ResolveLimiter` admits at most 8 requests a second per session
+  (hashed into 4096 fixed buckets), 256 a second relay-wide, and 64 in flight.
+  The permit travels with the lookup task and frees its slot when it ends.
+  Refused requests count as `rate_limit`; the frame format is unchanged.
+- Test: `resolve_requests_are_bounded_per_session_globally_and_in_flight`.
