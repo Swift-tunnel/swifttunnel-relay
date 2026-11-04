@@ -340,3 +340,19 @@ Line numbers refer to the code before the fix landed.
   Submission ports (465, 587) need authentication at the far end and are left
   to the policy. Counted as `forbidden_dst`.
 - Test: `tcp_to_smtp_is_refused_in_every_policy_mode`.
+
+### 21. ICMP errors through the TUN quoted an address the client never had (fixed)
+
+- `src/tcp_tun.rs:455` (TUN reader rewrite).
+- ICMP errors (fragmentation needed, time exceeded, unreachable) quote the
+  header of the packet that caused them, and the receiving stack matches the
+  error to a socket by that quote. Conntrack undoes the NAT inside the quote
+  on the way in, so it names the session's `10.200.x.y` address. The reader
+  rewrote only the outer destination, so every such error reached the client
+  quoting a source it does not own and was dropped. PMTU discovery for
+  tunnelled TCP could not work (uploads stall on paths under 1380 bytes), and
+  with `RELAY_TUN_UDP=true` the client never learned a port was unreachable.
+- Fix: `rewrite_icmp_error_quoted_src` puts the client's own address back in
+  the quote of ICMP error types 3, 4, 5, 11 and 12 and fixes the quoted header
+  checksum and the ICMP checksum. Other ICMP is untouched.
+- Test: `icmp_errors_quote_the_clients_own_address_after_rewrite`.

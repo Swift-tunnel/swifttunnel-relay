@@ -453,6 +453,7 @@ mod platform {
                 // client's original source IP.
                 let mut ip_packet = buf[..n].to_vec();
                 rewrite_dst_ip(&mut ip_packet, original_src_ip);
+                rewrite_icmp_error_quoted_src(&mut ip_packet, dst_ip, original_src_ip);
 
                 log::debug!(
                     "tun-reader: TUN -> {} (rewritten dst {} -> {}, {} bytes)",
@@ -614,6 +615,54 @@ fn rewrite_src_ip(packet: &mut [u8], new_src: Ipv4Addr) {
 /// Rewrite the destination IP address (bytes 16-19) in an IPv4 packet and fix checksums.
 fn rewrite_dst_ip(packet: &mut [u8], new_dst: Ipv4Addr) {
     rewrite_ip_field(packet, IP_DST_OFFSET, new_dst);
+}
+
+/// IPv4 protocol number for ICMP.
+const IPPROTO_ICMP: u8 = 1;
+
+/// Point an ICMP error's quoted packet back at the client's own address.
+///
+/// An ICMP error (destination unreachable, including fragmentation needed,
+/// time exceeded, parameter problem) quotes the header of the packet that
+/// caused it, and the client's stack matches the error to a socket by that
+/// quote. On the way in, conntrack has already undone the NAT inside it, so
+/// it names the session's `10.200.x.y` address, which the client has never
+/// heard of. Rewriting only the outer destination left the quote alone, so
+/// clients silently ignored every such error: PMTU discovery for tunnelled
+/// TCP did not work, and with `RELAY_TUN_UDP` neither did port unreachable.
+/// The quoted transport checksum is left as it is; stacks do not check it.
+fn rewrite_icmp_error_quoted_src(packet: &mut [u8], tun_ip: Ipv4Addr, client_ip: Ipv4Addr) {
+    if packet.len() < MIN_IPV4_HEADER_LEN || packet[9] != IPPROTO_ICMP || ipv4_is_fragment(packet) {
+        return;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    let total_len = (u16::from_be_bytes([packet[2], packet[3]]) as usize).min(packet.len());
+    let quote = ihl + 8;
+    if ihl < MIN_IPV4_HEADER_LEN || total_len < quote + MIN_IPV4_HEADER_LEN {
+        return;
+    }
+    // Error types only; echo replies and the like carry no quote.
+    if !matches!(packet[ihl], 3 | 4 | 5 | 11 | 12) {
+        return;
+    }
+    let quoted_ihl = ((packet[quote] & 0x0F) as usize) * 4;
+    if packet[quote] >> 4 != 4
+        || quoted_ihl < MIN_IPV4_HEADER_LEN
+        || total_len < quote + quoted_ihl
+        || packet[quote + IP_SRC_OFFSET..quote + IP_SRC_OFFSET + 4] != tun_ip.octets()
+    {
+        return;
+    }
+    packet[quote + IP_SRC_OFFSET..quote + IP_SRC_OFFSET + 4].copy_from_slice(&client_ip.octets());
+    packet[quote + 10] = 0;
+    packet[quote + 11] = 0;
+    let quoted_checksum = super::calculate_ip_checksum(&packet[quote..quote + quoted_ihl]);
+    packet[quote + 10..quote + 12].copy_from_slice(&quoted_checksum.to_be_bytes());
+    // The ICMP checksum covers the whole message, quote included.
+    packet[ihl + 2] = 0;
+    packet[ihl + 3] = 0;
+    let icmp_checksum = super::calculate_ip_checksum(&packet[ihl..total_len]);
+    packet[ihl + 2..ihl + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
 }
 
 fn ipv4_is_fragment(packet: &[u8]) -> bool {
@@ -1265,6 +1314,54 @@ mod tests {
             map.insert(ip, test_mapping(other));
         }
         assert_eq!(assign_session_ip(&sid, &map), None);
+    }
+
+    #[test]
+    fn icmp_errors_quote_the_clients_own_address_after_rewrite() {
+        let client_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let tun_ip = Ipv4Addr::new(10, 200, 7, 9);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let router = Ipv4Addr::new(198, 51, 100, 1);
+        // What the client sent, as it left the TUN.
+        let quoted = make_tcp_packet(tun_ip, server);
+        // A router's fragmentation-needed error about it, after conntrack
+        // has translated it back toward the session's TUN address.
+        let mut icmp = vec![0u8; 20 + 8 + 28];
+        icmp[0] = 0x45;
+        icmp[2..4].copy_from_slice(&56u16.to_be_bytes());
+        icmp[8] = 64;
+        icmp[9] = IPPROTO_ICMP;
+        icmp[12..16].copy_from_slice(&router.octets());
+        icmp[16..20].copy_from_slice(&tun_ip.octets());
+        icmp[20] = 3; // destination unreachable
+        icmp[21] = 4; // fragmentation needed
+        icmp[26..28].copy_from_slice(&1280u16.to_be_bytes());
+        icmp[28..56].copy_from_slice(&quoted[..28]);
+        recalculate_ip_checksum(&mut icmp);
+        let sum = super::super::calculate_ip_checksum(&icmp[20..]);
+        icmp[22..24].copy_from_slice(&sum.to_be_bytes());
+
+        // What the TUN reader does with it.
+        rewrite_dst_ip(&mut icmp, client_ip);
+        rewrite_icmp_error_quoted_src(&mut icmp, tun_ip, client_ip);
+
+        assert_eq!(&icmp[16..20], &client_ip.octets());
+        assert_eq!(&icmp[40..44], &client_ip.octets(), "quoted source");
+        assert_eq!(&icmp[44..48], &server.octets());
+        assert!(verify_ip_checksum(&icmp));
+        assert!(verify_ip_checksum(&icmp[28..]), "quoted header checksum");
+        assert_eq!(
+            super::super::calculate_ip_checksum(&icmp[20..]),
+            0,
+            "icmp checksum"
+        );
+
+        // An echo reply has no quote and is left alone.
+        let mut echo = icmp.clone();
+        echo[20] = 0;
+        let before = echo.clone();
+        rewrite_icmp_error_quoted_src(&mut echo, client_ip, tun_ip);
+        assert_eq!(echo, before);
     }
 
     #[test]
