@@ -30,7 +30,9 @@ DeviceAllow=/dev/net/tun rw
 AmbientCapabilities=CAP_NET_ADMIN
 
 # Resource limits
-LimitNOFILE=65536
+# Every v2 flow holds a socket. The relay caps flows at 262144 and keeps
+# 4096 descriptors spare, so anything lower than this lowers the flow cap.
+LimitNOFILE=524288
 LimitNPROC=4096
 
 [Install]

@@ -28,3 +28,19 @@ Line numbers refer to the code before the fix landed.
   abandoning the rest of the burst.
 - Test: `shard_drains_a_flow_past_its_burst_budget_without_new_traffic` queues
   135 responses at once; before the fix only 128 arrived.
+
+### 2. v2 global flow cap read counters refreshed only every 30 s (fixed)
+
+- `src/datapath_v2.rs:759` (cap check) and `:939` (only store of the counter).
+- Each shard published its flow count only during the 30 s cleanup, and not at
+  all after `RemoveSession`. The `MAX_FLOWS_TOTAL` check summed those stale
+  numbers, so between cleanups the cap did not apply: one source alone may open
+  4096 flows per second, about 120k per cleanup interval.
+- Every v2 flow is a socket, and `v3-relay.service` set `LimitNOFILE=65536`, far
+  below `MAX_FLOWS_TOTAL` (262144). A flood of new flows therefore ran the
+  process out of file descriptors first, which also breaks the health and
+  stats listeners and resolver sockets.
+- Fix: publish the shard count on every insert and session removal; clamp the
+  flow cap to the soft `RLIMIT_NOFILE` minus 4096 spare descriptors; raise
+  `LimitNOFILE` in the unit file to 524288 so the configured cap is reachable.
+- Test: `flow_cap_stays_inside_the_fd_limit`.

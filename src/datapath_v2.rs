@@ -546,6 +546,39 @@ fn allocate_flow_token(
     }
 }
 
+/// File descriptors kept free for everything that is not a flow socket: the
+/// main socket, TUN, epoll and eventfd per shard, HTTP clients, resolver
+/// sockets and TCP connections the kernel side of the TUN path opens.
+const NON_FLOW_FD_HEADROOM: u64 = 4096;
+
+/// Soft `RLIMIT_NOFILE` for this process, or `None` when it cannot be read or
+/// is unlimited.
+fn current_nofile_limit() -> Option<u64> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // Safety: `limit` is a valid, writable rlimit struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    (limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur as u64)
+}
+
+/// Every v2 flow owns a socket, so the flow cap is also a file descriptor
+/// budget. Clamp it below the process fd limit, otherwise a flood of new flows
+/// runs the process out of descriptors before `MAX_FLOWS_TOTAL` is reached and
+/// everything else that needs one (stats/health connections, resolver
+/// sockets) starts failing too.
+fn max_flows_for_fd_limit(nofile: Option<u64>) -> usize {
+    match nofile {
+        Some(limit) => {
+            let budget = limit.saturating_sub(NON_FLOW_FD_HEADROOM).max(1);
+            usize::try_from(budget)
+                .unwrap_or(usize::MAX)
+                .min(super::MAX_FLOWS_TOTAL)
+        }
+        None => super::MAX_FLOWS_TOTAL,
+    }
+}
+
 /// Read up to `MAX_FLOW_RECV_BURST` responses from one flow socket and queue
 /// them for the TX thread.
 ///
@@ -668,6 +701,7 @@ fn run_shard(
         .expect("waker publish must succeed");
 
     let mut events = Events::with_capacity(1024);
+    let max_flows_total = max_flows_for_fd_limit(current_nofile_limit());
 
     let mut next_token: usize = 1;
     let mut token_to_flow: HashMap<Token, FlowKey> = HashMap::new();
@@ -677,7 +711,11 @@ fn run_shard(
     let mut recv_buf = [0u8; super::MAX_PACKET_SIZE];
     let mut cleanup_at = Instant::now() + super::CLEANUP_INTERVAL;
 
-    log::info!("V2 shard {} started", shard_id);
+    log::info!(
+        "V2 shard {} started (flow cap {} across all shards)",
+        shard_id,
+        max_flows_total
+    );
 
     // mio registers sockets edge-triggered, so a flow that still has queued
     // datagrams after its burst budget gets no new event until another
@@ -760,7 +798,7 @@ fn run_shard(
                                 .iter()
                                 .map(|value| value.load(Ordering::Relaxed) as usize)
                                 .sum();
-                            if total_flows >= super::MAX_FLOWS_TOTAL {
+                            if total_flows >= max_flows_total {
                                 stats.drop_in(super::DropReason::Capacity);
                                 pool.release(payload_idx);
                                 continue;
@@ -826,14 +864,20 @@ fn run_shard(
 
                             token_to_flow.insert(token, key);
                             session_flows.entry(session_id).or_default().push(game_addr);
-                            flows.entry(key).or_insert(FlowState {
+                            let flow = flows.entry(key).or_insert(FlowState {
                                 socket,
                                 client_addr,
                                 original_info,
                                 last_activity: Instant::now(),
                                 marked_for_removal: None,
                                 token,
-                            })
+                            });
+                            // Published on every change, not only at cleanup:
+                            // the global cap above reads these counters.
+                            // `token_to_flow` has one entry per flow.
+                            flow_counts[shard_id]
+                                .store(token_to_flow.len() as u64, Ordering::Relaxed);
+                            flow
                         }
                     };
 
@@ -895,6 +939,7 @@ fn run_shard(
                                 token_to_flow.remove(&flow.token);
                             }
                         }
+                        flow_counts[shard_id].store(flows.len() as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -2521,6 +2566,17 @@ mod tests {
             assert_eq!(buf[3], 0xEF);
         }
         pool.release(idx);
+    }
+
+    #[test]
+    fn flow_cap_stays_inside_the_fd_limit() {
+        assert_eq!(max_flows_for_fd_limit(None), super::super::MAX_FLOWS_TOTAL);
+        assert_eq!(max_flows_for_fd_limit(Some(65_536)), 65_536 - 4096);
+        assert_eq!(
+            max_flows_for_fd_limit(Some(10_000_000)),
+            super::super::MAX_FLOWS_TOTAL
+        );
+        assert_eq!(max_flows_for_fd_limit(Some(1024)), 1);
     }
 
     /// A flow that receives more than one burst's worth of responses at once
