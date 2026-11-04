@@ -76,6 +76,39 @@ impl TunSessionCleanup {
     }
 }
 
+/// Sends the thread's name when dropped, so a thread that returns or panics
+/// is noticed by whoever waits on the channel.
+struct ExitNotice(Sender<&'static str>, &'static str);
+
+impl Drop for ExitNotice {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(self.1);
+    }
+}
+
+/// At most one report a second for an error that can repeat for every packet.
+/// A failing TUN write used to log one warning per packet, which on a relay
+/// carrying TCP is thousands of lines a second for as long as the fault lasts.
+#[derive(Default)]
+struct LogLimiter {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl LogLimiter {
+    /// `Some(suppressed since the last report)` when this one should be logged.
+    fn should_log(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.last.is_some_and(|last| {
+            now.saturating_duration_since(last) < std::time::Duration::from_secs(1)
+        }) {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
 /// Inbound IPv4 packet received from a client via the UDP tunnel.
 pub struct InboundTunPacket {
     pub session_id: [u8; 8],
@@ -244,28 +277,33 @@ mod platform {
             let tx_sender = self.tx_sender.clone();
             let tun_fd_r = self.tun_fd;
 
+            // Returns as soon as either thread ends, panics included. Joining
+            // the writer first, as this used to, waited forever when only the
+            // reader died, since the writer blocks on its channel.
+            let (exited_s, exited_r) = crossbeam_channel::bounded::<&'static str>(2);
+
             // tun-writer thread: client packets -> TUN device
-            let writer = std::thread::Builder::new()
+            let notice = ExitNotice(exited_s.clone(), "tun-writer");
+            std::thread::Builder::new()
                 .name("tun-writer".into())
                 .spawn(move || {
+                    let _notice = notice;
                     Self::tun_writer_loop(tun_fd_w, rx_receiver, ip_to_session_w, session_to_ip_w);
                 })
                 .expect("failed to spawn tun-writer thread");
 
             // tun-reader thread: TUN device -> client responses
-            let reader = std::thread::Builder::new()
+            let notice = ExitNotice(exited_s, "tun-reader");
+            std::thread::Builder::new()
                 .name("tun-reader".into())
                 .spawn(move || {
+                    let _notice = notice;
                     Self::tun_reader_loop(tun_fd_r, ip_to_session_r, tx_sender);
                 })
                 .expect("failed to spawn tun-reader thread");
 
-            // Both threads run indefinitely; join so caller can detect exit.
-            if let Err(e) = writer.join() {
-                log::warn!("tun-writer thread panicked: {:?}", e);
-            }
-            if let Err(e) = reader.join() {
-                log::warn!("tun-reader thread panicked: {:?}", e);
+            if let Ok(name) = exited_r.recv() {
+                log::error!("{} thread exited", name);
             }
         }
 
@@ -276,6 +314,7 @@ mod platform {
             ip_to_session: Arc<DashMap<Ipv4Addr, SessionMapping>>,
             session_to_ip: Arc<DashMap<[u8; 8], Ipv4Addr>>,
         ) {
+            let mut write_errors = LogLimiter::default();
             loop {
                 let pkt = match rx_receiver.recv() {
                     Ok(p) => p,
@@ -392,10 +431,14 @@ mod platform {
                     )
                 };
                 if written < 0 {
-                    log::warn!(
-                        "tun-writer: write failed: {}",
-                        std::io::Error::last_os_error()
-                    );
+                    let error = std::io::Error::last_os_error();
+                    if let Some(suppressed) = write_errors.should_log(std::time::Instant::now()) {
+                        log::warn!(
+                            "tun-writer: write failed: {} ({} more since the last report)",
+                            error,
+                            suppressed
+                        );
+                    }
                 }
             }
         }
@@ -1380,6 +1423,37 @@ mod tests {
             !verify_udp_checksum(&udp),
             "damaged UDP datagram got a valid checksum"
         );
+    }
+
+    #[test]
+    fn repeated_errors_are_reported_once_a_second() {
+        let mut limiter = LogLimiter::default();
+        let start = std::time::Instant::now();
+        assert_eq!(limiter.should_log(start), Some(0));
+        let logged = (1..=1000)
+            .filter(|n| {
+                limiter
+                    .should_log(start + std::time::Duration::from_micros(*n))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(logged, 0);
+        assert_eq!(
+            limiter.should_log(start + std::time::Duration::from_secs(1)),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn a_panicking_thread_still_reports_that_it_exited() {
+        let (s, r) = crossbeam_channel::bounded(1);
+        let notice = ExitNotice(s, "worker");
+        let _ = std::thread::spawn(move || {
+            let _notice = notice;
+            panic!("worker failed");
+        })
+        .join();
+        assert_eq!(r.try_recv(), Ok("worker"));
     }
 
     #[test]

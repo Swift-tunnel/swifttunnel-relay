@@ -383,3 +383,23 @@ Line numbers refer to the code before the fix landed.
 - Fix: added `ufw allow 8081/tcp`; also documented ack codes 8
   (`owner_mismatch`) and 9 (`reauth_required`), and added them (and 7) to the
   speedtest client's labels.
+
+### 24. A dead TUN thread left TCP silently broken; failed writes flooded the log (fixed)
+
+- `src/tcp_tun.rs:233` (`TunHandler::run`), `:394` (writer error log),
+  `src/main.rs:1831` and `:1891` (TUN handler and response threads).
+- `run` joined the writer before the reader. The writer blocks on its channel
+  forever, so a reader that died (its only exit is the response channel
+  closing, or a panic) was never noticed. Neither the TUN threads nor the TUN
+  response thread were supervised, unlike the v2 RX, TX and shard threads,
+  so when any of them stopped the relay kept serving UDP while every TCP
+  connection (Route Assist, HTTPS) silently went nowhere until someone
+  restarted it by hand.
+- A failing TUN write (interface down, `ENOBUFS`) logged a warning for every
+  packet: thousands of lines a second for as long as the fault lasted.
+- Fix: `run` returns when either thread ends, panics included (`ExitNotice`
+  on drop), and the relay then exits with status 70 so systemd restarts it,
+  as it does for the v2 threads. The response thread does the same. Write
+  errors are reported at most once a second with a count (`LogLimiter`).
+- Tests: `a_panicking_thread_still_reports_that_it_exited`,
+  `repeated_errors_are_reported_once_a_second`.

@@ -1814,103 +1814,113 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
 
     let tun_session_cleanup: Option<tcp_tun::TunSessionCleanup>;
-    let tun_tx_sender: Option<crossbeam_channel::Sender<tcp_tun::InboundTunPacket>> =
-        if tcp_enabled || tun_udp_enabled {
-            log::info!(
-                "TUN forwarding enabled (RELAY_TCP_ENABLED={}, RELAY_TUN_UDP={})",
-                tcp_enabled,
-                tun_udp_enabled
-            );
-            // Bounded to prevent OOM if the response thread falls behind.
-            let (tcp_response_tx, tcp_response_rx) =
-                crossbeam_channel::bounded::<tcp_tun::TxPacket>(4096);
-            match tcp_tun::TunHandler::new(tcp_response_tx) {
-                Ok((handler, sender, tun_cleanup)) => {
-                    // Spawn the TUN handler on its own thread.
-                    std::thread::Builder::new()
-                        .name("relay-tun".into())
-                        .spawn(move || handler.run())
-                        .expect("Failed to spawn relay TUN handler");
+    let tun_tx_sender: Option<crossbeam_channel::Sender<tcp_tun::InboundTunPacket>> = if tcp_enabled
+        || tun_udp_enabled
+    {
+        log::info!(
+            "TUN forwarding enabled (RELAY_TCP_ENABLED={}, RELAY_TUN_UDP={})",
+            tcp_enabled,
+            tun_udp_enabled
+        );
+        // Bounded to prevent OOM if the response thread falls behind.
+        let (tcp_response_tx, tcp_response_rx) =
+            crossbeam_channel::bounded::<tcp_tun::TxPacket>(4096);
+        match tcp_tun::TunHandler::new(tcp_response_tx) {
+            Ok((handler, sender, tun_cleanup)) => {
+                // Spawn the TUN handler on its own thread.
+                std::thread::Builder::new()
+                    .name("relay-tun".into())
+                    .spawn(move || {
+                        handler.run();
+                        // Without its TUN threads the relay would keep
+                        // serving UDP with every TCP connection silently
+                        // dead. Exit so systemd restarts it whole.
+                        log::error!("TUN forwarding stopped; exiting so the relay restarts");
+                        std::process::exit(70);
+                    })
+                    .expect("Failed to spawn relay TUN handler");
 
-                    // Clone the main socket so TUN responses go out on port 51821.
-                    let resp_socket = main_std_socket
-                        .try_clone()
-                        .expect("Failed to clone main socket for TUN responses");
+                // Clone the main socket so TUN responses go out on port 51821.
+                let resp_socket = main_std_socket
+                    .try_clone()
+                    .expect("Failed to clone main socket for TUN responses");
 
-                    // Spawn a thread that drains TUN response packets and sends
-                    // them back to clients via the main relay socket.
-                    let stats_tun_resp = Arc::clone(&stats);
-                    let sessions_tun_resp = Arc::clone(&sessions);
-                    let auth_required_tun_resp = auth_config.mode.requires_auth();
-                    let session_traffic_tun_resp = Arc::clone(&session_traffic);
-                    std::thread::Builder::new()
-                        .name("relay-tun-resp".into())
-                        .spawn(move || {
-                            while let Ok(tx_pkt) = tcp_response_rx.recv() {
-                                let Some(client_addr) = forwarding_addr(
-                                    &sessions_tun_resp,
-                                    tx_pkt.session_id,
-                                    auth_required_tun_resp,
-                                    unix_timestamp_secs(),
-                                ) else {
-                                    continue;
-                                };
-                                if !account_budget::allow(
-                                    &sessions_tun_resp,
-                                    tx_pkt.session_id,
-                                    true,
-                                    &tx_pkt.ip_packet,
-                                ) {
-                                    stats_tun_resp.drop_out(DropReason::RateLimit);
-                                    continue;
-                                }
-                                // Build relay frame: [session_id][ip_packet]
-                                let mut frame =
-                                    Vec::with_capacity(SESSION_ID_LEN + tx_pkt.ip_packet.len());
-                                frame.extend_from_slice(&tx_pkt.session_id);
-                                frame.extend_from_slice(&tx_pkt.ip_packet);
-                                if let Err(e) = resp_socket.send_to(&frame, client_addr) {
-                                    log::trace!(
-                                        "TCP response send error to {}: {}",
-                                        tx_pkt.client_addr,
-                                        e
-                                    );
-                                } else {
-                                    let len = frame.len() as u64;
-                                    stats_tun_resp.packets_out.fetch_add(1, Ordering::Relaxed);
-                                    stats_tun_resp.bytes_out.fetch_add(len, Ordering::Relaxed);
-                                    if let Some(entry) =
-                                        session_traffic_tun_resp.get(&tx_pkt.session_id)
-                                    {
-                                        entry.value().bytes_out.fetch_add(len, Ordering::Relaxed);
-                                        entry.value().packets_out.fetch_add(1, Ordering::Relaxed);
-                                    }
+                // Spawn a thread that drains TUN response packets and sends
+                // them back to clients via the main relay socket.
+                let stats_tun_resp = Arc::clone(&stats);
+                let sessions_tun_resp = Arc::clone(&sessions);
+                let auth_required_tun_resp = auth_config.mode.requires_auth();
+                let session_traffic_tun_resp = Arc::clone(&session_traffic);
+                std::thread::Builder::new()
+                    .name("relay-tun-resp".into())
+                    .spawn(move || {
+                        while let Ok(tx_pkt) = tcp_response_rx.recv() {
+                            let Some(client_addr) = forwarding_addr(
+                                &sessions_tun_resp,
+                                tx_pkt.session_id,
+                                auth_required_tun_resp,
+                                unix_timestamp_secs(),
+                            ) else {
+                                continue;
+                            };
+                            if !account_budget::allow(
+                                &sessions_tun_resp,
+                                tx_pkt.session_id,
+                                true,
+                                &tx_pkt.ip_packet,
+                            ) {
+                                stats_tun_resp.drop_out(DropReason::RateLimit);
+                                continue;
+                            }
+                            // Build relay frame: [session_id][ip_packet]
+                            let mut frame =
+                                Vec::with_capacity(SESSION_ID_LEN + tx_pkt.ip_packet.len());
+                            frame.extend_from_slice(&tx_pkt.session_id);
+                            frame.extend_from_slice(&tx_pkt.ip_packet);
+                            if let Err(e) = resp_socket.send_to(&frame, client_addr) {
+                                log::trace!(
+                                    "TCP response send error to {}: {}",
+                                    tx_pkt.client_addr,
+                                    e
+                                );
+                            } else {
+                                let len = frame.len() as u64;
+                                stats_tun_resp.packets_out.fetch_add(1, Ordering::Relaxed);
+                                stats_tun_resp.bytes_out.fetch_add(len, Ordering::Relaxed);
+                                if let Some(entry) =
+                                    session_traffic_tun_resp.get(&tx_pkt.session_id)
+                                {
+                                    entry.value().bytes_out.fetch_add(len, Ordering::Relaxed);
+                                    entry.value().packets_out.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                        })
-                        .expect("Failed to spawn TUN response thread");
+                        }
+                        log::error!("TUN response thread stopped; exiting so the relay restarts");
+                        std::process::exit(70);
+                    })
+                    .expect("Failed to spawn TUN response thread");
 
-                    tun_session_cleanup = Some(tun_cleanup);
-                    Some(sender)
-                }
-                Err(e) => {
-                    log::error!(
-                        "Failed to create relay TUN handler: {}. TUN forwarding disabled.",
-                        e
-                    );
-                    tcp_enabled = false;
-                    tun_udp_enabled = false;
-                    tun_session_cleanup = None;
-                    None
-                }
+                tun_session_cleanup = Some(tun_cleanup);
+                Some(sender)
             }
-        } else {
-            log::info!(
-                "TUN forwarding disabled (set RELAY_TCP_ENABLED=true and/or RELAY_TUN_UDP=true)"
-            );
-            tun_session_cleanup = None;
-            None
-        };
+            Err(e) => {
+                log::error!(
+                    "Failed to create relay TUN handler: {}. TUN forwarding disabled.",
+                    e
+                );
+                tcp_enabled = false;
+                tun_udp_enabled = false;
+                tun_session_cleanup = None;
+                None
+            }
+        }
+    } else {
+        log::info!(
+            "TUN forwarding disabled (set RELAY_TCP_ENABLED=true and/or RELAY_TUN_UDP=true)"
+        );
+        tun_session_cleanup = None;
+        None
+    };
 
     let runtime_config = build_runtime_config(
         datapath,
