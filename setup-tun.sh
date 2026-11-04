@@ -10,6 +10,9 @@ set -euo pipefail
 
 TUN_SUBNET="10.200.0.0/16"
 TUN_DEVICE="swifttun0"
+TCP_MSS=1340
+# Where persistent config is written. Only tests point this elsewhere.
+ETC="${SWIFTTUNNEL_ETC_DIR:-/etc}"
 
 echo "=== SwiftTunnel TUN Setup ==="
 
@@ -22,9 +25,9 @@ else
 fi
 
 # Persist across reboots
-if ! grep -q "^tun$" /etc/modules-load.d/*.conf 2>/dev/null; then
-    echo "tun" > /etc/modules-load.d/swifttunnel-tun.conf
-    echo "[+] Added tun to /etc/modules-load.d/swifttunnel-tun.conf"
+if ! grep -q "^tun$" "$ETC"/modules-load.d/*.conf 2>/dev/null; then
+    echo "tun" > "$ETC/modules-load.d/swifttunnel-tun.conf"
+    echo "[+] Added tun to $ETC/modules-load.d/swifttunnel-tun.conf"
 fi
 
 # 2. Enable IP forwarding
@@ -37,9 +40,9 @@ else
 fi
 
 # Persist
-if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.d/*.conf 2>/dev/null; then
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-swifttunnel.conf
-    echo "[+] Persisted IP forwarding to /etc/sysctl.d/99-swifttunnel.conf"
+if ! grep -q "net.ipv4.ip_forward=1" "$ETC"/sysctl.d/*.conf 2>/dev/null; then
+    echo "net.ipv4.ip_forward=1" > "$ETC/sysctl.d/99-swifttunnel.conf"
+    echo "[+] Persisted IP forwarding to $ETC/sysctl.d/99-swifttunnel.conf"
 fi
 
 # 3. Raise UDP socket buffer ceilings for relay burst handling
@@ -47,7 +50,7 @@ fi
 # The relay requests multi-megabyte SO_RCVBUF/SO_SNDBUF values. Some fresh
 # Ubuntu images default net.core.rmem_max/wmem_max to 212992, silently capping
 # the relay to ~416 KiB effective buffers and causing burst loss under load.
-cat > /etc/sysctl.d/98-swifttunnel-relay-buffers.conf <<'EOF'
+cat > "$ETC/sysctl.d/98-swifttunnel-relay-buffers.conf" <<'EOF'
 net.core.rmem_max=16777216
 net.core.wmem_max=16777216
 net.core.rmem_default=8388608
@@ -76,7 +79,12 @@ fi
 # This remains TCP-specific; UDP uses the same NAT/FORWARD path but has no MSS.
 # swifttun0 runs at MTU 1400. Use a worst-case IPv4+TCP header budget (60)
 # so large TCP/API asset responses do not rely on PMTU discovery or fragments.
-TCP_MSS=1340
+#
+# Both directions. The client's SYN is clamped on its way out, which limits
+# what servers send back. The server's SYN-ACK has to be clamped on its way in
+# as well, or the client sizes its own segments for a 1500-byte path, and a
+# full segment plus the relay's 36 bytes of framing no longer fits in one
+# datagram from the client: uploads go out fragmented or not at all.
 
 # Remove the old overly-large rule if it exists; otherwise it can match before
 # the safe clamp and still advertise segments too large for swifttun0.
@@ -87,6 +95,12 @@ if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNE
     iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$TUN_SUBNET" -j TCPMSS --set-mss "$TCP_MSS"
 else
     echo "[=] TCP MSS clamping rule already exists"
+fi
+if ! iptables -t mangle -C FORWARD -o "$TUN_DEVICE" -p tcp --tcp-flags SYN,RST SYN -d "$TUN_SUBNET" -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; then
+    echo "[+] Adding TCP MSS clamping rule for SYN-ACKs toward $TUN_DEVICE ($TCP_MSS)..."
+    iptables -t mangle -A FORWARD -o "$TUN_DEVICE" -p tcp --tcp-flags SYN,RST SYN -d "$TUN_SUBNET" -j TCPMSS --set-mss "$TCP_MSS"
+else
+    echo "[=] Return-direction TCP MSS clamping rule already exists"
 fi
 
 # 7. FORWARD rules — needed when default FORWARD policy is DROP (e.g. UFW)
@@ -121,6 +135,22 @@ if ! iptables -C FORWARD -i "$PRIMARY_IF" -o "$TUN_DEVICE" -m state --state RELA
 else
     echo "[=] FORWARD return traffic rule already exists"
 fi
+
+# 7b. Nothing from the TUN is for this host
+#
+# Tunnelled packets are meant to be forwarded. One addressed to any address
+# this host owns (its public IP, 10.200.0.1, a private interface) is delivered
+# locally instead and goes through INPUT, not FORWARD, so the forbidden
+# destination list above never sees it. Without this, a client could reach
+# every service on the relay from a 10.200.x.x source, including anything
+# bound to a private interface or allowed by source range, such as SSH or
+# monitoring agents that trust 10.0.0.0/8. The relay itself needs nothing
+# from the TUN delivered locally.
+while iptables -D INPUT -i "$TUN_DEVICE" -m comment --comment swifttunnel-tun-input -j DROP 2>/dev/null; do
+    :
+done
+echo "[+] Dropping traffic from $TUN_DEVICE addressed to this host..."
+iptables -I INPUT 1 -i "$TUN_DEVICE" -m comment --comment swifttunnel-tun-input -j DROP
 
 # 8. Per-destination TCP limits on traffic leaving the TUN
 #
@@ -188,8 +218,8 @@ if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
     echo "[+] Saved iptables rules via netfilter-persistent"
 elif command -v iptables-save &>/dev/null; then
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-    iptables-save > /etc/iptables.rules 2>/dev/null || \
+    iptables-save > "$ETC/iptables/rules.v4" 2>/dev/null || \
+    iptables-save > "$ETC/iptables.rules" 2>/dev/null || \
     echo "[!] Could not auto-persist iptables rules. Save manually."
 fi
 

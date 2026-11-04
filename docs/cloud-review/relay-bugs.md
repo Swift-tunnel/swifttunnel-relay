@@ -117,3 +117,32 @@ Line numbers refer to the code before the fix landed.
 - Fix: the interface address is skipped like the other reserved pairs and the
   next byte pair is used.
 - Test: `test_assign_session_ip_never_hands_out_the_tun_interface_address`.
+
+### 7. setup-tun.sh let tunnel clients reach services on the relay host (fixed)
+
+- `setup-tun.sh:113` (forbidden destination rules live in FORWARD only).
+- A tunnelled packet addressed to any address the host owns (its public IP,
+  `10.200.0.1`, a private interface) is delivered locally, so it goes through
+  INPUT and the FORWARD drop list never sees it. `is_forbidden_dst` does not
+  know the host's own public address either. Any client could therefore talk
+  to every service on the relay from a `10.200.x.x` source: SSH, monitoring
+  agents, anything bound to a private interface or allowed by a `10.0.0.0/8`
+  source rule. The relay needs nothing from the TUN delivered locally.
+- Fix: `INPUT -i swifttun0 -j DROP` (tagged `swifttunnel-tun-input`, removed
+  and re-added on every run so it stays first and is never duplicated).
+
+### 8. TCP MSS was clamped in one direction only (fixed)
+
+- `setup-tun.sh:85`.
+- Only the client's SYN was clamped, which limits what servers send. The
+  server's SYN-ACK reached the client unclamped, so a client sends segments
+  sized for a 1500-byte path; a full one plus the relay's 36 bytes of framing
+  does not fit in one datagram from the client, and uploads (POST bodies,
+  asset uploads over Route Assist) go out fragmented or are lost where
+  fragments are dropped.
+- Fix: also clamp SYN-ACKs leaving toward `swifttun0` to the same 1340.
+- Test for 7 and 8: `tests/setup_tun.sh` runs the script against a fake
+  `iptables` that keeps its rules in a file and a temporary `/etc`
+  (`SWIFTTUNNEL_ETC_DIR`, defaults to `/etc`). It checks both rules, that a
+  rerun changes nothing, and that limit modes replace each other. It fails
+  against the previous script.
