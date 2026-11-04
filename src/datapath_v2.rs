@@ -546,6 +546,105 @@ fn allocate_flow_token(
     }
 }
 
+/// Read up to `MAX_FLOW_RECV_BURST` responses from one flow socket and queue
+/// them for the TX thread.
+///
+/// Returns `true` when the burst budget ran out before the socket reported
+/// `WouldBlock`, meaning datagrams may still be queued. The caller must come
+/// back to this flow without waiting for a new readiness event, because mio is
+/// edge-triggered and will not report the leftover datagrams again.
+#[allow(clippy::too_many_arguments)]
+fn drain_flow_responses(
+    shard_id: usize,
+    flow_key: FlowKey,
+    flow: &mut FlowState,
+    recv_buf: &mut [u8; super::MAX_PACKET_SIZE],
+    pool: &BufferPool,
+    sessions: &DashMap<[u8; super::SESSION_ID_LEN], super::SessionEntry>,
+    stats: &super::Stats,
+    tx_data: &crossbeam_channel::Sender<TxPacket>,
+) -> bool {
+    for _ in 0..MAX_FLOW_RECV_BURST {
+        let (len, response_tos) = match recv_flow_response(&flow.socket, recv_buf) {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(e) => {
+                log::debug!(
+                    "V2 shard {} flow {} recv error: {} (kind={:?})",
+                    shard_id,
+                    flow_key.game_addr,
+                    e,
+                    e.kind()
+                );
+                return false;
+            }
+        };
+        let received_at = Instant::now();
+
+        // Paid coverage decides whether this is carried, and it is decided
+        // before the activity refresh below, not after. See
+        // `session_lease_is_current`: refreshing first is what let inbound
+        // traffic from the far end hold a dead session open, so the idle
+        // cleanup never reached it and an expired lease kept returning data.
+        //
+        // One write guard does both the check and the refresh, instead of a
+        // read guard followed by a second lookup for the write.
+        {
+            let now_unix = super::unix_timestamp_secs();
+            let Some(mut session) = sessions.get_mut(&flow_key.session_id) else {
+                return false;
+            };
+            if !super::session_lease_is_current(&session, now_unix) {
+                return false;
+            }
+            session.last_activity = received_at;
+            session.last_activity_unix = now_unix;
+        }
+
+        flow.last_activity = received_at;
+        flow.marked_for_removal = None;
+
+        let Some(buf_idx) = pool.try_acquire() else {
+            stats.drop_out(super::DropReason::Pool);
+            stats.pool_exhausted.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+
+        // Safety: `buf_idx` was just checked out of the pool, so nothing else
+        // holds a reference to this buffer.
+        let ip_len = unsafe {
+            let out = pool.buffer_mut(buf_idx);
+            out[..super::SESSION_ID_LEN].copy_from_slice(&flow_key.session_id);
+            write_response_ip_packet_into_with_tos(
+                &mut out[super::SESSION_ID_LEN..],
+                &recv_buf[..len],
+                flow.original_info,
+                response_tos.unwrap_or(flow.original_info.tos),
+            )
+        };
+        let Some(ip_len) = ip_len else {
+            // Larger than one relay frame can carry; skip it and keep reading.
+            pool.release(buf_idx);
+            continue;
+        };
+
+        let packet = TxPacket {
+            addr: flow.client_addr,
+            session_id: flow_key.session_id,
+            buf_idx,
+            len: super::SESSION_ID_LEN + ip_len,
+            enqueued_at: received_at,
+            kind: QueuedPacketKind::Data,
+        };
+
+        if tx_data.try_send(packet).is_err() {
+            stats.drop_out(super::DropReason::TxQueue);
+            pool.release(buf_idx);
+        }
+    }
+    true
+}
+
 /// Run a shard event loop: manages per-flow sockets and forwards responses back to clients.
 fn run_shard(
     shard_id: usize,
@@ -580,105 +679,47 @@ fn run_shard(
 
     log::info!("V2 shard {} started", shard_id);
 
+    // mio registers sockets edge-triggered, so a flow that still has queued
+    // datagrams after its burst budget gets no new event until another
+    // datagram arrives. Those flows are remembered here and drained again on
+    // the next pass, which polls without blocking while any are waiting.
+    let mut pending_flows: Vec<Token> = Vec::new();
+    let mut retry_flows: Vec<Token> = Vec::new();
+
     loop {
         let now = Instant::now();
-        let timeout = cleanup_at.saturating_duration_since(now);
+        let timeout = if pending_flows.is_empty() && inbox.is_empty() {
+            cleanup_at.saturating_duration_since(now)
+        } else {
+            Duration::ZERO
+        };
         poll.poll(&mut events, Some(timeout))
             .context("mio poll failed")?;
 
-        for event in events.iter() {
-            let token = event.token();
-            if token == TOKEN_WAKE {
-                // Drain inbox below.
-                continue;
-            }
-
+        std::mem::swap(&mut retry_flows, &mut pending_flows);
+        let ready = events
+            .iter()
+            .map(|event| event.token())
+            .filter(|token| *token != TOKEN_WAKE);
+        for token in ready.chain(retry_flows.drain(..)) {
             let Some(flow_key) = token_to_flow.get(&token).copied() else {
                 continue;
             };
             let Some(flow) = flows.get_mut(&flow_key) else {
                 continue;
             };
-
-            // Drain a bounded burst so one hot game flow cannot monopolize the shard.
-            for _ in 0..MAX_FLOW_RECV_BURST {
-                match recv_flow_response(&flow.socket, &mut recv_buf) {
-                    Ok((len, response_tos)) => {
-                        let received_at = Instant::now();
-
-                        // Paid coverage decides whether this is carried, and it
-                        // is decided before the activity refresh below, not
-                        // after. See `session_lease_is_current`: refreshing
-                        // first is what let inbound traffic from the far end
-                        // hold a dead session open, so the idle cleanup never
-                        // reached it and an expired lease kept returning data.
-                        let now_unix = super::unix_timestamp_secs();
-                        let lease_current =
-                            sessions.get(&flow_key.session_id).is_some_and(|session| {
-                                super::session_lease_is_current(&session, now_unix)
-                            });
-                        if !lease_current {
-                            break;
-                        }
-
-                        flow.last_activity = received_at;
-                        flow.marked_for_removal = None;
-
-                        if let Some(mut session_entry) = sessions.get_mut(&flow_key.session_id) {
-                            session_entry.last_activity = received_at;
-                            session_entry.last_activity_unix = super::unix_timestamp_secs();
-                        }
-
-                        let Some(buf_idx) = pool.try_acquire() else {
-                            stats.drop_out(super::DropReason::Pool);
-                            stats.pool_exhausted.fetch_add(1, Ordering::Relaxed);
-                            break;
-                        };
-
-                        let total_len = unsafe {
-                            let out = pool.buffer_mut(buf_idx);
-                            out[..super::SESSION_ID_LEN].copy_from_slice(&flow_key.session_id);
-                            let ip_len = match write_response_ip_packet_into_with_tos(
-                                &mut out[super::SESSION_ID_LEN..],
-                                &recv_buf[..len],
-                                flow.original_info,
-                                response_tos.unwrap_or(flow.original_info.tos),
-                            ) {
-                                Some(value) => value,
-                                None => {
-                                    pool.release(buf_idx);
-                                    break;
-                                }
-                            };
-                            super::SESSION_ID_LEN + ip_len
-                        };
-
-                        let packet = TxPacket {
-                            addr: flow.client_addr,
-                            session_id: flow_key.session_id,
-                            buf_idx,
-                            len: total_len,
-                            enqueued_at: received_at,
-                            kind: QueuedPacketKind::Data,
-                        };
-
-                        if tx_data.try_send(packet).is_err() {
-                            stats.drop_out(super::DropReason::TxQueue);
-                            pool.release(buf_idx);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        log::debug!(
-                            "V2 shard {} flow {} recv error: {} (kind={:?})",
-                            shard_id,
-                            flow_key.game_addr,
-                            e,
-                            e.kind()
-                        );
-                        break;
-                    }
-                }
+            let more_queued = drain_flow_responses(
+                shard_id,
+                flow_key,
+                flow,
+                &mut recv_buf,
+                &pool,
+                &sessions,
+                &stats,
+                &tx_data,
+            );
+            if more_queued && !pending_flows.contains(&token) {
+                pending_flows.push(token);
             }
         }
 
@@ -2480,5 +2521,92 @@ mod tests {
             assert_eq!(buf[3], 0xEF);
         }
         pool.release(idx);
+    }
+
+    /// A flow that receives more than one burst's worth of responses at once
+    /// must still deliver all of them, without needing another datagram to
+    /// arrive. mio is edge-triggered, so leftover datagrams after the burst
+    /// budget used to sit in the socket until the game server sent again.
+    #[test]
+    fn shard_drains_a_flow_past_its_burst_budget_without_new_traffic() {
+        const RESPONSES: usize = MAX_FLOW_RECV_BURST * 2 + 7;
+
+        let game = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        game.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let game_addr = game.local_addr().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let session_id = [7u8; super::super::SESSION_ID_LEN];
+
+        let sessions = Arc::new(DashMap::new());
+        sessions.insert(
+            session_id,
+            super::super::SessionEntry {
+                user_id: "test".into(),
+                auth_state: super::super::SessionAuthState::Legacy,
+                lease_expires_at_unix: None,
+                client_addr,
+                created_at_unix: 0,
+                last_activity: Instant::now(),
+                last_activity_unix: 0,
+            },
+        );
+        let pool = Arc::new(BufferPool::new(1024));
+        let stats = Arc::new(super::super::Stats::new());
+        let (inbox_s, inbox_r) = crossbeam_channel::bounded(64);
+        let (tx_data_s, tx_data_r) = crossbeam_channel::bounded::<TxPacket>(1024);
+        let (tx_control_s, _tx_control_r) = crossbeam_channel::bounded::<TxPacket>(16);
+        let (waker_s, waker_r) = crossbeam_channel::bounded(1);
+        {
+            let (pool, sessions, stats) = (Arc::clone(&pool), Arc::clone(&sessions), stats);
+            std::thread::spawn(move || {
+                let _ = run_shard(
+                    0,
+                    inbox_r,
+                    tx_data_s,
+                    tx_control_s,
+                    pool,
+                    sessions,
+                    stats,
+                    Arc::new(vec![AtomicU64::new(0)]),
+                    Arc::new(super::super::SourceRateLimiter::new()),
+                    waker_s,
+                );
+            });
+        }
+        let (_, waker) = waker_r.recv().unwrap();
+
+        // First client packet creates the flow socket.
+        let payload_idx = pool.try_acquire().unwrap();
+        unsafe { pool.buffer_mut(payload_idx)[..2].copy_from_slice(b"hi") };
+        inbox_s
+            .send(ShardMsg::ClientPacket {
+                session_id,
+                client_addr,
+                game_addr,
+                original_info: test_original_info(),
+                payload_idx,
+                payload_len: 2,
+                enqueued_at: Instant::now(),
+            })
+            .unwrap();
+        waker.wake().unwrap();
+        let mut buf = [0u8; 64];
+        let (_, flow_addr) = game.recv_from(&mut buf).unwrap();
+
+        // Stall the shard on the session lock while the whole burst lands in
+        // the flow socket, so it is all queued before the first read.
+        {
+            let _stall = sessions.get_mut(&session_id).unwrap();
+            for n in 0..RESPONSES {
+                game.send_to(&(n as u32).to_be_bytes(), flow_addr).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut delivered = 0;
+        while tx_data_r.recv_timeout(Duration::from_millis(500)).is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, RESPONSES);
     }
 }
