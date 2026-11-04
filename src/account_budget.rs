@@ -18,6 +18,15 @@ use std::{
 
 const FLOW_IDLE_SECONDS: u64 = 120;
 const ACCOUNT_IDLE_SECONDS: u64 = 600;
+/// Flow tuples one account may hold in the shared tracking table. The table is
+/// relay-wide, and once it is full every account's new flows go untracked,
+/// which enforce mode drops. Without a share per account, one account opening
+/// flows quickly (a TCP SYN sweep through the TUN with fresh source ports is
+/// enough) filled it within a minute or two and then blocked every other
+/// player's new connections until its own entries aged out. A real client
+/// has a few game flows and at most some hundreds of TCP connections within
+/// the 120 s window.
+const ACCOUNT_FLOW_LIMIT: usize = 8192;
 static BUDGETS: LazyLock<Budgets> = LazyLock::new(|| Budgets::new(Policy::from_env()));
 
 #[derive(Clone, Copy, Default)]
@@ -128,6 +137,7 @@ struct Budgets {
     capacity_drops: AtomicU64,
     account_limit: usize,
     flow_limit: usize,
+    account_flow_limit: usize,
 }
 impl Budgets {
     fn new(policy: Policy) -> Self {
@@ -140,6 +150,7 @@ impl Budgets {
             capacity_drops: AtomicU64::new(0),
             account_limit: super::MAX_SESSIONS_TOTAL,
             flow_limit: super::MAX_FLOWS_TOTAL,
+            account_flow_limit: ACCOUNT_FLOW_LIMIT,
         }
     }
     fn account(&self, user: &str, now: u64) -> Option<Arc<Account>> {
@@ -225,12 +236,13 @@ impl Budgets {
         }
         if let Some(key) = flow {
             if new_flow {
-                if self
-                    .slots
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < self.flow_limit).then_some(n + 1)
-                    })
-                    .is_err()
+                if state.flows.len() >= self.account_flow_limit
+                    || self
+                        .slots
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            (n < self.flow_limit).then_some(n + 1)
+                        })
+                        .is_err()
                 {
                     state.untracked += 1;
                     if self.policy.enforce {
@@ -436,6 +448,26 @@ mod tests {
             assert_eq!(budget.slots.load(Ordering::Relaxed), 0);
             assert!(budget.event("two", false, 40, Some(flow(2)), 602));
         }
+    }
+
+    #[test]
+    fn one_account_cannot_take_every_flow_slot_from_the_others() {
+        let mut budget = Budgets::new(Policy {
+            enforce: true,
+            ..Policy::default()
+        });
+        budget.flow_limit = 8;
+        budget.account_flow_limit = 4;
+        // The flooding account gets its share and no more...
+        let admitted = (1..=100)
+            .filter(|sid| budget.event("flood", false, 40, Some(flow(*sid)), 1))
+            .count();
+        assert_eq!(admitted, 4);
+        // ...and its flows already tracked keep working.
+        assert!(budget.event("flood", false, 40, Some(flow(1)), 1));
+        // Everybody else can still open flows.
+        assert!(budget.event("player", false, 40, Some(flow(1000)), 1));
+        assert_eq!(budget.slots.load(Ordering::Relaxed), 5);
     }
 
     #[test]

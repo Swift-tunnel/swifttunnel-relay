@@ -161,3 +161,18 @@ Line numbers refer to the code before the fix landed.
   The permit travels with the lookup task and frees its slot when it ends.
   Refused requests count as `rate_limit`; the frame format is unchanged.
 - Test: `resolve_requests_are_bounded_per_session_globally_and_in_flight`.
+
+### 10. One account could exhaust budget flow tracking for every account (fixed)
+
+- `src/account_budget.rs:221` (new-flow slot reservation).
+- Flow tuples are tracked in one relay-wide table capped at `MAX_FLOWS_TOTAL`.
+  When it is full, every new flow is "untracked", and enforce mode drops
+  untracked flows. Nothing limited one account's share, and every new
+  5-tuple counts, so one account sweeping fresh source ports (a TCP SYN
+  sweep through the TUN, at a few thousand packets a second) filled the
+  table within a minute or two and then blocked new connections for every
+  other player on the relay until its own entries aged out 120 s later.
+- Fix: an account may hold at most 8192 tracked tuples; beyond that its own
+  new flows go untracked (dropped in enforce mode, counted in observe mode)
+  without touching the shared table.
+- Test: `one_account_cannot_take_every_flow_slot_from_the_others`.
