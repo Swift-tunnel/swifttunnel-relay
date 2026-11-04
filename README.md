@@ -155,6 +155,12 @@ python3 relay-speedtest.py client \
 
 For auth-required relays, also pass `--ticket` or `--ticket-file`.
 
+The server only sends a download to an address that has first completed the
+HELLO exchange from that same address: the HELLO reply carries a cookie the
+download request must echo. Downloads are capped at `--max-download-packets`
+(default 20000) of at most 1400 bytes. Update the client and the server
+together; an older client gets no download from a newer server.
+
 This script sends real `[session_id][IPv4 packet]` frames through the relay and
 reports upload/download payload throughput plus packet loss for the actual relay
 datapath. For larger WAN runs, add small pacing gaps plus a wider timeout so

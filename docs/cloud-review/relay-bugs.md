@@ -206,3 +206,30 @@ Line numbers refer to the code before the fix landed.
 - Fix: at most 32 health clients at once (extra connections are closed at
   accept), and a 2 s timeout instead of 5 s.
 - Test: `tests/health.rs` (Linux), fails before the fix.
+
+### 13. The speedtest server was an open reflection amplifier (fixed)
+
+- `relay-speedtest.py:672` (`MSG_DOWNLOAD_REQUEST` in `run_server`), run on
+  public UDP 9000 by `relay-speedtest.service` and opened in the README's ufw
+  steps.
+- A download request is one small datagram naming a packet count (up to
+  2^32) and payload size (up to 65535), and the server sent that much to the
+  datagram's source address, which nothing checked. Anyone could spoof a
+  victim's address: measured against the old server, one 24-byte request for
+  2000 packets put 2.8 MB on the wire toward the claimed sender, and the
+  request format allows billions of packets. That is abuse traffic from our
+  relay IPs, the kind of reputation that already costs real gameplay. The
+  single-threaded server was also stuck for as long as the send took.
+  Upload state was a dict keyed by source with no bound, so spoofed
+  `UPLOAD_PREP`s grew it without end.
+- Fix: the HELLO reply now carries a 16-byte cookie (HMAC of the source
+  address and a one-minute window, per-process secret) and a download request
+  must echo it from the same address. HELLO requests are padded to the size
+  of the reply, so the reply amplifies nothing; an unpadded legacy HELLO is
+  still echoed but earns no cookie. Downloads are clamped to
+  `--max-download-packets` (default 20000) and 1400-byte payloads, gaps to
+  1 s, and upload state to 1024 entries. This is an operator tool, not part
+  of the apps, but its client and server must now be updated together
+  (README updated).
+- Test: `tests/relay_speedtest_server.py` (spoofed and cross-address requests
+  get nothing, clamping holds, HELLO reply is no larger than the request).

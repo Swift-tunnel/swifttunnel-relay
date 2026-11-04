@@ -16,6 +16,8 @@ only measures relay control-plane ping/pong frames.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -67,6 +69,22 @@ DEFAULT_UPLOAD_GAP_US = 0
 DEFAULT_DOWNLOAD_GAP_US = 0
 DEFAULT_INNER_SRC_IP = "10.0.0.2"
 SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
+
+# The server is public and answers whoever a datagram claims to come from, so
+# a download, many megabytes sent in reply to one small request, must first
+# prove the requester receives at its address. The HELLO reply carries a
+# cookie bound to the address, and a download request has to echo it. Without
+# this, one spoofed 30-byte request made the server send up to 2^32 packets of
+# up to 64 KiB at any address on the internet.
+COOKIE_LEN = 16
+COOKIE_WINDOW_SECS = 60
+# A HELLO is padded to the size of its reply, so the reply amplifies nothing.
+HELLO_PADDING = COOKIE_LEN
+DEFAULT_MAX_DOWNLOAD_PACKETS = 20000
+# Larger than one relay frame can carry anyway.
+MAX_PAYLOAD_BYTES = 1400
+MAX_GAP_US = 1_000_000
+MAX_UPLOAD_STATES = 1024
 
 
 @dataclass
@@ -184,17 +202,36 @@ def parse_message(payload: bytes) -> Optional[tuple[int, bytes]]:
 
 
 def build_hello_req(nonce: int) -> bytes:
-    return build_message(MSG_HELLO_REQ, struct.pack("!Q", nonce))
+    return build_message(MSG_HELLO_REQ, struct.pack("!Q", nonce) + bytes(HELLO_PADDING))
 
 
-def parse_hello_req(body: bytes) -> Optional[int]:
-    if len(body) != 8:
+def parse_hello_req(body: bytes) -> Optional[tuple[int, bool]]:
+    """The nonce, and whether the request is padded enough to earn a cookie."""
+    if len(body) not in (8, 8 + HELLO_PADDING):
         return None
-    return struct.unpack("!Q", body)[0]
+    return struct.unpack("!Q", body[:8])[0], len(body) == 8 + HELLO_PADDING
 
 
-def build_hello_resp(nonce: int) -> bytes:
-    return build_message(MSG_HELLO_RESP, struct.pack("!Q", nonce))
+def build_hello_resp(nonce: int, cookie: bytes = b"") -> bytes:
+    return build_message(MSG_HELLO_RESP, struct.pack("!Q", nonce) + cookie)
+
+
+def parse_hello_resp(body: bytes) -> Optional[tuple[int, bytes]]:
+    if len(body) not in (8, 8 + COOKIE_LEN):
+        return None
+    return struct.unpack("!Q", body[:8])[0], body[8:]
+
+
+def make_cookie(secret: bytes, addr: tuple[str, int], window: int) -> bytes:
+    message = f"{addr[0]}:{addr[1]}:{window}".encode()
+    return hmac.new(secret, message, hashlib.sha256).digest()[:COOKIE_LEN]
+
+
+def cookie_is_valid(secret: bytes, addr: tuple[str, int], cookie: bytes, now: float) -> bool:
+    window = int(now // COOKIE_WINDOW_SECS)
+    return any(
+        hmac.compare_digest(cookie, make_cookie(secret, addr, w)) for w in (window, window - 1)
+    )
 
 
 def build_upload_prep(test_id: int, packet_count: int, payload_bytes: int) -> bytes:
@@ -247,17 +284,20 @@ def parse_upload_result(body: bytes) -> Optional[tuple[int, int, int, int, int]]
     return struct.unpack("!QIQQQ", body[:36])
 
 
-def build_download_request(test_id: int, packet_count: int, payload_bytes: int, gap_us: int) -> bytes:
+def build_download_request(
+    test_id: int, packet_count: int, payload_bytes: int, gap_us: int, cookie: bytes = b""
+) -> bytes:
     return build_message(
         MSG_DOWNLOAD_REQUEST,
-        struct.pack("!QIHI", test_id, packet_count, payload_bytes, gap_us),
+        struct.pack("!QIHI", test_id, packet_count, payload_bytes, gap_us) + cookie,
     )
 
 
-def parse_download_request(body: bytes) -> Optional[tuple[int, int, int, int]]:
-    if len(body) != 18:
+def parse_download_request(body: bytes) -> Optional[tuple[int, int, int, int, bytes]]:
+    """Old clients send no cookie (18 bytes); the server refuses those."""
+    if len(body) not in (18, 18 + COOKIE_LEN):
         return None
-    return struct.unpack("!QIHI", body)
+    return (*struct.unpack("!QIHI", body[:18]), body[18:])
 
 
 def build_download_data(test_id: int, seq: int, payload_bytes: int) -> bytes:
@@ -398,6 +438,8 @@ class RelaySpeedtestClient:
         )
         self.sock.send(self.session_id + packet)
 
+    cookie = b""
+
     def recv_speedtest_message(
         self,
         *,
@@ -458,8 +500,9 @@ class RelaySpeedtestClient:
             if response is None:
                 continue
             _, body = response
-            returned = parse_hello_req(body)
-            if returned == nonce:
+            returned = parse_hello_resp(body)
+            if returned is not None and returned[0] == nonce:
+                self.cookie = returned[1]
                 return
         raise RuntimeError("speedtest server handshake timed out")
 
@@ -533,7 +576,11 @@ class RelaySpeedtestClient:
 
     def run_download(self, packet_count: int, payload_bytes: int, gap_us: int) -> dict:
         test_id = random.getrandbits(64)
-        self.send_speedtest_payload(build_download_request(test_id, packet_count, payload_bytes, gap_us))
+        if not self.cookie:
+            raise RuntimeError("speedtest server is too old to issue download cookies; update it")
+        self.send_speedtest_payload(
+            build_download_request(test_id, packet_count, payload_bytes, gap_us, self.cookie)
+        )
 
         recv_packets = 0
         recv_bytes = 0
@@ -602,8 +649,11 @@ class RelaySpeedtestClient:
         }
 
 
-def run_server(bind_host: str, port: int) -> int:
+def run_server(
+    bind_host: str, port: int, max_download_packets: int = DEFAULT_MAX_DOWNLOAD_PACKETS
+) -> int:
     states: dict[tuple[tuple[str, int], int], UploadState] = {}
+    secret = os.urandom(32)
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_BYTES)
@@ -620,9 +670,12 @@ def run_server(bind_host: str, port: int) -> int:
             msg_type, body = parsed
 
             if msg_type == MSG_HELLO_REQ:
-                nonce = parse_hello_req(body)
-                if nonce is not None:
-                    sock.sendto(build_hello_resp(nonce), addr)
+                hello = parse_hello_req(body)
+                if hello is not None:
+                    nonce, padded = hello
+                    window = int(time.time() // COOKIE_WINDOW_SECS)
+                    cookie = make_cookie(secret, addr, window) if padded else b""
+                    sock.sendto(build_hello_resp(nonce, cookie), addr)
                 continue
 
             if msg_type == MSG_UPLOAD_PREP:
@@ -630,6 +683,9 @@ def run_server(bind_host: str, port: int) -> int:
                 if parsed_prep is None:
                     continue
                 test_id, packet_count, payload_bytes = parsed_prep
+                # Spoofed sources could otherwise grow this without end.
+                while len(states) >= MAX_UPLOAD_STATES:
+                    states.pop(next(iter(states)))
                 states[(addr, test_id)] = UploadState(packet_count, payload_bytes)
                 sock.sendto(build_upload_ready(test_id), addr)
                 continue
@@ -673,7 +729,12 @@ def run_server(bind_host: str, port: int) -> int:
                 parsed_request = parse_download_request(body)
                 if parsed_request is None:
                     continue
-                test_id, packet_count, payload_bytes, gap_us = parsed_request
+                test_id, packet_count, payload_bytes, gap_us, cookie = parsed_request
+                if not cookie_is_valid(secret, addr, cookie, time.time()):
+                    continue
+                packet_count = min(packet_count, max_download_packets)
+                payload_bytes = max(min(payload_bytes, MAX_PAYLOAD_BYTES), 18)
+                gap_us = min(gap_us, MAX_GAP_US)
 
                 first_send_ns = 0
                 last_send_ns = 0
@@ -728,6 +789,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     server_parser = subparsers.add_parser("server", help="Run the public UDP speedtest server")
     server_parser.add_argument("--bind", default="0.0.0.0")
     server_parser.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
+    server_parser.add_argument(
+        "--max-download-packets", type=int, default=DEFAULT_MAX_DOWNLOAD_PACKETS
+    )
 
     client_parser = subparsers.add_parser("client", help="Run the relay-path speedtest client")
     client_parser.add_argument("--relay-host", required=True)
@@ -807,7 +871,7 @@ def run_client(args: argparse.Namespace) -> int:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.command == "server":
-        return run_server(args.bind, args.port)
+        return run_server(args.bind, args.port, args.max_download_packets)
     return run_client(args)
 
 
