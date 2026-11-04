@@ -303,6 +303,33 @@ fn supervise_critical_thread(
     Ok(())
 }
 
+/// Queue a message for a shard from the RX thread, waking the shard only when
+/// the message landed in an empty inbox.
+///
+/// A wake is an eventfd write, a syscall that cost about 270 ns here before
+/// it even wakes anybody, and the RX thread used to make one for every packet
+/// it handed over: on a busy relay most of its time spent on a packet. It is
+/// only needed when the inbox was empty. A shard never blocks with messages
+/// queued (it polls with a zero timeout while its inbox is non-empty, and
+/// drains until `try_recv` comes back empty), so if anything was already
+/// queued, the shard is due to read ours with it. The first message into an
+/// empty inbox always wakes. This relies on every other producer waking
+/// unconditionally, which the session cleanup does: otherwise two producers
+/// racing into an empty inbox could each see the other's message and skip it.
+fn push_to_shard(
+    sender: &crossbeam_channel::Sender<ShardMsg>,
+    waker: Option<&Arc<Waker>>,
+    msg: ShardMsg,
+) -> Result<(), ShardMsg> {
+    sender.try_send(msg).map_err(|e| e.into_inner())?;
+    if sender.len() <= 1 {
+        if let Some(waker) = waker {
+            let _ = waker.wake();
+        }
+    }
+    Ok(())
+}
+
 /// Select a shard index for a given session ID.
 fn shard_for_session(session_id: [u8; super::SESSION_ID_LEN], shard_count: usize) -> usize {
     // Mix the raw session_id to avoid shard hotspots if session IDs aren't uniformly random.
@@ -1789,16 +1816,12 @@ pub(super) async fn run_datapath_v2(
 
                     let shard_id = shard_for_session(session_id, shard_senders_rx.len());
                     if let Some(sender) = shard_senders_rx.get(shard_id) {
-                        if sender
-                            .try_send(ShardMsg::Keepalive {
-                                session_id,
-                                client_addr,
-                            })
-                            .is_err()
-                        {
+                        let msg = ShardMsg::Keepalive {
+                            session_id,
+                            client_addr,
+                        };
+                        if push_to_shard(sender, shard_wakers_rx.get(shard_id), msg).is_err() {
                             stats_rx.drop_in(super::DropReason::ShardQueue);
-                        } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
-                            let _ = waker.wake();
                         }
                     }
                     continue;
@@ -1939,22 +1962,18 @@ pub(super) async fn run_datapath_v2(
 
                         let shard_id = shard_for_session(session_id, shard_senders_rx.len());
                         if let Some(sender) = shard_senders_rx.get(shard_id) {
-                            if sender
-                                .try_send(ShardMsg::ClientPacket {
-                                    session_id,
-                                    client_addr,
-                                    game_addr,
-                                    original_info,
-                                    payload_idx,
-                                    payload_len: udp_payload.len(),
-                                    enqueued_at: now,
-                                })
-                                .is_err()
-                            {
+                            let msg = ShardMsg::ClientPacket {
+                                session_id,
+                                client_addr,
+                                game_addr,
+                                original_info,
+                                payload_idx,
+                                payload_len: udp_payload.len(),
+                                enqueued_at: now,
+                            };
+                            if push_to_shard(sender, shard_wakers_rx.get(shard_id), msg).is_err() {
                                 stats_rx.drop_in(super::DropReason::ShardQueue);
                                 pool_rx.release(payload_idx);
-                            } else if let Some(waker) = shard_wakers_rx.get(shard_id) {
-                                let _ = waker.wake();
                             }
                         } else {
                             stats_rx.drop_in(super::DropReason::ShardQueue);
@@ -2694,6 +2713,98 @@ mod tests {
             &tx_s,
         );
         assert_eq!(tx_r.try_iter().count(), 2);
+    }
+
+    /// The RX thread only wakes a shard for a message that lands in an empty
+    /// inbox. Packets sent in irregular bursts, with pauses long enough for the
+    /// shard to go back to sleep between them, must all still get through.
+    #[test]
+    fn shard_misses_no_packet_when_wakes_are_skipped_for_a_busy_inbox() {
+        const PACKETS: u32 = 6000;
+        let game = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&game)
+            .set_recv_buffer_size(8 * 1024 * 1024)
+            .unwrap();
+        game.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let game_addr = game.local_addr().unwrap();
+        let counter = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let mut seen = 0u32;
+            while game.recv(&mut buf).is_ok() {
+                seen += 1;
+            }
+            seen
+        });
+
+        let client_addr: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let session_id = [5u8; super::super::SESSION_ID_LEN];
+        let sessions = Arc::new(DashMap::new());
+        sessions.insert(
+            session_id,
+            super::super::SessionEntry {
+                user_id: "test".into(),
+                auth_state: super::super::SessionAuthState::Legacy,
+                lease_expires_at_unix: None,
+                client_addr,
+                created_at_unix: 0,
+                last_activity: Instant::now(),
+                last_activity_unix: 0,
+            },
+        );
+        let pool = Arc::new(BufferPool::new(8192));
+        let (inbox_s, inbox_r) = crossbeam_channel::bounded(8192);
+        let (tx_data_s, _tx_data_r) = crossbeam_channel::bounded::<TxPacket>(16);
+        let (tx_control_s, _tx_control_r) = crossbeam_channel::bounded::<TxPacket>(16);
+        let (waker_s, waker_r) = crossbeam_channel::bounded(1);
+        {
+            let (pool, sessions) = (Arc::clone(&pool), Arc::clone(&sessions));
+            std::thread::spawn(move || {
+                let _ = run_shard(
+                    0,
+                    inbox_r,
+                    tx_data_s,
+                    tx_control_s,
+                    pool,
+                    sessions,
+                    Arc::new(super::super::Stats::new()),
+                    Arc::new(vec![AtomicU64::new(0)]),
+                    Arc::new(super::super::SourceRateLimiter::new()),
+                    waker_s,
+                );
+            });
+        }
+        let (_, waker) = waker_r.recv().unwrap();
+
+        let mut sent = 0u32;
+        let mut burst = 1u32;
+        while sent < PACKETS {
+            for _ in 0..burst.min(PACKETS - sent) {
+                let idx = loop {
+                    if let Some(idx) = pool.try_acquire() {
+                        break idx;
+                    }
+                    std::thread::yield_now();
+                };
+                unsafe { pool.buffer_mut(idx)[..4].copy_from_slice(&sent.to_be_bytes()) };
+                let msg = ShardMsg::ClientPacket {
+                    session_id,
+                    client_addr,
+                    game_addr,
+                    original_info: test_original_info(),
+                    payload_idx: idx,
+                    payload_len: 4,
+                    enqueued_at: Instant::now(),
+                };
+                assert!(push_to_shard(&inbox_s, Some(&waker), msg).is_ok());
+                sent += 1;
+            }
+            // Vary between single packets and bursts, and let the shard idle.
+            burst = burst * 7 % 61 + 1;
+            if burst % 3 == 0 {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+        assert_eq!(counter.join().unwrap(), PACKETS);
     }
 
     #[test]

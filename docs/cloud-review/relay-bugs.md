@@ -293,3 +293,23 @@ Line numbers refer to the code before the fix landed.
   address was missing from the forbidden destinations (issue 14) until the
   first refresh, and the first resolve frames could fail.
 - Fix: `After=network-online.target`.
+
+### 18. The RX thread made a wake syscall for every packet (fixed)
+
+- `src/datapath_v2.rs:1801,1957` (keepalive and data hand-off to shards).
+- After queueing each packet for a shard, the single RX thread, which
+  carries every player's traffic, wrote the shard's eventfd. That write
+  measured about 270 ns of syscall here even with nobody waiting, against
+  about 24 ns for the queue push itself, and woke the shard's `epoll_wait`
+  once per packet. Under load that is most of the RX thread's per-packet
+  cost, so it sets how early the RX thread saturates and starts adding queueing
+  delay to everybody.
+- Fix: `push_to_shard` wakes only when the message landed in an empty inbox.
+  A shard never blocks with messages queued (zero poll timeout while its
+  inbox is non-empty, and it drains until empty), so a message behind others
+  is read with them. The other producer, session cleanup, still wakes
+  unconditionally, which keeps two producers from each skipping the wake.
+- Test: `shard_misses_no_packet_when_wakes_are_skipped_for_a_busy_inbox`
+  sends 6000 packets in irregular bursts with idle gaps through a real shard
+  and requires every one to arrive. Waking only on `len() == 0` (a lost
+  wakeup) delivers none, so the test does catch the failure mode.
