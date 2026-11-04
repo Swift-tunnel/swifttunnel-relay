@@ -820,10 +820,13 @@ static LOCAL_ADDRS: [AtomicU32; MAX_LOCAL_ADDRS] = [const { AtomicU32::new(0) };
 
 fn is_local_addr(ip: Ipv4Addr) -> bool {
     let ip = u32::from(ip);
+    // Filled from the front, so the first empty slot ends the list.
     ip != 0
         && LOCAL_ADDRS
             .iter()
-            .any(|slot| slot.load(Ordering::Relaxed) == ip)
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .take_while(|slot| *slot != 0)
+            .any(|slot| slot == ip)
 }
 
 fn set_local_addrs(addrs: &[Ipv4Addr]) {
