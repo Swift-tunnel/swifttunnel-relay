@@ -910,6 +910,19 @@ pub(crate) fn refresh_local_addrs() {
     set_local_addrs(&host_ipv4_addrs());
 }
 
+/// TCP ports refused whatever the destination policy mode.
+///
+/// TCP gets no service blocklist, for the reasons given at
+/// [`FORBIDDEN_DST_PORTS`], with one exception. SMTP on 25 is how a relay
+/// gets used to send mail spam: a game never touches it, mail from our relay
+/// addresses lands them on blocklists that other networks also consult, and
+/// hosting providers suspend servers over it. The destination policy would
+/// stop it in enforce mode, but relays run in observe, where TCP reaches any
+/// port.
+pub(crate) fn is_forbidden_tcp_dst_port(port: u16) -> bool {
+    port == 25
+}
+
 pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
     is_local_addr(ip)
         || ip.is_private()
@@ -3927,6 +3940,7 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
         };
         if is_forbidden_dst(dst_ip)
             || (protocol == 17 && dst_port.is_some_and(is_forbidden_dst_port))
+            || (protocol == 6 && dst_port.is_some_and(is_forbidden_tcp_dst_port))
             || !dest_policy::permits(protocol, dst_ip, dst_port)
         {
             return Some(ParsedPacket::ForbiddenDst);
@@ -4019,7 +4033,10 @@ fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
             // carries HTTPS for Route Assist, so that is a live cost. The
             // destination policy's TCP port list is a separate rule: it keeps
             // TCP to the web ports Roblox serves its front doors on.
-            if is_forbidden_dst(dst_ip) || !dest_policy::permits(protocol, dst_ip, Some(dst_port)) {
+            if is_forbidden_dst(dst_ip)
+                || is_forbidden_tcp_dst_port(dst_port)
+                || !dest_policy::permits(protocol, dst_ip, Some(dst_port))
+            {
                 return Some(ParsedPacket::ForbiddenDst);
             }
 
@@ -5820,6 +5837,36 @@ mod packet_construction_tests {
                 assert_eq!(raw_ip_packet.len(), 44);
             }
             _ => panic!("Expected ParsedPacket::Tcp"),
+        }
+    }
+
+    #[test]
+    fn tcp_to_smtp_is_refused_in_every_policy_mode() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        packet[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        packet[20..22].copy_from_slice(&40000u16.to_be_bytes());
+        packet[32] = 0x50;
+        for (port, refused) in [(25u16, true), (443, false), (587, false)] {
+            packet[22..24].copy_from_slice(&port.to_be_bytes());
+            stamp_ipv4_lengths(&mut packet);
+            let parsed = parse_ip_packet_full(&packet).unwrap();
+            assert_eq!(
+                matches!(parsed, ParsedPacket::ForbiddenDst),
+                refused,
+                "tcp port {port}"
+            );
+            // A first fragment carries the port too.
+            let mut first_fragment = packet.clone();
+            first_fragment[6] = 0x20; // more fragments
+            let parsed = parse_ip_packet_full(&first_fragment).unwrap();
+            assert_eq!(
+                matches!(parsed, ParsedPacket::ForbiddenDst),
+                refused,
+                "fragmented tcp port {port}"
+            );
         }
     }
 

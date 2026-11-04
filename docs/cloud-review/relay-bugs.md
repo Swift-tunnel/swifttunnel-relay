@@ -327,3 +327,16 @@ Line numbers refer to the code before the fix landed.
   checked before any refresh, so a response still cannot hold an expired
   session open.
 - Test: `responses_keep_a_quiet_session_alive_without_a_write_per_packet`.
+
+### 20. TCP through the TUN reached SMTP in the default policy mode (fixed)
+
+- `src/main.rs:4022` (TCP branch of `parse_ip_packet_full`) and the fragment
+  branch above it.
+- Relays run the destination policy in observe mode, where TCP may go to any
+  public address on any port. That includes port 25, so a client could send
+  mail spam from our relay addresses: those land on blocklists other networks
+  consult, and providers suspend servers over it. A game never uses SMTP.
+- Fix: TCP to port 25 is refused in every mode, including first fragments.
+  Submission ports (465, 587) need authentication at the far end and are left
+  to the policy. Counted as `forbidden_dst`.
+- Test: `tcp_to_smtp_is_refused_in_every_policy_mode`.
