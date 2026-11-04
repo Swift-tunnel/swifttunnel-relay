@@ -103,3 +103,17 @@ Line numbers refer to the code before the fix landed.
 - Tests: `flow_send_survives_an_icmp_error_from_an_earlier_datagram`,
   `flow_drain_reads_responses_queued_behind_an_icmp_error` (both fail without
   the fix), `only_one_shot_icmp_errors_are_retried`.
+
+### 6. One session in 65536 got the TUN device's own address and no TCP (fixed)
+
+- `src/tcp_tun.rs:530` (`assign_session_ip`).
+- Sessions get `10.200.<sid[0]>.<sid[1]>`, skipping only `.0.0` and
+  `.255.255`. A session id starting `00 01` got `10.200.0.1`, which is the
+  address the relay puts on `swifttun0`. Packets written to the TUN with a
+  local address as their source are martians and the kernel drops them, so
+  that session's TCP (Route Assist, HTTPS) silently never connected, and so did
+  its UDP when `RELAY_TUN_UDP=true`. Session ids are random, so this hit about
+  one session in 65536; on a busy relay that is a few players a day.
+- Fix: the interface address is skipped like the other reserved pairs and the
+  next byte pair is used.
+- Test: `test_assign_session_ip_never_hands_out_the_tun_interface_address`.

@@ -38,6 +38,10 @@ const IPPROTO_UDP: u8 = 17;
 const TUN_DEVICE_NAME: &str = "swifttun0";
 #[cfg(target_os = "linux")]
 const TUN_INTERFACE_CIDR: &str = "10.200.0.1/16";
+/// The relay's own address on the TUN device, from `TUN_INTERFACE_CIDR`. It is
+/// a local address, so a packet arriving on the TUN with it as the source is a
+/// martian and the kernel drops it. No session may be given it.
+const TUN_INTERFACE_IP: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
 
 /// Packet to transmit back to a client via the relay's UDP socket.
 pub struct TxPacket {
@@ -537,6 +541,9 @@ fn assign_session_ip(
         }
 
         let candidate = Ipv4Addr::new(10, 200, a, b);
+        if candidate == TUN_INTERFACE_IP {
+            continue;
+        }
 
         // O(1) collision check via the reverse map instead of scanning session_to_ip.
         let collision = ip_to_session
@@ -1223,6 +1230,21 @@ mod tests {
         let ip = assign_session_ip(&sid, &map).unwrap();
         // First pair (0,0) is skipped, should use (0xAA, 0xBB).
         assert_eq!(ip, Ipv4Addr::new(10, 200, 0xAA, 0xBB));
+    }
+
+    #[test]
+    fn test_assign_session_ip_never_hands_out_the_tun_interface_address() {
+        let map: DashMap<Ipv4Addr, SessionMapping> = DashMap::new();
+        // One session id in 65536 starts 00 01, which used to map onto
+        // 10.200.0.1, the relay's own TUN address. The kernel drops every
+        // packet with a local source address arriving on the TUN, so that
+        // session's TCP never connected.
+        let sid = [0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let ip = assign_session_ip(&sid, &map).unwrap();
+        assert_ne!(ip, TUN_INTERFACE_IP);
+        assert_eq!(ip, Ipv4Addr::new(10, 200, 0xAA, 0xBB));
+        #[cfg(target_os = "linux")]
+        assert!(TUN_INTERFACE_CIDR.starts_with(&format!("{}/", TUN_INTERFACE_IP)));
     }
 
     #[test]
