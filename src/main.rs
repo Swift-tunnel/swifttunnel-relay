@@ -2658,7 +2658,16 @@ async fn run_flow_handler(
             packet = rx.recv() => {
                 match packet {
                     Some(data) => {
-                        match socket.send(&data).await {
+                        // A pending ICMP error from an earlier datagram fails
+                        // this send without sending it; the error is consumed,
+                        // so send again. See `datapath_v2::is_deferred_icmp_error`.
+                        let sent = match socket.send(&data).await {
+                            Err(e) if datapath_v2::is_deferred_icmp_error(&e) => {
+                                socket.send(&data).await
+                            }
+                            result => result,
+                        };
+                        match sent {
                             Ok(_) => {
                                 consecutive_send_errors = 0;
                             }
@@ -2751,7 +2760,7 @@ async fn run_flow_handler(
                             session_entry.last_activity_unix = unix_timestamp_secs();
                         }
                     }
-                    Err(e) if is_transient_recv_error(&e) => {
+                    Err(e) if is_transient_recv_error(&e) || datapath_v2::is_deferred_icmp_error(&e) => {
                         // Transient error (WouldBlock/TimedOut/Interrupted/ConnectionReset), ignore and continue
                         continue;
                     }

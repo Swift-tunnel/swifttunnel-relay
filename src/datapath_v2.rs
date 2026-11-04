@@ -436,6 +436,41 @@ fn recv_flow_response(
     socket.recv(buf).map(|len| (len, None))
 }
 
+/// An error the kernel parked on a connected UDP socket because of an ICMP
+/// message about an earlier datagram (port unreachable, administratively
+/// prohibited, fragmentation needed and so on).
+///
+/// Linux reports such an error exactly once, on whichever call comes next,
+/// and that call does no other work: a `send` fails without sending its
+/// datagram, and a `recv` fails even when datagrams are already queued behind
+/// the error. Retrying straight away is correct for both, since the error has
+/// been consumed. Any of these, from one stray or spoofed ICMP message, used to
+/// cost the next client packet on a send, and on a receive left the queued
+/// responses waiting for the game server's next datagram, because the flow
+/// socket is edge-triggered and nothing else would wake it.
+pub(super) fn is_deferred_icmp_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::ECONNREFUSED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::EHOSTDOWN
+                | libc::ENOPROTOOPT
+                | libc::EMSGSIZE
+        )
+    )
+}
+
+/// Send one datagram on a flow socket, retrying once if the first attempt only
+/// reported an earlier ICMP error. See [`is_deferred_icmp_error`].
+fn send_flow_datagram(socket: &MioUdpSocket, payload: &[u8]) -> std::io::Result<usize> {
+    match socket.send(payload) {
+        Err(e) if is_deferred_icmp_error(&e) => socket.send(payload),
+        result => result,
+    }
+}
+
 /// Write a reconstructed IPv4+UDP packet into `dst` from a response payload.
 fn write_response_ip_packet_into(
     dst: &mut [u8],
@@ -601,6 +636,11 @@ fn drain_flow_responses(
         let (len, response_tos) = match recv_flow_response(&flow.socket, recv_buf) {
             Ok(value) => value,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            // The error belonged to an earlier datagram and has now been
+            // consumed; whatever is queued behind it is still readable.
+            Err(e) if is_deferred_icmp_error(&e) || e.kind() == std::io::ErrorKind::Interrupted => {
+                continue
+            }
             Err(e) => {
                 log::debug!(
                     "V2 shard {} flow {} recv error: {} (kind={:?})",
@@ -888,7 +928,7 @@ fn run_shard(
 
                     let send_result = unsafe {
                         let buf = pool.buffer(payload_idx);
-                        flow.socket.send(&buf[..payload_len])
+                        send_flow_datagram(&flow.socket, &buf[..payload_len])
                     };
                     pool.release(payload_idx);
 
@@ -2542,6 +2582,97 @@ mod tests {
             assert_eq!(buf[3], 0xEF);
         }
         pool.release(idx);
+    }
+
+    fn closed_local_udp_addr() -> SocketAddr {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap()
+    }
+
+    #[test]
+    fn only_one_shot_icmp_errors_are_retried() {
+        let os = std::io::Error::from_raw_os_error;
+        assert!(is_deferred_icmp_error(&os(libc::ECONNREFUSED)));
+        assert!(is_deferred_icmp_error(&os(libc::EHOSTUNREACH)));
+        assert!(is_deferred_icmp_error(&os(libc::EMSGSIZE)));
+        // Persistent failures must not be retried, or a drain pass would spin.
+        assert!(!is_deferred_icmp_error(&os(libc::EBADF)));
+        assert!(!is_deferred_icmp_error(&os(libc::EAGAIN)));
+    }
+
+    #[test]
+    fn flow_send_survives_an_icmp_error_from_an_earlier_datagram() {
+        let game_addr = closed_local_udp_addr();
+        let flow = create_flow_socket(game_addr).unwrap();
+        // Nothing listens yet, so loopback answers with port unreachable and
+        // the kernel parks ECONNREFUSED on the flow socket.
+        let _ = flow.send(b"first");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let game = std::net::UdpSocket::bind(game_addr).unwrap();
+        game.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        send_flow_datagram(&flow, b"second").unwrap();
+        let mut buf = [0u8; 16];
+        let len = game.recv(&mut buf).expect("second datagram was lost");
+        assert_eq!(&buf[..len], b"second");
+    }
+
+    #[test]
+    fn flow_drain_reads_responses_queued_behind_an_icmp_error() {
+        let game = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let game_addr = game.local_addr().unwrap();
+        let session_id = [9u8; super::super::SESSION_ID_LEN];
+        let client_addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let mut flow = FlowState {
+            socket: create_flow_socket(game_addr).unwrap(),
+            client_addr,
+            original_info: test_original_info(),
+            last_activity: Instant::now(),
+            marked_for_removal: None,
+            token: Token(1),
+        };
+        let flow_addr = flow.socket.local_addr().unwrap();
+        game.send_to(b"r1", flow_addr).unwrap();
+        game.send_to(b"r2", flow_addr).unwrap();
+        drop(game);
+        // The server is gone; this datagram draws port unreachable, which the
+        // kernel reports ahead of the two responses already queued.
+        let _ = flow.socket.send(b"x");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let sessions = DashMap::new();
+        sessions.insert(
+            session_id,
+            super::super::SessionEntry {
+                user_id: "test".into(),
+                auth_state: super::super::SessionAuthState::Legacy,
+                lease_expires_at_unix: None,
+                client_addr,
+                created_at_unix: 0,
+                last_activity: Instant::now(),
+                last_activity_unix: 0,
+            },
+        );
+        let pool = BufferPool::new(16);
+        let stats = super::super::Stats::new();
+        let (tx_s, tx_r) = crossbeam_channel::bounded::<TxPacket>(16);
+        let mut recv_buf = [0u8; super::super::MAX_PACKET_SIZE];
+        let key = FlowKey {
+            session_id,
+            game_addr,
+        };
+        drain_flow_responses(
+            0,
+            key,
+            &mut flow,
+            &mut recv_buf,
+            &pool,
+            &sessions,
+            &stats,
+            &tx_s,
+        );
+        assert_eq!(tx_r.try_iter().count(), 2);
     }
 
     #[test]

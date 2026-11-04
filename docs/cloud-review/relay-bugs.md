@@ -78,3 +78,28 @@ Line numbers refer to the code before the fix landed.
   clients already retry an unanswered hello. Ticket format and ack codes are
   unchanged.
 - Test: `spoofed_hellos_cannot_buy_unbounded_signature_checks`.
+
+### 5. An ICMP error cost the next client packet, or stranded queued responses (fixed)
+
+- `src/datapath_v2.rs:604` (`drain_flow_responses` error arm), `:848` (shard
+  send), `src/main.rs:2619` and `:2706` (v1 flow handler send and recv).
+- Flow sockets are connected UDP sockets. When an ICMP port unreachable,
+  protocol unreachable, administratively prohibited or fragmentation needed
+  message comes back for one datagram, Linux parks the error on the socket and
+  reports it once, on the next call, and that call does nothing else. Checked
+  on this kernel: the send after a port unreachable failed with
+  `ECONNREFUSED` and its datagram never left; a recv returned the error ahead
+  of two responses that were already queued.
+- v2 send: the error was logged at debug and the client packet was lost.
+- v2 receive: the drain returned on the error. The socket is edge-triggered,
+  so the queued responses waited for the game server's next datagram (one
+  tick or more of added delay, or forever if it was the last one).
+- v1: `ECONNREFUSED` on recv was not treated as transient, so each one slept
+  the flow task 10 ms (holding up client packets queued for that flow) and
+  five in a row tore the flow down. Sends lost the packet as in v2.
+- Fix: `is_deferred_icmp_error` names the one-shot errnos. Sends retry once
+  after one, and the drain keeps reading (still bounded by the burst budget).
+  Persistent errors are unchanged, so a broken socket cannot make the drain spin.
+- Tests: `flow_send_survives_an_icmp_error_from_an_earlier_datagram`,
+  `flow_drain_reads_responses_queued_behind_an_icmp_error` (both fail without
+  the fix), `only_one_shot_icmp_errors_are_retried`.
