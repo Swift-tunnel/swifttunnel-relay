@@ -44,7 +44,7 @@ use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::net::{Ipv4Addr, Shutdown};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -803,8 +803,89 @@ pub(crate) fn is_forbidden_dst_port(port: u16) -> bool {
     port == 0 || FORBIDDEN_DST_PORTS.contains(&port)
 }
 
+/// IPv4 addresses this host owns, so traffic is never relayed to the relay
+/// machine itself.
+///
+/// The ranges in [`is_forbidden_dst`] cover private and loopback space, but a
+/// relay's public address is an ordinary public address. Sent there, a flow
+/// reached whatever listens on the relay host: the speedtest server, the
+/// relay's own port (a relay inside the relay, with the relay's address as the
+/// source), and any service that trusts traffic from the host itself.
+///
+/// Read on every packet, so it is a fixed set of atomics rather than a lock.
+/// Refreshed by the cleanup tasks; an address added between refreshes is
+/// covered within one cleanup interval.
+const MAX_LOCAL_ADDRS: usize = 32;
+static LOCAL_ADDRS: [AtomicU32; MAX_LOCAL_ADDRS] = [const { AtomicU32::new(0) }; MAX_LOCAL_ADDRS];
+
+fn is_local_addr(ip: Ipv4Addr) -> bool {
+    let ip = u32::from(ip);
+    ip != 0
+        && LOCAL_ADDRS
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == ip)
+}
+
+fn set_local_addrs(addrs: &[Ipv4Addr]) {
+    let mut addrs: Vec<u32> = addrs
+        .iter()
+        .map(|ip| u32::from(*ip))
+        .filter(|ip| *ip != 0)
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    if addrs.len() > MAX_LOCAL_ADDRS {
+        log::warn!(
+            "Host has {} IPv4 addresses; only the first {} are kept off the relay path",
+            addrs.len(),
+            MAX_LOCAL_ADDRS
+        );
+    }
+    for (index, slot) in LOCAL_ADDRS.iter().enumerate() {
+        slot.store(addrs.get(index).copied().unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(unix))]
+fn host_ipv4_addrs() -> Vec<Ipv4Addr> {
+    Vec::new()
+}
+
+/// Every IPv4 address on this host's interfaces.
+#[cfg(unix)]
+fn host_ipv4_addrs() -> Vec<Ipv4Addr> {
+    let mut found = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // Safety: getifaddrs fills `list` with a linked list freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return found;
+    }
+    let mut cursor = list;
+    while !cursor.is_null() {
+        // Safety: `cursor` walks the list getifaddrs returned.
+        let entry = unsafe { &*cursor };
+        if !entry.ifa_addr.is_null()
+            && i32::from(unsafe { (*entry.ifa_addr).sa_family }) == libc::AF_INET
+        {
+            // Safety: AF_INET addresses are sockaddr_in.
+            let addr = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+            found.push(Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
+        }
+        cursor = entry.ifa_next;
+    }
+    // Safety: `list` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
+/// Reload [`LOCAL_ADDRS`] from the host's interfaces.
+pub(crate) fn refresh_local_addrs() {
+    set_local_addrs(&host_ipv4_addrs());
+}
+
 pub(crate) fn is_forbidden_dst(ip: Ipv4Addr) -> bool {
-    ip.is_private()
+    is_local_addr(ip)
+        || ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_multicast()
@@ -1674,6 +1755,7 @@ async fn main() -> Result<()> {
     // Before the datapaths split, so both report it; this also loads the
     // policy, so a bad allowlist file shows up at startup.
     log::info!("{}", dest_policy::describe());
+    refresh_local_addrs();
 
     // Bind the main UDP socket early so the TUN response thread can share it.
     // Reuse the existing datapath-v2 helper so RELAY_SOCKET_RCVBUF_BYTES /
@@ -1953,6 +2035,7 @@ async fn main() -> Result<()> {
         let mut cleanup_timer = interval(CLEANUP_INTERVAL);
         loop {
             cleanup_timer.tick().await;
+            refresh_local_addrs();
             let now = Instant::now();
 
             let mut marked_count = 0u32;
@@ -5664,6 +5747,25 @@ mod packet_construction_tests {
             assert!(is_forbidden_dst(ip), "{ip} should be forbidden");
         }
         assert!(!is_forbidden_dst(Ipv4Addr::new(128, 116, 50, 10)));
+    }
+
+    #[test]
+    fn the_relay_host_is_never_a_destination() {
+        // A public address the host might own, made local for the test.
+        let own = Ipv4Addr::new(203, 0, 114, 7);
+        assert!(!is_forbidden_dst(own));
+        set_local_addrs(&[own]);
+        assert!(is_forbidden_dst(own));
+        assert!(!is_forbidden_dst(Ipv4Addr::new(128, 116, 50, 10)));
+        // Real interfaces: every address found is refused after a refresh.
+        let host = host_ipv4_addrs();
+        assert!(
+            host.contains(&Ipv4Addr::LOCALHOST),
+            "getifaddrs found {host:?}"
+        );
+        refresh_local_addrs();
+        assert!(host.iter().all(|ip| is_forbidden_dst(*ip)));
+        assert!(!is_forbidden_dst(own));
     }
 
     /// The relay must not be usable as an amplifier.

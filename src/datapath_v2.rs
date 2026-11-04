@@ -1220,6 +1220,7 @@ pub(super) async fn run_datapath_v2(
         let mut cleanup_timer = tokio::time::interval(super::CLEANUP_INTERVAL);
         loop {
             cleanup_timer.tick().await;
+            super::refresh_local_addrs();
             let now = Instant::now();
             let session_idle_limit = super::SESSION_TIMEOUT + super::FLOW_GRACE_PERIOD;
 

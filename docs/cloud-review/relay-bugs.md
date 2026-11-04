@@ -233,3 +233,21 @@ Line numbers refer to the code before the fix landed.
   (README updated).
 - Test: `tests/relay_speedtest_server.py` (spoofed and cross-address requests
   get nothing, clamping holds, HELLO reply is no larger than the request).
+
+### 14. Clients could relay traffic to the relay host itself (fixed)
+
+- `src/main.rs:770` (`is_forbidden_dst`).
+- The forbidden ranges cover private, loopback and reserved space, but the
+  relay's own public address is an ordinary public address, so a UDP flow (or
+  a TUN packet) to it was relayed to the relay host. That reached whatever
+  listens there: the speedtest server, the relay's own port (a session
+  inside the relay whose source is the relay itself, outside every per-source
+  limit), and any service that trusts traffic from the host's own address.
+  Issue 7 closes this for the TUN in the firewall; this closes it for the UDP
+  datapath, where the traffic comes from the relay's own sockets and never
+  crosses `swifttun0`.
+- Fix: the host's IPv4 addresses (from `getifaddrs`) are forbidden
+  destinations. They are read at startup and refreshed by both cleanup tasks
+  every 30 s, and kept in a fixed array of atomics so the per-packet check
+  takes no lock.
+- Test: `the_relay_host_is_never_a_destination`.
