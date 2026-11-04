@@ -413,7 +413,17 @@ struct PendingAuthLimiter {
     hash: std::collections::hash_map::RandomState,
     buckets: Vec<std::sync::Mutex<SourceRateState>>,
     verifications: std::sync::Mutex<(Instant, u32)>,
+    /// Separate budget for `AUTH_ACK_REAUTH_REQUIRED` notices. Every data
+    /// packet from a rebound address asks for one, and they used to draw on
+    /// the same bucket as hellos, so a client sending a few hundred packets a
+    /// second after a NAT change spent the budget its own re-auth hello
+    /// needed, and the hello was dropped as rate limited.
+    notices: Vec<std::sync::Mutex<(Instant, u32)>>,
 }
+
+/// Re-auth notices sent per second per source bucket. One that arrives is
+/// enough; the rest only cover loss.
+const MAX_REAUTH_NOTICES_PER_SOURCE_WINDOW: u32 = 16;
 
 /// Ticket signature checks allowed per second across all sources. A rejected
 /// signature costs roughly 50 us, so this keeps a hello flood under about a
@@ -429,7 +439,21 @@ impl PendingAuthLimiter {
                 .map(|_| std::sync::Mutex::new(SourceRateState::new(Instant::now())))
                 .collect(),
             verifications: std::sync::Mutex::new((Instant::now(), 0)),
+            notices: (0..4096)
+                .map(|_| std::sync::Mutex::new((Instant::now(), 0)))
+                .collect(),
         }
+    }
+
+    /// Whether to tell `ip` its session needs a fresh hello.
+    fn allow_reauth_notice(&self, ip: IpAddr, now: Instant) -> bool {
+        use std::hash::BuildHasher;
+        let index = self.hash.hash_one(ip) as usize % self.notices.len();
+        take_from_window(
+            &self.notices[index],
+            MAX_REAUTH_NOTICES_PER_SOURCE_WINDOW,
+            now,
+        )
     }
 
     /// Whether an auth hello from `ip` may have its signature checked now:
@@ -2224,7 +2248,7 @@ async fn main() -> Result<()> {
             && sessions
                 .get(&session_id)
                 .is_some_and(|session| session.client_addr != client_addr)
-            && pending_auth.allow(client_addr.ip(), now)
+            && pending_auth.allow_reauth_notice(client_addr.ip(), now)
         {
             send_auth_ack(
                 socket.as_ref(),
@@ -4262,6 +4286,23 @@ mod tests {
         let _again = std::net::TcpStream::connect(addr).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(running.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reauth_notices_do_not_spend_the_budget_of_the_hello_that_answers_them() {
+        let limiter = PendingAuthLimiter::new();
+        let now = Instant::now();
+        let ip: IpAddr = "198.51.100.40".parse().unwrap();
+        // A busy client after a NAT change: every packet asks for a notice.
+        let sent = (0..1000)
+            .filter(|_| limiter.allow_reauth_notice(ip, now))
+            .count();
+        assert_eq!(sent, MAX_REAUTH_NOTICES_PER_SOURCE_WINDOW as usize);
+        assert!(
+            limiter.allow_verification(ip, now),
+            "re-auth hello was starved"
+        );
+        assert!(limiter.allow_reauth_notice(ip, now + SOURCE_RATE_WINDOW));
     }
 
     #[test]

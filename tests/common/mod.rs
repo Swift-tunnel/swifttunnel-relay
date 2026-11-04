@@ -105,6 +105,11 @@ pub fn start(
 
 /// An auth hello for session 1, signed by `key`.
 pub fn hello(key: &Ed25519KeyPair) -> Vec<u8> {
+    hello_with_jti(key, "local-test-ticket")
+}
+
+/// An auth hello for session 1 with its own ticket id, signed by `key`.
+pub fn hello_with_jti(key: &Ed25519KeyPair, jti: &str) -> Vec<u8> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -112,7 +117,7 @@ pub fn hello(key: &Ed25519KeyPair) -> Vec<u8> {
     let payload = serde_json::to_vec(&serde_json::json!({
         "v": 1, "iss": "swifttunnel-web", "aud": "swifttunnel-relay",
         "sub": "owner", "sid": "0000000000000001", "srv": "local-test",
-        "iat": now, "exp": now + 300, "jti": "local-test-ticket", "lease": true,
+        "iat": now, "exp": now + 300, "jti": jti, "lease": true,
     }))
     .unwrap();
     let token = format!(

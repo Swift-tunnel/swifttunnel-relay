@@ -267,3 +267,18 @@ Line numbers refer to the code before the fix landed.
 - Fix: both run on `serve_bounded`, which never exits on accept errors, pauses
   50 ms after one, and caps concurrent clients (health 32, stats 16).
 - Test: `bounded_server_never_runs_more_clients_than_its_limit`.
+
+### 16. Re-auth notices starved the hello that answers them (fixed)
+
+- `src/datapath_v2.rs:1436` and `src/main.rs:2227` (`AUTH_ACK_REAUTH_REQUIRED`).
+- After a NAT change, every packet from the new address makes the relay send
+  `REAUTH_REQUIRED`, rate limited by the same per-source bucket (256 a
+  second) that admits auth hellos. A client still sending its game traffic
+  (a few hundred packets a second) used up that bucket on notices, so its
+  re-auth hello was dropped as rate limited, and again the next second: the
+  session stayed dead until the client happened to slow down. It also meant
+  up to 256 notices a second where one is enough.
+- Fix: notices have their own bucket array, 16 per second per source.
+- Tests: `reauth_notices_do_not_spend_the_budget_of_the_hello_that_answers_them`
+  and `tests/auth_retransmit.rs::both_datapaths_accept_a_reauth_hello_from_a_busy_rebound_client`
+  (400 packets from the rebound address, then a hello; fails before the fix).

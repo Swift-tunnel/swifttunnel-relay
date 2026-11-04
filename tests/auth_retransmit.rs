@@ -7,7 +7,7 @@
 //! it. The same ticket from any other endpoint must still be refused.
 mod common;
 
-use common::{authenticated_client, hello, ping, start};
+use common::{authenticated_client, hello, hello_with_jti, ping, start};
 use ring::signature::Ed25519KeyPair;
 use std::{net::UdpSocket, time::Duration};
 
@@ -37,5 +37,39 @@ fn both_datapaths_acknowledge_a_retransmitted_hello_only_from_its_endpoint() {
 
         let pong = exchange(&client, port, &ping());
         assert_eq!(pong[8], 0xa4, "{datapath}: endpoint moved");
+    }
+}
+
+/// After a NAT change every packet from the new address draws a re-auth
+/// notice. Those notices must not use up the budget of the hello that answers
+/// them, or a busy client cannot get its session back.
+#[test]
+fn both_datapaths_accept_a_reauth_hello_from_a_busy_rebound_client() {
+    let key = Ed25519KeyPair::from_seed_unchecked(&[13; 32]).unwrap();
+    for datapath in ["v1", "v2"] {
+        let (_relay, port, _) = start(datapath, &key, &[]);
+        let _original = authenticated_client(port, &key);
+
+        let rebound = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rebound
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        for _ in 0..400 {
+            rebound.send_to(&ping(), ("127.0.0.1", port)).unwrap();
+        }
+        rebound
+            .send_to(&hello_with_jti(&key, "after-rebind"), ("127.0.0.1", port))
+            .unwrap();
+        let mut accepted = false;
+        let mut buf = [0u8; 64];
+        while let Ok(len) = rebound.recv(&mut buf) {
+            if len >= 10 && buf[8] == 0xa2 && buf[9] == 0 {
+                accepted = true;
+            }
+        }
+        assert!(
+            accepted,
+            "{datapath}: re-auth hello after a busy rebind got no OK"
+        );
     }
 }

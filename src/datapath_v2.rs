@@ -1433,7 +1433,7 @@ pub(super) async fn run_datapath_v2(
                     && sessions_rx
                         .get(&session_id)
                         .is_some_and(|session| session.client_addr != client_addr)
-                    && pending_auth.allow(client_addr.ip(), now)
+                    && pending_auth.allow_reauth_notice(client_addr.ip(), now)
                 {
                     send_small_control_frame(
                         &tx_control_rx,
