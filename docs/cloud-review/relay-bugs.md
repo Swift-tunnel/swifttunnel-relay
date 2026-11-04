@@ -282,3 +282,14 @@ Line numbers refer to the code before the fix landed.
 - Tests: `reauth_notices_do_not_spend_the_budget_of_the_hello_that_answers_them`
   and `tests/auth_retransmit.rs::both_datapaths_accept_a_reauth_hello_from_a_busy_rebound_client`
   (400 packets from the rebound address, then a hello; fails before the fix).
+
+### 17. v3-relay.service did not wait for the network it asked for (fixed)
+
+- `v3-relay.service:4-5`.
+- `Wants=network-online.target` pulls the target in but does not order
+  anything after it; only `After=` does, and the unit had
+  `After=network.target`, which is reached before addresses are configured.
+  At boot the relay could start with no public address yet, so the host's
+  address was missing from the forbidden destinations (issue 14) until the
+  first refresh, and the first resolve frames could fail.
+- Fix: `After=network-online.target`.

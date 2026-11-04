@@ -1,7 +1,7 @@
 [Unit]
 Description=SwiftTunnel V3 Relay Server (UDP + TCP)
 Documentation=https://github.com/Swift-tunnel/swifttunnel-app
-After=network.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
