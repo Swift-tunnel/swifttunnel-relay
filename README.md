@@ -393,6 +393,8 @@ Auth ack status codes:
 - `5` server_mismatch
 - `6` auth_disabled
 - `7` replay
+- `8` owner_mismatch (the session id belongs to another account)
+- `9` reauth_required (the session was seen from a new address; send a fresh hello)
 
 **Keepalive:** Send just the session ID (8 bytes, no payload) every 15-20 seconds to maintain NAT bindings.
 
@@ -403,6 +405,10 @@ See the [SwiftTunnel App](https://github.com/Swift-tunnel/swifttunnel-app) for a
 ```bash
 # Open the relay port
 sudo ufw allow 51821/udp
+
+# Public health endpoint, probed by the status page and the latency widget
+# (RELAY_HEALTH_PORT, default 8081; set it to 0 to disable)
+sudo ufw allow 8081/tcp
 
 # Speedtest server port
 sudo ufw allow 9000/udp

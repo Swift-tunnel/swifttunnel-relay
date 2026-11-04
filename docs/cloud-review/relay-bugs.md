@@ -372,3 +372,14 @@ Line numbers refer to the code before the fix landed.
   stays bad. The full recompute helpers remain for tests only.
 - Test: `rewrite_does_not_launder_a_damaged_segment` (fails with the old
   recompute); the existing checksum-preservation tests still pass.
+
+### 23. README firewall steps left the health endpoint closed (fixed)
+
+- `README.md` "Firewall" section.
+- The steps opened 51821/udp and 9000/udp but not 8081/tcp, the public
+  health endpoint the status page and landing-page latency widget probe. On a
+  relay set up from the README with ufw, both report the relay as down, which
+  is the failure the health endpoint was added to fix.
+- Fix: added `ufw allow 8081/tcp`; also documented ack codes 8
+  (`owner_mismatch`) and 9 (`reauth_required`), and added them (and 7) to the
+  speedtest client's labels.

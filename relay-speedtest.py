@@ -43,6 +43,9 @@ AUTH_ACK_LABELS = {
     4: "sid_mismatch",
     5: "server_mismatch",
     6: "auth_disabled",
+    7: "replay",
+    8: "owner_mismatch",
+    9: "reauth_required",
 }
 
 MAGIC = b"SWST"
