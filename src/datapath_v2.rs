@@ -1341,7 +1341,7 @@ pub(super) async fn run_datapath_v2(
                     && buf[super::SESSION_ID_LEN] == super::AUTH_HELLO_FRAME_TYPE;
 
                 let verified_ticket = if auth_config_rx.mode.requires_auth() && is_auth_hello {
-                    if !pending_auth.allow(client_addr.ip(), now) {
+                    if !pending_auth.allow_verification(client_addr.ip(), now) {
                         stats_rx.drop_in(super::DropReason::RateLimit);
                         continue;
                     }

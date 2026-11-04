@@ -57,3 +57,24 @@ Line numbers refer to the code before the fix landed.
   read guard, and only takes the write guard and touches the heap when the
   identity really changes. Applied to both datapaths.
 - Test: `legacy_user_id_tracks_the_tunnel_ip_but_never_overrides_authenticated`.
+
+## Pass 2: auth, ICMP errors, TUN, setup, resolve, budgets
+
+### 4. Forged auth hellos could buy unbounded signature checks on the RX thread (fixed)
+
+- `src/main.rs:403` (`PendingAuthLimiter`), used at `src/datapath_v2.rs:1344`
+  and `src/main.rs:1955`.
+- Hellos are verified before anything else, on the one receive thread that
+  forwards every player's traffic. The only limit was 256 per second per
+  hash bucket, and a spoofed source address lands in a different bucket for
+  free, so 4096 buckets admitted about a million verifications a second.
+  Rejecting a junk token with a 64-byte signature measured about 56 us in a
+  release build, so roughly 18k forged hellos a second (about 2 MB/s, no
+  account needed) would have kept the RX thread fully busy and stalled
+  forwarding for everybody on the relay.
+- Fix: `allow_verification` adds a relay-wide ceiling of 2048 signature checks
+  per second on top of the per-bucket limit (about 11% of one core at worst).
+  Hellos over the ceiling are dropped silently and counted as `rate_limit`;
+  clients already retry an unanswered hello. Ticket format and ack codes are
+  unchanged.
+- Test: `spoofed_hellos_cannot_buy_unbounded_signature_checks`.

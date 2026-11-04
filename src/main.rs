@@ -400,10 +400,26 @@ pub(crate) struct SourceRateLimiter {
 /// Fixed memory before signature verification. Randomized buckets prevent a
 /// stream of invented source addresses from growing the authenticated maps.
 /// Colliding sources share a bucket for one second; there is no eviction churn.
+///
+/// The buckets alone do not bound the work, though. Every bucket admits
+/// `MAX_NEW_SESSIONS_PER_SOURCE_WINDOW` hellos a second, and a spoofed source
+/// address picks a new bucket for free, so 4096 buckets let through about a
+/// million Ed25519 verifications a second. One verification of a junk token
+/// costs tens of microseconds and runs on the single receive thread that
+/// forwards everybody's game traffic, so a couple of megabytes a second of
+/// forged hellos, needing no account, could stall forwarding for every player.
+/// `verifications` is a relay-wide ceiling on that work.
 struct PendingAuthLimiter {
     hash: std::collections::hash_map::RandomState,
     buckets: Vec<std::sync::Mutex<SourceRateState>>,
+    verifications: std::sync::Mutex<(Instant, u32)>,
 }
+
+/// Ticket signature checks allowed per second across all sources. A rejected
+/// signature costs roughly 50 us, so this keeps a hello flood under about a
+/// tenth of the receive thread. Real clients send one hello per session and
+/// one per lease renewal, and retry a hello that goes unanswered.
+const MAX_AUTH_VERIFICATIONS_PER_WINDOW: u32 = 2048;
 
 impl PendingAuthLimiter {
     fn new() -> Self {
@@ -412,7 +428,27 @@ impl PendingAuthLimiter {
             buckets: (0..4096)
                 .map(|_| std::sync::Mutex::new(SourceRateState::new(Instant::now())))
                 .collect(),
+            verifications: std::sync::Mutex::new((Instant::now(), 0)),
         }
+    }
+
+    /// Whether an auth hello from `ip` may have its signature checked now:
+    /// its source bucket and the relay-wide verification budget both allow it.
+    fn allow_verification(&self, ip: IpAddr, now: Instant) -> bool {
+        if !self.allow(ip, now) {
+            return false;
+        }
+        let Ok(mut window) = self.verifications.lock() else {
+            return false;
+        };
+        if now.saturating_duration_since(window.0) >= SOURCE_RATE_WINDOW {
+            *window = (now, 0);
+        }
+        if window.1 >= MAX_AUTH_VERIFICATIONS_PER_WINDOW {
+            return false;
+        }
+        window.1 += 1;
+        true
     }
 
     fn allow(&self, ip: IpAddr, now: Instant) -> bool {
@@ -1952,7 +1988,7 @@ async fn main() -> Result<()> {
 
         // Unknown senders use fixed pending buckets, never authenticated capacity.
         let verified_ticket = if auth_config.mode.requires_auth() && is_auth_hello {
-            if !pending_auth.allow(client_addr.ip(), now) {
+            if !pending_auth.allow_verification(client_addr.ip(), now) {
                 stats.drop_in(DropReason::RateLimit);
                 continue;
             }
@@ -3882,6 +3918,21 @@ mod tests {
         }
         assert!(!limiter.allow(ip, now));
         assert!(limiter.allow(ip, now + SOURCE_RATE_WINDOW));
+    }
+
+    #[test]
+    fn spoofed_hellos_cannot_buy_unbounded_signature_checks() {
+        let limiter = PendingAuthLimiter::new();
+        let now = Instant::now();
+        // Every hello from a fresh spoofed address: before the global ceiling
+        // all of them reached signature verification.
+        let admitted = (0..100_000u32)
+            .filter(|value| limiter.allow_verification(IpAddr::V4(Ipv4Addr::from(*value)), now))
+            .count();
+        assert_eq!(admitted, MAX_AUTH_VERIFICATIONS_PER_WINDOW as usize);
+        let fresh: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!limiter.allow_verification(fresh, now));
+        assert!(limiter.allow_verification(fresh, now + SOURCE_RATE_WINDOW));
     }
 
     fn make_ticket_token(
