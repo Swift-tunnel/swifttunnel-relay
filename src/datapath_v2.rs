@@ -31,6 +31,8 @@ const DEFAULT_FLOW_SOCKET_SNDBUF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FLOW_RECV_BURST: usize = 64;
 const MAX_INBOX_DRAIN_BURST: usize = 1024;
 const MAX_DATA_QUEUE_AGE: Duration = Duration::from_millis(250);
+/// How stale a session's activity time may get before a response refreshes it.
+const SESSION_ACTIVITY_REFRESH: Duration = Duration::from_secs(1);
 // Intentionally shorter than MAX_DATA_QUEUE_AGE: this bounds a single kernel
 // send-buffer stall, while stale-queue dropping sheds packets that waited too long.
 const MAIN_SOCKET_SEND_TIMEOUT: Duration = Duration::from_millis(5);
@@ -687,18 +689,26 @@ fn drain_flow_responses(
         // traffic from the far end hold a dead session open, so the idle
         // cleanup never reached it and an expired lease kept returning data.
         //
-        // One write guard does both the check and the refresh, instead of a
-        // read guard followed by a second lookup for the write.
-        {
-            let now_unix = super::unix_timestamp_secs();
-            let Some(mut session) = sessions.get_mut(&flow_key.session_id) else {
+        // The check takes a shared guard. The refresh only needs the write
+        // guard when the stored activity is more than a second old: idle
+        // cleanup works in tens of seconds, and a write guard per response
+        // packet contended with the RX thread, which takes one on the same
+        // map shard for every packet the client sends.
+        let now_unix = super::unix_timestamp_secs();
+        let refresh = {
+            let Some(session) = sessions.get(&flow_key.session_id) else {
                 return false;
             };
             if !super::session_lease_is_current(&session, now_unix) {
                 return false;
             }
-            session.last_activity = received_at;
-            session.last_activity_unix = now_unix;
+            received_at.saturating_duration_since(session.last_activity) >= SESSION_ACTIVITY_REFRESH
+        };
+        if refresh {
+            if let Some(mut session) = sessions.get_mut(&flow_key.session_id) {
+                session.last_activity = received_at;
+                session.last_activity_unix = now_unix;
+            }
         }
 
         flow.last_activity = received_at;
@@ -2805,6 +2815,61 @@ mod tests {
             }
         }
         assert_eq!(counter.join().unwrap(), PACKETS);
+    }
+
+    #[test]
+    fn responses_keep_a_quiet_session_alive_without_a_write_per_packet() {
+        let game = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let game_addr = game.local_addr().unwrap();
+        let session_id = [6u8; super::super::SESSION_ID_LEN];
+        let client_addr: SocketAddr = "127.0.0.1:40003".parse().unwrap();
+        let mut flow = FlowState {
+            socket: create_flow_socket(game_addr).unwrap(),
+            client_addr,
+            original_info: test_original_info(),
+            last_activity: Instant::now(),
+            marked_for_removal: None,
+            token: Token(1),
+        };
+        let flow_addr = flow.socket.local_addr().unwrap();
+        let sessions = DashMap::new();
+        let stale = Instant::now() - Duration::from_secs(100);
+        sessions.insert(
+            session_id,
+            super::super::SessionEntry {
+                user_id: "test".into(),
+                auth_state: super::super::SessionAuthState::Legacy,
+                lease_expires_at_unix: None,
+                client_addr,
+                created_at_unix: 0,
+                last_activity: stale,
+                last_activity_unix: 0,
+            },
+        );
+        let pool = BufferPool::new(16);
+        let stats = super::super::Stats::new();
+        let (tx_s, tx_r) = crossbeam_channel::bounded::<TxPacket>(16);
+        let mut recv_buf = [0u8; super::super::MAX_PACKET_SIZE];
+        let key = FlowKey {
+            session_id,
+            game_addr,
+        };
+        let mut drain = |flow: &mut FlowState| {
+            drain_flow_responses(0, key, flow, &mut recv_buf, &pool, &sessions, &stats, &tx_s);
+        };
+
+        game.send_to(b"a", flow_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drain(&mut flow);
+        let refreshed = sessions.get(&session_id).unwrap().last_activity;
+        assert!(refreshed > stale, "a response must keep the session alive");
+
+        // Within the refresh interval the stored time is left alone.
+        game.send_to(b"b", flow_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drain(&mut flow);
+        assert_eq!(sessions.get(&session_id).unwrap().last_activity, refreshed);
+        assert_eq!(tx_r.try_iter().count(), 2);
     }
 
     #[test]

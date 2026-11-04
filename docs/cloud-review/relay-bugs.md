@@ -313,3 +313,17 @@ Line numbers refer to the code before the fix landed.
   sends 6000 packets in irregular bursts with idle gaps through a real shard
   and requires every one to arrive. Waking only on `len() == 0` (a lost
   wakeup) delivers none, so the test does catch the failure mode.
+
+### 19. A session write guard for every response packet (fixed)
+
+- `src/datapath_v2.rs:690` (`drain_flow_responses`).
+- Each response took the session's write guard to store `last_activity`,
+  while the RX thread takes the write guard of the same map shard for every
+  packet the client sends, so the two directions of one session serialised
+  on that lock. The value only feeds idle cleanup, which works in tens of
+  seconds.
+- Fix: the lease check uses a shared guard, and the write guard is taken
+  only when the stored activity is more than a second old. The lease is still
+  checked before any refresh, so a response still cannot hold an expired
+  session open.
+- Test: `responses_keep_a_quiet_session_alive_without_a_write_per_packet`.
