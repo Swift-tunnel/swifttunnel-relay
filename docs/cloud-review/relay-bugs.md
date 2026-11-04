@@ -44,3 +44,16 @@ Line numbers refer to the code before the fix landed.
   flow cap to the soft `RLIMIT_NOFILE` minus 4096 spare descriptors; raise
   `LimitNOFILE` in the unit file to 524288 so the configured cap is reachable.
 - Test: `flow_cap_stays_inside_the_fd_limit`.
+
+### 3. Write lock and `String` allocation per data packet for the legacy user id (fixed)
+
+- `src/datapath_v2.rs:1810,1844,1877,1888` and `src/main.rs:2304,2336,2366,2375`.
+- Every TCP, UDP and fragment packet took a `sessions` write guard and, for
+  non-authenticated sessions, formatted `src_ip.to_string()` into a new heap
+  `String`. The write guard is taken even for authenticated sessions, where
+  nothing changes, and it contends with the shard and TX threads that look up
+  the same DashMap shard on every response packet.
+- Fix: `note_legacy_user_ip` formats into a stack buffer, compares under a
+  read guard, and only takes the write guard and touches the heap when the
+  identity really changes. Applied to both datapaths.
+- Test: `legacy_user_id_tracks_the_tunnel_ip_but_never_overrides_authenticated`.

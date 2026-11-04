@@ -1137,6 +1137,42 @@ fn test_runtime_config() -> RelayRuntimeConfig {
 }
 
 /// Default identity until we observe a tunnel source IP or strict auth identity.
+/// In legacy (unauthenticated) sessions the tunnel source IP doubles as a
+/// best-effort user identity. This runs for every data packet, so it checks
+/// under a shared read guard and only takes the write guard, and allocates,
+/// when the identity actually changes. It used to take a write guard and
+/// format a fresh `String` for every packet, authenticated or not.
+pub(crate) fn note_legacy_user_ip(
+    sessions: &DashMap<[u8; SESSION_ID_LEN], SessionEntry>,
+    session_id: [u8; SESSION_ID_LEN],
+    ip: Ipv4Addr,
+) {
+    use std::io::Write as _;
+    let mut text = [0u8; 15]; // "255.255.255.255"
+    let mut cursor = &mut text[..];
+    if write!(cursor, "{}", ip).is_err() {
+        return;
+    }
+    let written = 15 - cursor.len();
+    // Only ASCII digits and dots were written.
+    let Ok(ip_text) = std::str::from_utf8(&text[..written]) else {
+        return;
+    };
+
+    let needs_update = sessions.get(&session_id).is_some_and(|session| {
+        session.auth_state != SessionAuthState::Authenticated && session.user_id != ip_text
+    });
+    if !needs_update {
+        return;
+    }
+    if let Some(mut session) = sessions.get_mut(&session_id) {
+        if session.auth_state != SessionAuthState::Authenticated {
+            session.user_id.clear();
+            session.user_id.push_str(ip_text);
+        }
+    }
+}
+
 fn derive_user_id(session_id: [u8; SESSION_ID_LEN]) -> String {
     format!("session-{:016x}", u64::from_be_bytes(session_id))
 }
@@ -2299,11 +2335,7 @@ async fn main() -> Result<()> {
                 } else {
                     stats.drop_in(DropReason::Fragment);
                 }
-                if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-                    if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
-                        session_entry.user_id = src_ip.to_string();
-                    }
-                }
+                note_legacy_user_ip(&sessions, session_id, src_ip);
                 continue;
             }
             ParsedPacket::Tcp {
@@ -2330,12 +2362,7 @@ async fn main() -> Result<()> {
                 } else {
                     stats.drop_in(DropReason::TcpDisabled);
                 }
-                // Update session user_id for TCP too
-                if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-                    if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
-                        session_entry.user_id = original_info.src_ip.to_string();
-                    }
-                }
+                note_legacy_user_ip(&sessions, session_id, original_info.src_ip);
                 continue;
             }
             ParsedPacket::Udp {
@@ -2361,20 +2388,11 @@ async fn main() -> Result<()> {
                     } else {
                         stats.drop_in(DropReason::TunQueue);
                     }
-                    if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-                        if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
-                            session_entry.user_id = original_info.src_ip.to_string();
-                        }
-                    }
+                    note_legacy_user_ip(&sessions, session_id, original_info.src_ip);
                     continue;
                 }
 
-                // In legacy mode, use tunnel source IP as best-effort user identity.
-                if let Some(mut session_entry) = sessions.get_mut(&session_id) {
-                    if !matches!(session_entry.auth_state, SessionAuthState::Authenticated) {
-                        session_entry.user_id = original_info.src_ip.to_string();
-                    }
-                }
+                note_legacy_user_ip(&sessions, session_id, original_info.src_ip);
 
                 // Create flow key
                 let flow_key = format!("{:016x}:{}", u64::from_be_bytes(session_id), game_addr);
@@ -3798,6 +3816,46 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    #[test]
+    fn legacy_user_id_tracks_the_tunnel_ip_but_never_overrides_authenticated() {
+        let sessions = DashMap::new();
+        let entry = |auth_state| SessionEntry {
+            user_id: "session-0000000000000001".into(),
+            auth_state,
+            lease_expires_at_unix: None,
+            client_addr: "127.0.0.1:1".parse().unwrap(),
+            created_at_unix: 0,
+            last_activity: Instant::now(),
+            last_activity_unix: 0,
+        };
+        sessions.insert([1; SESSION_ID_LEN], entry(SessionAuthState::Legacy));
+        sessions.insert([2; SESSION_ID_LEN], entry(SessionAuthState::Authenticated));
+
+        note_legacy_user_ip(
+            &sessions,
+            [1; SESSION_ID_LEN],
+            Ipv4Addr::new(255, 255, 255, 255),
+        );
+        assert_eq!(
+            sessions.get(&[1; SESSION_ID_LEN]).unwrap().user_id,
+            "255.255.255.255"
+        );
+        note_legacy_user_ip(&sessions, [1; SESSION_ID_LEN], Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(
+            sessions.get(&[1; SESSION_ID_LEN]).unwrap().user_id,
+            "10.0.0.7"
+        );
+
+        note_legacy_user_ip(&sessions, [2; SESSION_ID_LEN], Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(
+            sessions.get(&[2; SESSION_ID_LEN]).unwrap().user_id,
+            "session-0000000000000001"
+        );
+        // Unknown sessions are ignored.
+        note_legacy_user_ip(&sessions, [3; SESSION_ID_LEN], Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(sessions.len(), 2);
+    }
 
     fn test_auth_materials() -> (Ed25519KeyPair, RelayAuthConfig) {
         let seed = [7u8; 32];

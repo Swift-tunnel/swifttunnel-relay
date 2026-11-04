@@ -1802,14 +1802,7 @@ pub(super) async fn run_datapath_v2(
                         } else {
                             stats_rx.drop_in(super::DropReason::Fragment);
                         }
-                        if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
-                            if !matches!(
-                                session_entry.auth_state,
-                                super::SessionAuthState::Authenticated
-                            ) {
-                                session_entry.user_id = src_ip.to_string();
-                            }
-                        }
+                        super::note_legacy_user_ip(&sessions_rx, session_id, src_ip);
                         continue;
                     }
                     super::ParsedPacket::Tcp {
@@ -1836,14 +1829,7 @@ pub(super) async fn run_datapath_v2(
                         } else {
                             stats_rx.drop_in(super::DropReason::TcpDisabled);
                         }
-                        if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
-                            if !matches!(
-                                session_entry.auth_state,
-                                super::SessionAuthState::Authenticated
-                            ) {
-                                session_entry.user_id = original_info.src_ip.to_string();
-                            }
-                        }
+                        super::note_legacy_user_ip(&sessions_rx, session_id, original_info.src_ip);
                         continue;
                     }
                     super::ParsedPacket::Udp {
@@ -1869,25 +1855,15 @@ pub(super) async fn run_datapath_v2(
                             } else {
                                 stats_rx.drop_in(super::DropReason::TunQueue);
                             }
-                            if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
-                                if !matches!(
-                                    session_entry.auth_state,
-                                    super::SessionAuthState::Authenticated
-                                ) {
-                                    session_entry.user_id = original_info.src_ip.to_string();
-                                }
-                            }
+                            super::note_legacy_user_ip(
+                                &sessions_rx,
+                                session_id,
+                                original_info.src_ip,
+                            );
                             continue;
                         }
 
-                        if let Some(mut session_entry) = sessions_rx.get_mut(&session_id) {
-                            if !matches!(
-                                session_entry.auth_state,
-                                super::SessionAuthState::Authenticated
-                            ) {
-                                session_entry.user_id = original_info.src_ip.to_string();
-                            }
-                        }
+                        super::note_legacy_user_ip(&sessions_rx, session_id, original_info.src_ip);
 
                         let Some(payload_idx) = pool_rx.try_acquire() else {
                             stats_rx.drop_in(super::DropReason::Pool);
