@@ -1387,16 +1387,30 @@ pub(super) async fn run_datapath_v2(
                         continue;
                     }
                     let result = super::parse_auth_hello_token(&buf, len).and_then(|token| {
-                        super::verify_relay_ticket_once(
+                        super::verify_auth_hello(
                             token,
                             session_id,
                             &auth_config_rx,
                             now_unix,
                             &replay_cache_rx,
+                            &sessions_rx,
+                            client_addr,
                         )
                     });
                     match result {
-                        Ok(ticket) => Some(ticket),
+                        Ok(Some(ticket)) => Some(ticket),
+                        Ok(None) => {
+                            send_small_control_frame(
+                                &tx_control_rx,
+                                &pool_rx,
+                                client_addr,
+                                session_id,
+                                super::AUTH_ACK_FRAME_TYPE,
+                                super::AUTH_ACK_OK,
+                                &stats_rx,
+                            );
+                            continue;
+                        }
                         Err(err) => {
                             send_small_control_frame(
                                 &tx_control_rx,

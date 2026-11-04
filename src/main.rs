@@ -902,6 +902,7 @@ fn verify_relay_ticket(
     })
 }
 
+#[cfg(test)]
 fn verify_relay_ticket_once(
     token: &str,
     session_id: [u8; SESSION_ID_LEN],
@@ -914,6 +915,43 @@ fn verify_relay_ticket_once(
         return Err(RelayAuthVerifyError::Replay);
     }
     Ok(ticket)
+}
+
+/// Verify the ticket in an auth hello.
+///
+/// `Ok(None)` means the hello is a retransmission of the one that already
+/// authenticated this session from this same endpoint: acknowledge it as
+/// accepted and change nothing. The ack travels over UDP, so when it is lost
+/// the client sends the same hello again, and that used to be answered with
+/// `AUTH_ACK_REPLAY` although the session was authenticated, which reads to
+/// the client as a refused ticket. A replay from any other endpoint, or of a
+/// ticket the session is not running on, is still refused.
+fn verify_auth_hello(
+    token: &str,
+    session_id: [u8; SESSION_ID_LEN],
+    auth: &RelayAuthConfig,
+    now_unix: u64,
+    replay_cache: &RelayTicketReplayCache,
+    sessions: &DashMap<[u8; SESSION_ID_LEN], SessionEntry>,
+    client_addr: SocketAddr,
+) -> Result<Option<VerifiedRelayTicket>, RelayAuthVerifyError> {
+    let ticket = verify_relay_ticket(token, session_id, auth, now_unix)?;
+    if replay_cache.accept_once(&ticket.jti, ticket.exp, now_unix) {
+        return Ok(Some(ticket));
+    }
+    let already_applied = sessions.get(&session_id).is_some_and(|session| {
+        session.auth_state == SessionAuthState::Authenticated
+            && session.client_addr == client_addr
+            && session.user_id == ticket.user_id
+            && session.lease_expires_at_unix == Some(ticket.exp)
+            && session_auth_is_current(&session, now_unix)
+    });
+    if already_applied {
+        Ok(None)
+    } else {
+        log_auth_verify_error(RelayAuthVerifyError::Replay, client_addr, session_id);
+        Err(RelayAuthVerifyError::Replay)
+    }
 }
 
 fn parse_auth_hello_token(frame: &[u8], len: usize) -> Result<&str, RelayAuthVerifyError> {
@@ -2071,10 +2109,22 @@ async fn main() -> Result<()> {
                 continue;
             }
             let result = parse_auth_hello_token(&buf, len).and_then(|token| {
-                verify_relay_ticket_once(token, session_id, &auth_config, now_unix, &replay_cache)
+                verify_auth_hello(
+                    token,
+                    session_id,
+                    &auth_config,
+                    now_unix,
+                    &replay_cache,
+                    &sessions,
+                    client_addr,
+                )
             });
             match result {
-                Ok(ticket) => Some(ticket),
+                Ok(Some(ticket)) => Some(ticket),
+                Ok(None) => {
+                    send_auth_ack(socket.as_ref(), client_addr, session_id, AUTH_ACK_OK).await;
+                    continue;
+                }
                 Err(err) => {
                     send_auth_ack(socket.as_ref(), client_addr, session_id, err.ack_status()).await;
                     continue;

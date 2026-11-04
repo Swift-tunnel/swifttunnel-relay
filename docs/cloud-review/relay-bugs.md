@@ -176,3 +176,19 @@ Line numbers refer to the code before the fix landed.
   new flows go untracked (dropped in enforce mode, counted in observe mode)
   without touching the shared table.
 - Test: `one_account_cannot_take_every_flow_slot_from_the_others`.
+
+### 11. A lost auth ack turned the client's retry into a "replayed ticket" (fixed)
+
+- `src/main.rs:905` (`verify_relay_ticket_once`), used by both receive loops.
+- The `AUTH_ACK_OK` is one UDP datagram. When it is lost, the client sends
+  the same hello again with the same `jti`, and the replay cache answered
+  `AUTH_ACK_REPLAY` although that ticket had just authenticated the session.
+  To the client that is a refused ticket, so it has to fetch a new one (a
+  round trip to the web backend) or gives up, on exactly the lossy links
+  where the relay matters most.
+- Fix: `verify_auth_hello` acks `OK` and changes nothing when a seen ticket
+  is a retransmission of the hello that already authenticated this session:
+  same endpoint, same owner, same lease expiry, lease still current. Any
+  other reuse is still `AUTH_ACK_REPLAY`, so a captured hello sent from
+  somewhere else gains nothing. Wire format and ack codes are unchanged.
+- Test: `tests/auth_retransmit.rs` (both datapaths); fails before the fix.
