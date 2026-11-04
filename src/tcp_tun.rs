@@ -583,27 +583,20 @@ fn rewrite_ip_field(packet: &mut [u8], offset: usize, new_ip: Ipv4Addr) {
 
     recalculate_ip_checksum(packet);
 
-    // Fragmented IPv4 packets do not carry a complete transport segment in
-    // every fragment. Recomputing UDP/TCP checksums over partial fragments
-    // corrupts payload bytes and breaks reassembly on the far side. Only
-    // fragment 0 carries the transport checksum field, so update the
-    // pseudo-header there incrementally and leave later fragments untouched.
-    if ipv4_is_fragment(packet) {
-        if ipv4_fragment_offset(packet) == Some(0) {
-            match packet[9] {
-                IPPROTO_TCP => update_fragment_tcp_checksum(packet, old_ip, new_ip),
-                IPPROTO_UDP => update_fragment_udp_checksum(packet, old_ip, new_ip),
-                _ => {}
-            }
+    // TCP/UDP checksums cover the addresses through the pseudo-header, so the
+    // change is applied to the checksum incrementally (RFC 1624) rather than
+    // by summing the segment again. Recomputing from scratch was wrong as
+    // well as slower: a segment damaged before it reached the relay left with
+    // a fresh, valid checksum, and the client accepted the damaged data.
+    //
+    // Only the first fragment carries the transport header. Later fragments
+    // are left untouched; recomputing over a partial segment would corrupt it.
+    if ipv4_fragment_offset(packet) == Some(0) {
+        match packet[9] {
+            IPPROTO_TCP => update_fragment_tcp_checksum(packet, old_ip, new_ip),
+            IPPROTO_UDP => update_fragment_udp_checksum(packet, old_ip, new_ip),
+            _ => {}
         }
-        return;
-    }
-
-    match packet[9] {
-        // TCP/UDP checksums both include the IPv4 pseudo-header.
-        IPPROTO_TCP => recalculate_tcp_checksum(packet),
-        IPPROTO_UDP => recalculate_udp_checksum(packet),
-        _ => {}
     }
 }
 
@@ -763,6 +756,7 @@ fn recalculate_ip_checksum(packet: &mut [u8]) {
 ///
 /// The TCP pseudo-header contains: src IP (4), dst IP (4), zero (1), protocol (1),
 /// TCP length (2). We zero the TCP checksum field, compute, and write back.
+#[cfg(test)]
 fn recalculate_tcp_checksum(packet: &mut [u8]) {
     if packet.len() < MIN_IPV4_HEADER_LEN {
         return;
@@ -834,6 +828,7 @@ fn recalculate_tcp_checksum(packet: &mut [u8]) {
 ///
 /// IPv4 allows UDP checksum 0 to mean "checksum omitted". Preserve that mode
 /// instead of forcing a non-zero checksum after IP rewriting.
+#[cfg(test)]
 fn recalculate_udp_checksum(packet: &mut [u8]) {
     if packet.len() < MIN_IPV4_HEADER_LEN {
         return;
@@ -1362,6 +1357,29 @@ mod tests {
         let before = echo.clone();
         rewrite_icmp_error_quoted_src(&mut echo, client_ip, tun_ip);
         assert_eq!(echo, before);
+    }
+
+    #[test]
+    fn rewrite_does_not_launder_a_damaged_segment() {
+        let mut tcp = make_tcp_packet(Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(1, 1, 1, 1));
+        tcp[41] ^= 0x40; // damaged in transit, checksum now wrong
+        assert!(!verify_tcp_checksum(&tcp));
+        rewrite_src_ip(&mut tcp, Ipv4Addr::new(10, 200, 42, 7));
+        assert!(verify_ip_checksum(&tcp));
+        assert!(
+            !verify_tcp_checksum(&tcp),
+            "damaged TCP segment got a valid checksum"
+        );
+
+        let mut udp = make_udp_packet(Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(10, 200, 42, 7), 1);
+        let last = udp.len() - 1;
+        udp[last] ^= 0x01;
+        assert!(!verify_udp_checksum(&udp));
+        rewrite_dst_ip(&mut udp, Ipv4Addr::new(10, 0, 0, 1));
+        assert!(
+            !verify_udp_checksum(&udp),
+            "damaged UDP datagram got a valid checksum"
+        );
     }
 
     #[test]

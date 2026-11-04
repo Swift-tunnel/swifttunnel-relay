@@ -356,3 +356,19 @@ Line numbers refer to the code before the fix landed.
   the quote of ICMP error types 3, 4, 5, 11 and 12 and fixes the quoted header
   checksum and the ICMP checksum. Other ICMP is untouched.
 - Test: `icmp_errors_quote_the_clients_own_address_after_rewrite`.
+
+### 22. TUN address rewrites gave damaged segments a valid checksum (fixed)
+
+- `src/tcp_tun.rs:602` (`rewrite_ip_field`, non-fragment branch).
+- After swapping an address, every unfragmented TCP and UDP packet had its
+  transport checksum recomputed from scratch over the whole segment. That
+  replaced the checksum the sender computed, so a segment damaged anywhere
+  before the relay (a bad NIC, memory, a broken middlebox) left with a valid
+  checksum and the client or server accepted the damaged bytes; TCP's
+  end-to-end check no longer covered the path. It also summed every byte of
+  every tunnelled packet on the TUN threads.
+- Fix: the address change is applied incrementally (RFC 1624), as the
+  first-fragment path already did, so a good checksum stays good and a bad one
+  stays bad. The full recompute helpers remain for tests only.
+- Test: `rewrite_does_not_launder_a_damaged_segment` (fails with the old
+  recompute); the existing checksum-preservation tests still pass.
